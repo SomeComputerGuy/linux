@@ -889,6 +889,13 @@ static int dw_hdmi_qp_rockchip_bind(struct device *dev, struct device *master,
 		return dev_err_probe(dev, PTR_ERR(connector),
 				     "Failed to init bridge connector\n");
 
+	/* Passing 0 selects the full HDMI colorspace set defined by the core. */
+	ret = drm_mode_create_hdmi_colorspace_property(connector, 0);
+	if (ret)
+		return ret;
+
+	drm_connector_attach_colorspace_property(connector);
+
 	platform_set_drvdata(pdev, hdmi);
 
 	return 0;
