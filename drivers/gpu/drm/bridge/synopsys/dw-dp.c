@@ -317,6 +317,7 @@ struct dw_dp_bridge_state {
 	u8 color_format;
 	u8 bpc;
 	u8 bpp;
+	enum drm_colorspace colorspace;
 };
 
 struct dw_dp_sdp {
@@ -1226,6 +1227,12 @@ static void dw_dp_clear_sdp(struct dw_dp *dp, int nr)
 		clear_bit(nr, dp->sdp_reg_bank);
 }
 
+static bool dw_dp_colorspace_is_bt2020(enum drm_colorspace colorspace)
+{
+	return colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB ||
+	       colorspace == DRM_MODE_COLORIMETRY_BT2020_YCC;
+}
+
 static int dw_dp_send_vsc_sdp(struct dw_dp *dp)
 {
 	struct dw_dp_bridge_state *state;
@@ -1261,13 +1268,25 @@ static int dw_dp_send_vsc_sdp(struct dw_dp *dp)
 		break;
 	}
 
-	if (state->color_format == DRM_OUTPUT_COLOR_FORMAT_RGB444) {
-		vsc.colorimetry = DP_COLORIMETRY_DEFAULT;
-		vsc.dynamic_range = DP_DYNAMIC_RANGE_VESA;
-	} else {
-		vsc.colorimetry = DP_COLORIMETRY_BT709_YCC;
-		vsc.dynamic_range = DP_DYNAMIC_RANGE_CTA;
+	switch (state->colorspace) {
+	case DRM_MODE_COLORIMETRY_BT2020_RGB:
+		vsc.colorimetry = DP_COLORIMETRY_BT2020_RGB;
+		break;
+	case DRM_MODE_COLORIMETRY_BT2020_YCC:
+		vsc.colorimetry = DP_COLORIMETRY_BT2020_YCC;
+		break;
+	default:
+		if (state->color_format == DRM_OUTPUT_COLOR_FORMAT_RGB444)
+			vsc.colorimetry = DP_COLORIMETRY_DEFAULT;
+		else
+			vsc.colorimetry = DP_COLORIMETRY_BT709_YCC;
+		break;
 	}
+
+	if (state->color_format == DRM_OUTPUT_COLOR_FORMAT_RGB444)
+		vsc.dynamic_range = DP_DYNAMIC_RANGE_VESA;
+	else
+		vsc.dynamic_range = DP_DYNAMIC_RANGE_CTA;
 
 	drm_dp_vsc_sdp_pack(&vsc, &sdp.base);
 
@@ -1328,7 +1347,7 @@ static bool dw_dp_video_need_vsc_sdp(struct dw_dp *dp)
 	if (state->color_format == DRM_OUTPUT_COLOR_FORMAT_YCBCR420)
 		return true;
 
-	return false;
+	return dw_dp_colorspace_is_bt2020(state->colorspace);
 }
 
 static int dw_dp_video_set_msa(struct dw_dp *dp,
@@ -1779,10 +1798,21 @@ static int dw_dp_bridge_atomic_check(struct drm_bridge *bridge,
 	state->color_format = fmt->color_format;
 	state->bpc = fmt->bpc;
 	state->bpp = fmt->bpp;
+	state->colorspace = conn_state->colorspace;
+
+	/*
+	 * BT.2020 cannot be signaled through the legacy MSA MISC0
+	 * colorimetry bits; it requires the VSC SDP colorimetry format
+	 * indication, which the sink must support.
+	 */
+	if (dw_dp_colorspace_is_bt2020(conn_state->colorspace) &&
+	    !dp->link.vsc_sdp_supported)
+		return -EINVAL;
 
 	old_conn_state = drm_atomic_get_old_connector_state(conn_state->state,
 							    conn_state->connector);
-	if (!drm_connector_atomic_hdr_metadata_equal(old_conn_state, conn_state))
+	if (!drm_connector_atomic_hdr_metadata_equal(old_conn_state, conn_state) ||
+	    old_conn_state->colorspace != conn_state->colorspace)
 		crtc_state->mode_changed = true;
 
 	if ((adjusted_mode->hsync_start - adjusted_mode->hdisplay) & 0x1) {
