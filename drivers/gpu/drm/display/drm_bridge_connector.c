@@ -242,9 +242,16 @@ drm_bridge_connector_create_state(struct drm_connector *connector)
 	if (IS_ERR(conn_state))
 		return conn_state;
 
-	if (bridge_connector->bridge_hdmi)
+	if (bridge_connector->bridge_hdmi) {
 		__drm_atomic_helper_connector_hdmi_state_init(connector,
 							      conn_state);
+	} else if (connector->max_bpc_property) {
+		/* The property's range maximum is the attach-time default */
+		u64 max_bpc = connector->max_bpc_property->values[1];
+
+		conn_state->max_requested_bpc = max_bpc;
+		conn_state->max_bpc = max_bpc;
+	}
 
 	return conn_state;
 }
