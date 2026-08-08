@@ -69,6 +69,21 @@ static void dw_dp_rockchip_hpd_sw_cfg(void *data, bool hpd)
 		     FIELD_PREP_WM16(ROCKCHIP_VO_GRF_DP_SINK_HPD_CFG, hpd));
 }
 
+static bool dw_dp_yuv_bus_format(u32 bus_format)
+{
+	switch (bus_format) {
+	case MEDIA_BUS_FMT_UYYVYY10_0_5X30:
+	case MEDIA_BUS_FMT_UYYVYY8_0_5X24:
+	case MEDIA_BUS_FMT_YUYV10_1X20:
+	case MEDIA_BUS_FMT_YUYV8_1X16:
+	case MEDIA_BUS_FMT_YUV10_1X30:
+	case MEDIA_BUS_FMT_YUV8_1X24:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static int dw_dp_encoder_atomic_check(struct drm_encoder *encoder,
 				      struct drm_crtc_state *crtc_state,
 				      struct drm_connector_state *conn_state)
@@ -102,7 +117,17 @@ static int dw_dp_encoder_atomic_check(struct drm_encoder *encoder,
 	s->output_type = DRM_MODE_CONNECTOR_DisplayPort;
 	s->bus_format = bus_format;
 	s->bus_flags = di->bus_flags;
-	s->color_space = V4L2_COLORSPACE_DEFAULT;
+
+	/*
+	 * For BT.2020 YCbCr output the VOP2 must use its BT.2020 R'G'B' to
+	 * Y'C'bC'r matrix; BT.2020 RGB is passed through unconverted.
+	 */
+	if ((conn_state->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB ||
+	     conn_state->colorspace == DRM_MODE_COLORIMETRY_BT2020_YCC) &&
+	    dw_dp_yuv_bus_format(bus_format))
+		s->color_space = V4L2_COLORSPACE_BT2020;
+	else
+		s->color_space = V4L2_COLORSPACE_DEFAULT;
 
 	return 0;
 }
@@ -199,6 +224,17 @@ static int dw_dp_rockchip_bind(struct device *dev, struct device *master, void *
 	}
 
 	drm_connector_attach_hdr_output_metadata_property(connector);
+
+	ret = drm_mode_create_dp_colorspace_property(connector,
+						     BIT(DRM_MODE_COLORIMETRY_DEFAULT) |
+						     BIT(DRM_MODE_COLORIMETRY_BT2020_RGB) |
+						     BIT(DRM_MODE_COLORIMETRY_BT2020_YCC));
+	if (ret) {
+		dw_dp_unbind(dp->base);
+		return ret;
+	}
+
+	drm_connector_attach_colorspace_property(connector);
 
 	return 0;
 }
