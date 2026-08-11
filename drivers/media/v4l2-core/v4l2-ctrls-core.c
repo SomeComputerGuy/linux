@@ -133,6 +133,7 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 	struct v4l2_ctrl_av1_sequence *p_av1_sequence;
 	struct v4l2_ctrl_hevc_encode_params *p_hevc_enc_params;
 	struct v4l2_ctrl_hevc_encode_feedback *p_hevc_enc_feedback;
+	struct v4l2_ctrl_hevc_sps *p_hevc_sps;
 	void *p = ptr.p + idx * ctrl->elem_size;
 
 	if (ctrl->p_def.p_const)
@@ -219,6 +220,12 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 		p_hevc_enc_feedback->nal_unit_type = V4L2_HEVC_NAL_IDR_W_RADL;
 		p_hevc_enc_feedback->nuh_temporal_id_plus1 = 1;
 		p_hevc_enc_feedback->slice_type = V4L2_HEVC_SLICE_TYPE_I;
+		break;
+	case V4L2_CTRL_TYPE_HEVC_SPS:
+		p_hevc_sps = p;
+
+		/* 4:2:0 */
+		p_hevc_sps->chroma_format_idc = 1;
 		break;
 	}
 }
