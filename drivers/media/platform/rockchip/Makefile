@@ -3,6 +3,7 @@ obj-y += iep/
 obj-y += rga/
 obj-y += rkcif/
 obj-y += rkisp1/
+obj-y += rkisp2/
 obj-y += rkjpegd/
 obj-y += rkvdec/
 obj-y += rkvenc/
