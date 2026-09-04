@@ -97,6 +97,7 @@ struct rockchip_pm_domain {
 	int num_qos;
 	struct regmap **qos_regmap;
 	u32 *qos_save_regs[MAX_QOS_REGS_NUM];
+	bool qos_saved;
 	int num_clks;
 	struct clk_bulk_data *clks;
 	struct device_node *node;
@@ -474,12 +475,21 @@ static int rockchip_pmu_save_qos(struct rockchip_pm_domain *pd)
 			    QOS_EXTCONTROL,
 			    &pd->qos_save_regs[4][i]);
 	}
+	pd->qos_saved = true;
 	return 0;
 }
 
 static int rockchip_pmu_restore_qos(struct rockchip_pm_domain *pd)
 {
 	int i;
+
+	/*
+	 * A domain that was off when it was registered has nothing saved yet,
+	 * and writing the zeroed array would replace the reset values the QoS
+	 * registers came up with.
+	 */
+	if (!pd->qos_saved)
+		return 0;
 
 	for (i = 0; i < pd->num_qos; i++) {
 		regmap_write(pd->qos_regmap[i],
