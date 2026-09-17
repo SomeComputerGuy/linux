@@ -1978,6 +1978,8 @@ static int imx_pcie_probe(struct platform_device *pdev)
 				return ret;
 		}
 
+		pci->pp.suspend_poweroff = true;
+
 		if (imx_check_flag(imx_pcie, IMX_PCIE_FLAG_SKIP_L23_READY))
 			pci->pp.skip_l23_ready = true;
 		if (imx_check_flag(imx_pcie, IMX_PCIE_FLAG_KEEP_MSI_CAP))
