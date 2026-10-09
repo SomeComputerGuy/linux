@@ -1247,6 +1247,13 @@ const char *v4l2_ctrl_get_name(u32 id)
 	case V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY:		return "AV1 Tile Group Entry";
 	case V4L2_CID_STATELESS_AV1_FRAME:			return "AV1 Frame Parameters";
 	case V4L2_CID_STATELESS_AV1_FILM_GRAIN:			return "AV1 Film Grain";
+	case V4L2_CID_STATELESS_MPEG4_VOL:			return "MPEG-4 Video Object Layer";
+	case V4L2_CID_STATELESS_MPEG4_VOP:			return "MPEG-4 Video Object Plane";
+	case V4L2_CID_STATELESS_MPEG4_QUANTISATION:		return "MPEG-4 Quantisation Matrices";
+	case V4L2_CID_STATELESS_MPEG4_SLICE_PARAMS:		return "MPEG-4 Slice Parameters";
+	case V4L2_CID_STATELESS_MPEG4_QUIRKS:			return "MPEG-4 Encoder Quirks";
+	case V4L2_CID_STATELESS_H263_PICTURE:			return "H.263 Picture";
+	case V4L2_CID_STATELESS_H263_SLICE_PARAMS:		return "H.263 Slice Parameters";
 	case V4L2_CID_STATELESS_AVS2_SEQUENCE:			return "AVS2 Sequence Header";
 	case V4L2_CID_STATELESS_AVS2_PICTURE:			return "AVS2 Picture Header";
 	case V4L2_CID_STATELESS_AVS2_WEIGHT_QUANT:	return "AVS2 Weight Quant Matrices";
@@ -1640,6 +1647,29 @@ void v4l2_ctrl_fill(u32 id, const char **name, enum v4l2_ctrl_type *type,
 		break;
 	case V4L2_CID_STATELESS_AV1_FILM_GRAIN:
 		*type = V4L2_CTRL_TYPE_AV1_FILM_GRAIN;
+		break;
+	case V4L2_CID_STATELESS_MPEG4_VOL:
+		*type = V4L2_CTRL_TYPE_MPEG4_VOL;
+		break;
+	case V4L2_CID_STATELESS_MPEG4_VOP:
+		*type = V4L2_CTRL_TYPE_MPEG4_VOP;
+		break;
+	case V4L2_CID_STATELESS_MPEG4_QUANTISATION:
+		*type = V4L2_CTRL_TYPE_MPEG4_QUANTISATION;
+		break;
+	case V4L2_CID_STATELESS_MPEG4_SLICE_PARAMS:
+		*type = V4L2_CTRL_TYPE_MPEG4_SLICE_PARAMS;
+		*flags |= V4L2_CTRL_FLAG_DYNAMIC_ARRAY;
+		break;
+	case V4L2_CID_STATELESS_MPEG4_QUIRKS:
+		*type = V4L2_CTRL_TYPE_BITMASK;
+		break;
+	case V4L2_CID_STATELESS_H263_PICTURE:
+		*type = V4L2_CTRL_TYPE_H263_PICTURE;
+		break;
+	case V4L2_CID_STATELESS_H263_SLICE_PARAMS:
+		*type = V4L2_CTRL_TYPE_H263_SLICE_PARAMS;
+		*flags |= V4L2_CTRL_FLAG_DYNAMIC_ARRAY;
 		break;
 	case V4L2_CID_STATELESS_AVS2_SEQUENCE:
 		*type = V4L2_CTRL_TYPE_AVS2_SEQUENCE;
