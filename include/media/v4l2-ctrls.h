@@ -59,6 +59,12 @@ struct video_device;
  * @p_av1_tile_group_entry:	Pointer to an AV1 tile group entry structure.
  * @p_av1_frame:		Pointer to an AV1 frame structure.
  * @p_av1_film_grain:		Pointer to an AV1 film grain structure.
+ * @p_mpeg4_vol:		Pointer to an MPEG-4 video object layer structure.
+ * @p_mpeg4_vop:		Pointer to an MPEG-4 video object plane structure.
+ * @p_mpeg4_quantisation:	Pointer to an MPEG-4 quantisation structure.
+ * @p_mpeg4_slice_params:	Pointer to an MPEG-4 slice parameters structure.
+ * @p_h263_picture:		Pointer to an H.263 picture structure.
+ * @p_h263_slice_params:	Pointer to an H.263 slice parameters structure.
  * @p_rect:			Pointer to a rectangle.
  * @p:				Pointer to a compound value.
  * @p_const:			Pointer to a constant compound value.
@@ -96,6 +102,12 @@ union v4l2_ctrl_ptr {
 	struct v4l2_ctrl_av1_tile_group_entry *p_av1_tile_group_entry;
 	struct v4l2_ctrl_av1_frame *p_av1_frame;
 	struct v4l2_ctrl_av1_film_grain *p_av1_film_grain;
+	struct v4l2_ctrl_mpeg4_vol *p_mpeg4_vol;
+	struct v4l2_ctrl_mpeg4_vop *p_mpeg4_vop;
+	struct v4l2_ctrl_mpeg4_quantisation *p_mpeg4_quantisation;
+	struct v4l2_ctrl_mpeg4_slice_params *p_mpeg4_slice_params;
+	struct v4l2_ctrl_h263_picture *p_h263_picture;
+	struct v4l2_ctrl_h263_slice_params *p_h263_slice_params;
 	struct v4l2_rect *p_rect;
 	void *p;
 	const void *p_const;
