@@ -776,6 +776,9 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_H264_SLICE v4l2_fourcc('S', '2', '6', '4') /* H264 parsed slices */
 #define V4L2_PIX_FMT_HEVC_SLICE v4l2_fourcc('S', '2', '6', '5') /* HEVC parsed slices */
 #define V4L2_PIX_FMT_AV1_FRAME v4l2_fourcc('A', 'V', '1', 'F') /* AV1 parsed frame */
+#define V4L2_PIX_FMT_MPEG4_SLICE v4l2_fourcc('M', 'G', '4', 'S') /* MPEG-4 Part 2 parsed VOP data */
+#define V4L2_PIX_FMT_H263_SLICE v4l2_fourcc('S', '2', '6', '3') /* H.263 parsed picture data */
+#define V4L2_PIX_FMT_SPK_SLICE v4l2_fourcc('S', 'P', 'K', 'S') /* Sorenson Spark parsed picture data */
 #define V4L2_PIX_FMT_AV1      v4l2_fourcc('A', 'V', '0', '1') /* AV1 */
 #define V4L2_PIX_FMT_SPK      v4l2_fourcc('S', 'P', 'K', '0') /* Sorenson Spark */
 #define V4L2_PIX_FMT_RV30     v4l2_fourcc('R', 'V', '3', '0') /* RealVideo 8 */
@@ -1913,6 +1916,12 @@ struct v4l2_ext_control {
 		struct v4l2_ctrl_av1_tile_group_entry __user *p_av1_tile_group_entry;
 		struct v4l2_ctrl_av1_frame __user *p_av1_frame;
 		struct v4l2_ctrl_av1_film_grain __user *p_av1_film_grain;
+		struct v4l2_ctrl_mpeg4_vol __user *p_mpeg4_vol;
+		struct v4l2_ctrl_mpeg4_vop __user *p_mpeg4_vop;
+		struct v4l2_ctrl_mpeg4_quantisation __user *p_mpeg4_quantisation;
+		struct v4l2_ctrl_mpeg4_slice_params __user *p_mpeg4_slice_params;
+		struct v4l2_ctrl_h263_picture __user *p_h263_picture;
+		struct v4l2_ctrl_h263_slice_params __user *p_h263_slice_params;
 		struct v4l2_ctrl_hdr10_cll_info __user *p_hdr10_cll_info;
 		struct v4l2_ctrl_hdr10_mastering_display __user *p_hdr10_mastering_display;
 		void __user *ptr;
@@ -2001,6 +2010,14 @@ enum v4l2_ctrl_type {
 	V4L2_CTRL_TYPE_AV1_TILE_GROUP_ENTRY = 0x281,
 	V4L2_CTRL_TYPE_AV1_FRAME	    = 0x282,
 	V4L2_CTRL_TYPE_AV1_FILM_GRAIN	    = 0x283,
+
+	V4L2_CTRL_TYPE_MPEG4_VOL		= 0x02a0,
+	V4L2_CTRL_TYPE_MPEG4_VOP		= 0x02a1,
+	V4L2_CTRL_TYPE_MPEG4_QUANTISATION	= 0x02a2,
+	V4L2_CTRL_TYPE_MPEG4_SLICE_PARAMS	= 0x02a3,
+
+	V4L2_CTRL_TYPE_H263_PICTURE		= 0x02b0,
+	V4L2_CTRL_TYPE_H263_SLICE_PARAMS	= 0x02b1,
 };
 
 /*  Used in the VIDIOC_QUERYCTRL ioctl for querying controls */
