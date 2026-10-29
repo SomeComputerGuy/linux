@@ -281,7 +281,12 @@ static void config_ref_registers(struct rkvdec_ctx *ctx,
 	struct rkvdec_vp9_ctx *vp9_ctx = ctx->priv;
 	struct rkvdec_vdpu381_regs_vp9 *regs = &vp9_ctx->regs;
 
-	aligned_height = round_up(ref_buf->vp9.height, 64);
+	/*
+	 * Every CAPTURE buffer has the layout of the decoded format, whatever
+	 * the size of the frame stored in it, so plane offsets come from the
+	 * format while the frame size registers use the frame's own size.
+	 */
+	aligned_height = round_up(ctx->decoded_fmt.fmt.pix_mp.height, 64);
 
 	switch (i) {
 	case 0:
@@ -418,7 +423,7 @@ static dma_addr_t get_mv_base_addr(struct rkvdec_ctx *ctx, struct rkvdec_decoded
 {
 	unsigned int aligned_pitch, aligned_height, yuv_len;
 
-	aligned_height = round_up(buf->vp9.height, 64);
+	aligned_height = round_up(ctx->decoded_fmt.fmt.pix_mp.height, 64);
 
 	aligned_pitch = ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
 	yuv_len = (aligned_height * aligned_pitch * 3) / 2;
@@ -647,11 +652,13 @@ static int validate_dec_params(struct rkvdec_ctx *ctx,
 	aligned_height = round_up(dec_params->frame_height_minus_1 + 1, 64);
 
 	/*
-	 * Userspace should update the capture/decoded format when the
-	 * resolution changes.
+	 * VP9 can change resolution on inter frames, which then predict from
+	 * references of the previous size. Frames that fit in the allocated
+	 * CAPTURE buffers are decoded in place so that those references stay
+	 * available; userspace must reallocate only when a frame is larger.
 	 */
-	if (aligned_width != ctx->decoded_fmt.fmt.pix_mp.width ||
-	    aligned_height != ctx->decoded_fmt.fmt.pix_mp.height) {
+	if (aligned_width > ctx->decoded_fmt.fmt.pix_mp.width ||
+	    aligned_height > ctx->decoded_fmt.fmt.pix_mp.height) {
 		dev_err(ctx->core->dev,
 			"unexpected bitstream resolution %dx%d\n",
 			dec_params->frame_width_minus_1 + 1,
