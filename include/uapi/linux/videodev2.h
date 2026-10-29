@@ -1992,8 +1992,6 @@ enum v4l2_ctrl_type {
 	V4L2_CTRL_TYPE_HEVC_DECODE_PARAMS	= 0x0274,
 	V4L2_CTRL_TYPE_HEVC_EXT_SPS_ST_RPS	= 0x0275,
 	V4L2_CTRL_TYPE_HEVC_EXT_SPS_LT_RPS	= 0x0276,
-	V4L2_CTRL_TYPE_HEVC_ENCODE_PARAMS	= 0x0277,
-	V4L2_CTRL_TYPE_HEVC_ENCODE_FEEDBACK	= 0x0278,
 
 	V4L2_CTRL_TYPE_AV1_SEQUENCE	    = 0x280,
 	V4L2_CTRL_TYPE_AV1_TILE_GROUP_ENTRY = 0x281,
@@ -2001,8 +1999,10 @@ enum v4l2_ctrl_type {
 	V4L2_CTRL_TYPE_AV1_FILM_GRAIN	    = 0x283,
 };
 
-/* Not an enumerator, to keep the module symbol versions of v4l2-core. */
+/* Not enumerators, to keep the module symbol versions of v4l2-core. */
 #define V4L2_CTRL_TYPE_H264_ENCODE_PARAMS	0x0206
+#define V4L2_CTRL_TYPE_HEVC_ENCODE_PARAMS	0x0277
+#define V4L2_CTRL_TYPE_HEVC_ENCODE_FEEDBACK	0x0278
 
 /*  Used in the VIDIOC_QUERYCTRL ioctl for querying controls */
 struct v4l2_queryctrl {
