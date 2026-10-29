@@ -39,6 +39,17 @@ struct rkvdec_rps {
 	u32 info[RKVDEC_RPS_HEVC_SIZE / 8 / 4];
 } __packed;
 
+#define RKVDEC_HEVC_MAX_ST_RPS_SETS	64
+
+/*
+ * The SPS short-term RPS sets the hardware table was last built from: the
+ * table depends on nothing else.
+ */
+struct rkvdec_hevc_st_rps_cache {
+	unsigned int num_sets;
+	struct v4l2_ctrl_hevc_ext_sps_st_rps sets[RKVDEC_HEVC_MAX_ST_RPS_SETS];
+};
+
 struct rkvdec_hevc_run {
 	struct rkvdec_run base;
 	const struct v4l2_ctrl_hevc_slice_params *slices_params;
@@ -65,7 +76,7 @@ void compute_tiles_non_uniform(struct rkvdec_hevc_run *run, u16 log2_min_cb_size
 			       u16 width, u16 height, s32 pic_in_cts_width,
 			       s32 pic_in_cts_height, u16 *column_width, u16 *row_height);
 void rkvdec_hevc_assemble_hw_rps(struct rkvdec_hevc_run *run, struct rkvdec_rps *rps,
-				 struct v4l2_ctrl_hevc_ext_sps_st_rps *st_cache);
+				 struct rkvdec_hevc_st_rps_cache *st_cache);
 void rkvdec_hevc_assemble_hw_scaling_list(struct rkvdec_ctx *ctx,
 					  struct rkvdec_hevc_run *run,
 					  struct scaling_factor *scaling_factor,
