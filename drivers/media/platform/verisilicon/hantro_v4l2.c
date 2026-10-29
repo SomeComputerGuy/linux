@@ -213,6 +213,16 @@ static int vidioc_enum_framesizes(struct file *file, void *priv,
 	return 0;
 }
 
+/*
+ * The frame rate only matters to the rate control of video encoders. JPEG
+ * encoders don't have one, and like other JPEG encoders don't implement
+ * the frame interval ioctls.
+ */
+static bool hantro_has_frame_rate(struct hantro_ctx *ctx)
+{
+	return ctx->vpu_dst_fmt->codec_mode != HANTRO_MODE_JPEG_ENC;
+}
+
 static int vidioc_enum_frameintervals(struct file *file, void *priv,
 				      struct v4l2_frmivalenum *fival)
 {
@@ -220,6 +230,9 @@ static int vidioc_enum_frameintervals(struct file *file, void *priv,
 	unsigned int width = fival->width;
 	unsigned int height = fival->height;
 	int ret;
+
+	if (!hantro_has_frame_rate(file_to_ctx(file)))
+		return -ENOTTY;
 
 	if (fival->index > 0)
 		return -EINVAL;
@@ -846,6 +859,9 @@ static int vidioc_g_parm(struct file *file, void *priv,
 	struct hantro_ctx *ctx = file_to_ctx(file);
 	struct v4l2_fract *timeperframe;
 
+	if (!hantro_has_frame_rate(ctx))
+		return -ENOTTY;
+
 	if (V4L2_TYPE_IS_OUTPUT(parm->type)) {
 		timeperframe = &ctx->src_timeperframe;
 		parm->parm.output.capability = V4L2_CAP_TIMEPERFRAME;
@@ -866,6 +882,9 @@ static int vidioc_s_parm(struct file *file, void *priv,
 	struct v4l2_fract *timeperframe_propagate;
 	struct v4l2_fract *timeperframe_ctx;
 	struct v4l2_fract *timeperframe;
+
+	if (!hantro_has_frame_rate(ctx))
+		return -ENOTTY;
 
 	if (V4L2_TYPE_IS_OUTPUT(parm->type)) {
 		parm->parm.output.capability = V4L2_CAP_TIMEPERFRAME;
