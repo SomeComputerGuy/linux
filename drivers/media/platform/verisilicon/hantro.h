@@ -193,6 +193,14 @@ hantro_vdev_to_func(struct video_device *vdev)
  *			shared with interrupt handlers.
  * @variant:		Hardware variant-specific parameters.
  * @watchdog_work:	Delayed work for hardware timeout handling.
+ * @curr_ctx:		Context whose job is running on this instance, or NULL
+ *			if the instance is idle. Protected by @cores_lock of
+ *			the device the job was scheduled on.
+ * @cores:		Hardware instances the jobs of this device can be
+ *			scheduled on. The first entry is the device itself.
+ * @num_cores:		Number of entries in @cores.
+ * @cores_lock:		Spinlock protecting @cores, @num_cores and @curr_ctx
+ *			of each core.
  */
 struct hantro_dev {
 	struct v4l2_device v4l2_dev;
@@ -213,12 +221,21 @@ struct hantro_dev {
 	spinlock_t irqlock;
 	const struct hantro_variant *variant;
 	struct delayed_work watchdog_work;
+
+	struct hantro_ctx *curr_ctx;
+	struct hantro_dev **cores;
+	unsigned int num_cores;
+	spinlock_t cores_lock; /* protects the core list and curr_ctx */
 };
 
 /**
  * struct hantro_ctx - Context (instance) private data.
  *
  * @dev:		VPU driver data to which the context belongs.
+ * @core:		VPU instance running the current job of this context,
+ *			only valid while a job is running. Codec operations
+ *			must access the hardware through it. It is the same
+ *			as @dev unless the variant has multiple cores.
  * @fh:			V4L2 file handler.
  * @is_encoder:		Decoder or encoder context?
  *
@@ -248,6 +265,7 @@ struct hantro_dev {
  */
 struct hantro_ctx {
 	struct hantro_dev *dev;
+	struct hantro_dev *core;
 	struct v4l2_fh fh;
 	bool is_encoder;
 
