@@ -11,6 +11,7 @@
 
 #include "rkvdec.h"
 #include "rkvdec-cabac.h"
+#include "rkvdec-ccu.h"
 #include "rkvdec-rcb.h"
 #include "rkvdec-h264-common.h"
 #include "rkvdec-vdpu381-regs.h"
@@ -307,6 +308,8 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	else
 		regs->common.reg032_timeout_threshold = RKVDEC_TIMEOUT_MAX;
 
+	rkvdec_vdpu381_set_ccu_regs(ctx, &regs->common);
+
 	/* Set TOP and BOTTOM POCs */
 	regs->h264_param.reg065_cur_top_poc = dec_params->top_field_order_cnt;
 	regs->h264_param.reg066_cur_bot_poc = dec_params->bottom_field_order_cnt;
@@ -320,7 +323,9 @@ static void config_registers(struct rkvdec_ctx *ctx,
 		 * If a DPB entry is unused or invalid, address of current destination
 		 * buffer is returned.
 		 */
-		if (!vb_buf)
+		if (vb_buf)
+			rkvdec_job_add_ref(ctx, vb_buf);
+		else
 			vb_buf = &dst_buf->vb2_buf;
 
 		buf_dma = vb2_dma_contig_plane_dma_addr(vb_buf, 0);
@@ -477,6 +482,7 @@ static int rkvdec_h264_run(struct rkvdec_ctx *ctx)
 	rkvdec_schedule_watchdog(core, h264_ctx->regs.common.reg032_timeout_threshold);
 
 	/* Start decoding! */
+	rkvdec_ccu_start(ctx);
 	writel(VDPU381_DEC_E_BIT, core->regs + VDPU381_REG_DEC_E);
 
 	return 0;
