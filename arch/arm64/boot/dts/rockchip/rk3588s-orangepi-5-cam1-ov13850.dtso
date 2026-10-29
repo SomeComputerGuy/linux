@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Device tree overlay for the Xunlong OV13850 camera module (CMK-CT0116,
+ * with a VM149C voice coil motor) on the CAM1 connector of the Orange Pi 5.
+ *
+ * CAM1 is wired to MIPI CSI D-PHY 0 (csi_dphy0, full mode) which feeds the
+ * MIPI CSI-2 receiver csi2 and VICAP port mipi2. The sensor control bus is
+ * I2C7 (M0 pins), the master clock is CLK_MIPI_CAMARAOUT_M3 on GPIO1_D6,
+ * the sensor reset line is GPIO3_C4 and the power-down line is GPIO3_C6.
+ * This mapping is taken from the Xunlong vendor kernel
+ * (rk3588s-orangepi-5-camera1.dtsi). Both control lines are active low at
+ * the sensor (RESETB, XSHUTDOWN); the vendor tree describes them as active
+ * high because its driver drives the physical level.
+ *
+ * The module has no switchable supplies on the Orange Pi 5, so none are
+ * described.
+ *
+ * There is no "ovti,ov13850" driver or binding in mainline yet; this overlay
+ * is the board description for when one is available. The VM149C lens
+ * driver has no mainline driver either and is not described.
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/clock/rockchip,rk3588-cru.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/media/video-interfaces.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+
+&i2c7 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c7m0_xfer>;
+	status = "okay";
+
+	ov13850: camera-sensor@10 {
+		compatible = "ovti,ov13850";
+		reg = <0x10>;
+		assigned-clocks = <&cru CLK_MIPI_CAMARAOUT_M3>;
+		assigned-clock-rates = <24000000>;
+		clocks = <&cru CLK_MIPI_CAMARAOUT_M3>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&mipim0_camera3_clk &cam1_rstn &cam1_pdn>;
+		powerdown-gpios = <&gpio3 RK_PC6 GPIO_ACTIVE_LOW>;
+		reset-gpios = <&gpio3 RK_PC4 GPIO_ACTIVE_LOW>;
+		orientation = <1>;
+
+		/* link frequency of the 2-lane mode of the Rockchip vendor driver */
+		port {
+			ov13850_output: endpoint {
+				data-lanes = <1 2>;
+				link-frequencies = /bits/ 64 <300000000>;
+				remote-endpoint = <&csi2_input>;
+			};
+		};
+	};
+};
+
+&pinctrl {
+	cam1 {
+		cam1_pdn: cam1-pdn-pinctrl {
+			rockchip,pins = <3 RK_PC6 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		cam1_rstn: cam1-rstn-pinctrl {
+			rockchip,pins = <3 RK_PC4 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+};
+
+&csi_dphy0 {
+	status = "okay";
+};
+
+&csi2 {
+	status = "okay";
+};
+
+&csi2_in {
+	csi2_input: endpoint {
+		bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
+		data-lanes = <1 2>;
+		link-frequencies = /bits/ 64 <300000000>;
+		remote-endpoint = <&ov13850_output>;
+	};
+};
+
+&vicap {
+	status = "okay";
+};
+
+&vicap_mmu {
+	status = "okay";
+};
+
+&isp0 {
+	status = "okay";
+};
+
+&isp0_mmu {
+	status = "okay";
+};
