@@ -8,10 +8,11 @@ config VIDEO_ROCKCHIP_VENC
 	select V4L2_MEM2MEM_DEV
 	select V4L2_H264
 	select V4L2_H264_ENC
+	select V4L2_HEVC_ENC
 	help
 	  Support for the VEPU580 (RKVENC) video encoder of the Rockchip
-	  RK3588, using the V4L2 stateless encoder interface. H.264 is
-	  supported.
+	  RK3588, using the V4L2 stateless encoder interface. H.264 and
+	  HEVC are supported.
 
 	  To compile this driver as a module, choose M here: the module
 	  will be called rockchip-venc.

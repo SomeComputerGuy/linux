@@ -43,6 +43,7 @@ static const struct rkvenc_raw_fmt rkvenc_raw_fmts[] = {
 
 static const struct rkvenc_coded_fmt_desc *rkvenc_coded_fmts[] = {
 	&rkvenc_h264_fmt_desc,
+	&rkvenc_hevc_fmt_desc,
 };
 
 static const struct rkvenc_coded_fmt_desc *rkvenc_find_coded_fmt(u32 fourcc)
@@ -655,6 +656,10 @@ static void rkvenc_hw_start(struct rkvenc_core *core)
 	rkvenc_write_range(core, VEPU580_FRAME_START, VEPU580_FRAME_END);
 	rkvenc_write_range(core, VEPU580_KLUT_START, VEPU580_KLUT_END);
 	rkvenc_write_range(core, VEPU580_PARAM_START, VEPU580_PARAM_END);
+	if (FIELD_GET(VEPU580_ENC_PIC_ENC_STND, core->shadow[VEPU580_ENC_PIC / 4]) ==
+	    VEPU580_ENC_STND_HEVC)
+		rkvenc_write_range(core, VEPU580_HEVC_WGT_START,
+				   VEPU580_HEVC_WGT_END);
 	rkvenc_write_range(core, VEPU580_RDO_START, VEPU580_RDO_END);
 	rkvenc_write_range(core, VEPU580_SCL_START, VEPU580_SCL_END);
 
