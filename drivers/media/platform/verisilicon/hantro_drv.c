@@ -182,7 +182,7 @@ static void device_run(void *priv)
 
 	ret = clk_bulk_enable(ctx->dev->variant->num_clocks, ctx->dev->clocks);
 	if (ret)
-		goto err_cancel_job;
+		goto err_pm_put;
 
 	v4l2_m2m_buf_copy_metadata(src, dst);
 
@@ -191,6 +191,8 @@ static void device_run(void *priv)
 
 	return;
 
+err_pm_put:
+	pm_runtime_put_autosuspend(ctx->dev->dev);
 err_cancel_job:
 	hantro_job_finish_no_pm(ctx->dev, ctx, VB2_BUF_STATE_ERROR);
 }
