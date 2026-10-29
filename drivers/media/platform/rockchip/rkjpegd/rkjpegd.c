@@ -505,6 +505,7 @@ static void rkjpegd_buf_queue(struct vb2_buffer *vb)
 	struct rkjpegd_ctx *ctx = vb2_get_drv_priv(vq);
 	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+	struct vb2_queue *cap_q = v4l2_m2m_get_dst_vq(m2m_ctx);
 
 	if (V4L2_TYPE_IS_CAPTURE(vq->type)) {
 		if (vb2_is_streaming(vq) && v4l2_m2m_dst_buf_is_last(m2m_ctx)) {
@@ -518,16 +519,26 @@ static void rkjpegd_buf_queue(struct vb2_buffer *vb)
 		return;
 	}
 
+	/*
+	 * A buffer that cannot be decoded still goes through a job, which
+	 * returns it together with a CAPTURE buffer flagged as an error, so
+	 * that a client waiting for the CAPTURE buffer of that frame does not
+	 * wait forever. Before the first header, with CAPTURE not streaming,
+	 * there is no CAPTURE buffer to return: give the buffer back now.
+	 */
 	if (!to_rkjpegd_buf(vbuf)->valid) {
-		vbuf->sequence = ctx->out_sequence++;
-		vb2_buffer_done(vb, VB2_BUF_STATE_ERROR);
+		if (ctx->state == RKJPEGD_STATE_INIT && !vb2_is_streaming(cap_q)) {
+			vbuf->sequence = ctx->out_sequence++;
+			vb2_buffer_done(vb, VB2_BUF_STATE_ERROR);
+			return;
+		}
+		v4l2_m2m_buf_queue(m2m_ctx, vbuf);
 		return;
 	}
 
 	/* the first header sets up the CAPTURE format */
 	if (ctx->state == RKJPEGD_STATE_INIT) {
 		struct v4l2_pix_format_mplane old = ctx->cap_fmt;
-		struct vb2_queue *cap_q = v4l2_m2m_get_dst_vq(m2m_ctx);
 
 		rkjpegd_apply_header(ctx, &to_rkjpegd_buf(vbuf)->hdr);
 		rkjpegd_queue_src_change(ctx);
@@ -628,14 +639,12 @@ static int rkjpegd_queue_init(void *priv, struct vb2_queue *src_vq,
 
 /* m2m operations */
 
-static void rkjpegd_job_done(struct rkjpegd_dev *jpegd,
-			     enum vb2_buffer_state state)
+/* Return the OUTPUT and CAPTURE buffers of the current job */
+static void rkjpegd_buf_done(struct rkjpegd_ctx *ctx,
+			     enum vb2_buffer_state state, u32 payload)
 {
-	struct rkjpegd_ctx *ctx = jpegd->curr_ctx;
 	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
 	struct vb2_v4l2_buffer *src, *dst;
-
-	jpegd->curr_ctx = NULL;
 
 	src = v4l2_m2m_src_buf_remove(m2m_ctx);
 	dst = v4l2_m2m_dst_buf_remove(m2m_ctx);
@@ -644,8 +653,7 @@ static void rkjpegd_job_done(struct rkjpegd_dev *jpegd,
 	src->sequence = ctx->out_sequence++;
 	dst->sequence = ctx->cap_sequence++;
 	dst->field = V4L2_FIELD_NONE;
-	vb2_set_plane_payload(&dst->vb2_buf, 0,
-			      ctx->cap_fmt.plane_fmt[0].sizeimage);
+	vb2_set_plane_payload(&dst->vb2_buf, 0, payload);
 
 	if (v4l2_m2m_is_last_draining_src_buf(m2m_ctx, src)) {
 		dst->flags |= V4L2_BUF_FLAG_LAST;
@@ -655,9 +663,17 @@ static void rkjpegd_job_done(struct rkjpegd_dev *jpegd,
 
 	v4l2_m2m_buf_done(src, state);
 	v4l2_m2m_buf_done(dst, state);
+}
 
+static void rkjpegd_job_done(struct rkjpegd_dev *jpegd,
+			     enum vb2_buffer_state state)
+{
+	struct rkjpegd_ctx *ctx = jpegd->curr_ctx;
+
+	jpegd->curr_ctx = NULL;
+	rkjpegd_buf_done(ctx, state, ctx->cap_fmt.plane_fmt[0].sizeimage);
 	pm_runtime_put_autosuspend(jpegd->dev);
-	v4l2_m2m_job_finish(jpegd->m2m_dev, m2m_ctx);
+	v4l2_m2m_job_finish(jpegd->m2m_dev, ctx->fh.m2m_ctx);
 }
 
 static void rkjpegd_device_run(void *priv)
@@ -672,6 +688,12 @@ static void rkjpegd_device_run(void *priv)
 	src = v4l2_m2m_next_src_buf(m2m_ctx);
 	dst = v4l2_m2m_next_dst_buf(m2m_ctx);
 	hdr = &to_rkjpegd_buf(src)->hdr;
+
+	if (!to_rkjpegd_buf(src)->valid) {
+		rkjpegd_buf_done(ctx, VB2_BUF_STATE_ERROR, 0);
+		v4l2_m2m_job_finish(jpegd->m2m_dev, m2m_ctx);
+		return;
+	}
 
 	/*
 	 * A new size or subsampling: return an empty CAPTURE buffer flagged
@@ -722,8 +744,15 @@ static void rkjpegd_device_run(void *priv)
 static int rkjpegd_job_ready(void *priv)
 {
 	struct rkjpegd_ctx *ctx = priv;
+	struct vb2_v4l2_buffer *src;
 
-	return ctx->state == RKJPEGD_STATE_RUNNING;
+	if (ctx->state == RKJPEGD_STATE_RUNNING)
+		return 1;
+
+	/* before the first header, undecodable buffers complete with an error */
+	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+	return ctx->state == RKJPEGD_STATE_INIT && src &&
+	       !to_rkjpegd_buf(src)->valid;
 }
 
 static const struct v4l2_m2m_ops rkjpegd_m2m_ops = {
