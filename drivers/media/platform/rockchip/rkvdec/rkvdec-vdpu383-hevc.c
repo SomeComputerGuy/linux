@@ -550,8 +550,8 @@ static int rkvdec_hevc_run(struct rkvdec_ctx *ctx)
 	 * To be on the safe side for this new v4l2 control, write an error in the log and mark
 	 * the buffer as failed by returning an error here.
 	 */
-	if ((!ctx->has_sps_lt_rps && run.sps->num_long_term_ref_pics_sps) ||
-	    (!ctx->has_sps_st_rps && run.sps->num_short_term_ref_pic_sets)) {
+	if ((run.sps->num_long_term_ref_pics_sps && !run.ext_sps_lt_rps) ||
+	    (run.sps->num_short_term_ref_pic_sets && !run.ext_sps_st_rps)) {
 		dev_err_ratelimited(core->dev, "Long and short term RPS not set\n");
 		return -EINVAL;
 	}
