@@ -96,6 +96,16 @@ properties:
       Some SoCs, like rk3588 provide on-chip SRAM to store temporary
       buffers during decoding.
 
+  rockchip,ccu:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: The core coordination unit the core is connected to
+          - description: The index of the core in the core coordination unit
+    description:
+      The core coordination unit (rockchip,rk3588-vdec-ccu) that lets the
+      cores of the decoder work on the same stream.
+
 required:
   - compatible
   - reg
@@ -140,6 +150,15 @@ allOf:
         resets: false
         reset-names: false
         sram: false
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: rockchip,rk3588-vdec
+    then:
+      properties:
+        rockchip,ccu: false
 
 additionalProperties: false
 
