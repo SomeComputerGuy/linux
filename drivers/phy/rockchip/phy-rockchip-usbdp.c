@@ -1106,6 +1106,19 @@ static int rk_udphy_update_power_state(struct rk_udphy *udphy)
 			rk_udphy_run_reset_handler(udphy, false);
 			return ret;
 		}
+
+		/*
+		 * rk_udphy_init() leaves all DP lanes disabled. If the DP PHY
+		 * is powered on (the Type-C mux changed the pin assignment
+		 * while DP is in use), enable the lanes of the new
+		 * configuration again, as rk_udphy_dp_phy_power_on() does, so
+		 * that the DP controller can retrain the link.
+		 */
+		if ((udphy->sw_mode & UDPHY_MODE_DP) && (target_mode & UDPHY_MODE_DP)) {
+			phy_set_bus_width(udphy->phy_dp, udphy->dp_lanes);
+			rk_udphy_dp_lane_enable(udphy, udphy->dp_lanes);
+			rk_udphy_dp_lane_select(udphy);
+		}
 	}
 
 	/* Ensure USB3 support is enabled when supported */
