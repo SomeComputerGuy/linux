@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config VIDEO_ROCKCHIP_JPEGD
+	tristate "Rockchip VDPU720 JPEG decoder driver"
+	depends on ARCH_ROCKCHIP || COMPILE_TEST
+	depends on VIDEO_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	select V4L2_MEM2MEM_DEV
+	select V4L2_JPEG_HELPER
+	help
+	  Support for the VDPU720 baseline JPEG decoder (rkjpegd) found in
+	  Rockchip RK3588 SoCs. It is exposed as a stateful V4L2
+	  memory-to-memory decoder.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called rockchip-jpegd.
