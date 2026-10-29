@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Orange Pi 5 with an M.2 SATA SSD. The M.2 slot's single lane (combphy0)
+ * is shared between PCIe (NVMe) and SATA; this runs it in SATA mode.
+ */
+
+#include "rk3588s-orangepi-5.dts"
+
+/ {
+	model = "Xunlong Orange Pi 5 (M.2 SATA)";
+};
+
+&pcie2x1l2 {
+	status = "disabled";
+};
+
+&sata0 {
+	status = "okay";
+};
+
+&sata0 {
+	sata-port@0 {
+		/* M.2 slot 3.3 V; without a consumer it is switched off as unused */
+		target-supply = <&vcc3v3_pcie20>;
+	};
+};
