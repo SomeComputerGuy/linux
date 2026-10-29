@@ -1973,7 +1973,6 @@ enum v4l2_ctrl_type {
 	V4L2_CTRL_TYPE_H264_SLICE_PARAMS    = 0x0203,
 	V4L2_CTRL_TYPE_H264_DECODE_PARAMS   = 0x0204,
 	V4L2_CTRL_TYPE_H264_PRED_WEIGHTS    = 0x0205,
-	V4L2_CTRL_TYPE_H264_ENCODE_PARAMS   = 0x0206,
 
 	V4L2_CTRL_TYPE_FWHT_PARAMS	    = 0x0220,
 
@@ -1999,6 +1998,9 @@ enum v4l2_ctrl_type {
 	V4L2_CTRL_TYPE_AV1_FRAME	    = 0x282,
 	V4L2_CTRL_TYPE_AV1_FILM_GRAIN	    = 0x283,
 };
+
+/* Not an enumerator, to keep the module symbol versions of v4l2-core. */
+#define V4L2_CTRL_TYPE_H264_ENCODE_PARAMS	0x0206
 
 /*  Used in the VIDIOC_QUERYCTRL ioctl for querying controls */
 struct v4l2_queryctrl {
