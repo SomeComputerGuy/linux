@@ -90,6 +90,11 @@ struct dw_hdmi_qp {
 	u8 frl_rate_per_lane;
 	u8 frl_lanes;
 
+	/* Serializes ACR (N/CTS) programming against link rate changes */
+	struct mutex audio_lock;
+	/* Sample rate of the active audio stream, 0 when there is none */
+	unsigned int audio_sample_rate;
+
 	bool no_hpd;
 };
 
@@ -265,6 +270,19 @@ static void dw_hdmi_qp_set_sample_rate(struct dw_hdmi_qp *hdmi, unsigned long lo
 	dw_hdmi_qp_set_cts_n(hdmi, cts, n);
 }
 
+/*
+ * N and CTS depend on the link rate, so an audio stream that stays open across
+ * a modeset or an FRL rate change needs them reprogrammed for the new link.
+ */
+static void dw_hdmi_qp_update_acr(struct dw_hdmi_qp *hdmi)
+{
+	guard(mutex)(&hdmi->audio_lock);
+
+	if (hdmi->audio_sample_rate && hdmi->tmds_char_rate)
+		dw_hdmi_qp_set_sample_rate(hdmi, hdmi->tmds_char_rate,
+					   hdmi->audio_sample_rate);
+}
+
 static int dw_hdmi_qp_audio_enable(struct drm_bridge *bridge,
 				   struct drm_connector *connector)
 {
@@ -296,7 +314,11 @@ static int dw_hdmi_qp_audio_prepare(struct drm_bridge *bridge,
 		ref2stream = true;
 
 	dw_hdmi_qp_set_audio_interface(hdmi, fmt, hparms);
-	dw_hdmi_qp_set_sample_rate(hdmi, hdmi->tmds_char_rate, hparms->sample_rate);
+	scoped_guard(mutex, &hdmi->audio_lock) {
+		hdmi->audio_sample_rate = hparms->sample_rate;
+		dw_hdmi_qp_set_sample_rate(hdmi, hdmi->tmds_char_rate,
+					   hparms->sample_rate);
+	}
 	dw_hdmi_qp_set_channel_status(hdmi, hparms->iec.status, ref2stream);
 	drm_atomic_helper_connector_hdmi_update_audio_infoframe(connector, &hparms->cea);
 
@@ -328,6 +350,9 @@ static void dw_hdmi_qp_audio_disable(struct drm_bridge *bridge,
 	struct dw_hdmi_qp *hdmi = dw_hdmi_qp_from_bridge(bridge);
 
 	drm_atomic_helper_connector_hdmi_clear_audio_infoframe(connector);
+
+	scoped_guard(mutex, &hdmi->audio_lock)
+		hdmi->audio_sample_rate = 0;
 
 	if (hdmi->tmds_char_rate)
 		dw_hdmi_qp_audio_disable_regs(hdmi);
@@ -614,6 +639,8 @@ static void dw_hdmi_qp_bridge_atomic_enable(struct drm_bridge *bridge,
 	ret = drm_connector_hdmi_enable_frl(connector, conn_state);
 	if (ret)
 		dev_warn(hdmi->dev, "Failed to enable FRL: %d\n", ret);
+
+	dw_hdmi_qp_update_acr(hdmi);
 }
 
 static void dw_hdmi_qp_bridge_atomic_disable(struct drm_bridge *bridge,
@@ -698,6 +725,8 @@ static int dw_hdmi_qp_bridge_frl_configure(struct drm_bridge *bridge,
 
 	hdmi->frl_rate_per_lane = rate_per_lane;
 	hdmi->frl_lanes = lanes;
+
+	dw_hdmi_qp_update_acr(hdmi);
 
 link_config:
 	dw_hdmi_qp_mod(hdmi, OPMODE_FRL | (lanes == 4 ? OPMODE_FRL_4LANES : 0),
@@ -1261,6 +1290,10 @@ struct dw_hdmi_qp *dw_hdmi_qp_bind(struct platform_device *pdev,
 		return ERR_PTR(ret);
 
 	hdmi->dev = dev;
+
+	ret = devm_mutex_init(dev, &hdmi->audio_lock);
+	if (ret)
+		return ERR_PTR(ret);
 
 	regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(regs))
