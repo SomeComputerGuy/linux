@@ -175,7 +175,7 @@ static const struct v4l2_ctrl_hevc_encode_feedback *
 hevc_enc_test_feedback(struct hevc_enc_test *t)
 {
 	return v4l2_ctrl_find(&t->hdl, V4L2_CID_STATELESS_HEVC_ENCODE_FEEDBACK)
-		->p_cur.p_hevc_encode_feedback;
+		->p_cur.p;
 }
 
 static unsigned int hevc_enc_test_active(struct hevc_enc_test *t)
@@ -469,7 +469,7 @@ static void hevc_enc_validate(struct kunit *test)
 		hevc_enc_test_init(test, V4L2_HEVC_ENC_FLAG_INTER_PRED);
 	const struct v4l2_ctrl_hevc_encode_params *cur =
 		v4l2_ctrl_find(&t->hdl, V4L2_CID_STATELESS_HEVC_ENCODE_PARAMS)
-		->p_cur.p_hevc_encode_params;
+		->p_cur.p;
 	struct v4l2_ctrl_hevc_encode_params p = {
 		.nal_unit_type = V4L2_HEVC_NAL_TRAIL_R,
 		.nuh_temporal_id_plus1 = 1,
