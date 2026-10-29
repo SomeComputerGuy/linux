@@ -1271,13 +1271,11 @@ static int hantro_hw_init(struct hantro_dev *vpu)
 	ret = clk_bulk_prepare(vpu->variant->num_clocks, vpu->clocks);
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to prepare clocks\n");
-		goto err_rst_assert;
+		goto err_pm_disable;
 	}
 
 	return 0;
 
-err_rst_assert:
-	reset_control_assert(vpu->resets);
 err_pm_disable:
 	pm_runtime_dont_use_autosuspend(vpu->dev);
 	pm_runtime_disable(vpu->dev);
@@ -1287,7 +1285,6 @@ err_pm_disable:
 static void hantro_hw_cleanup(struct hantro_dev *vpu)
 {
 	clk_bulk_unprepare(vpu->variant->num_clocks, vpu->clocks);
-	reset_control_assert(vpu->resets);
 	pm_runtime_dont_use_autosuspend(vpu->dev);
 	pm_runtime_disable(vpu->dev);
 }
