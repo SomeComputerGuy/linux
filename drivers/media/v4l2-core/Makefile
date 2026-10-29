@@ -34,6 +34,7 @@ obj-$(CONFIG_V4L2_H264_ENC) += v4l2-h264-enc.o v4l2-h264-enc-rbsp.o \
 obj-$(CONFIG_V4L2_HEVC_ENC) += v4l2-hevc-enc.o
 obj-$(CONFIG_V4L2_HEVC_ENC_RBSP) += v4l2-hevc-enc-rbsp.o
 obj-$(CONFIG_V4L2_HEVC_ENC_RBSP_KUNIT_TEST) += v4l2-hevc-enc-rbsp-kunit.o
+obj-$(CONFIG_V4L2_HEVC_ENC_KUNIT_TEST) += v4l2-hevc-enc-kunit.o
 obj-$(CONFIG_V4L2_ISP) += v4l2-isp.o
 obj-$(CONFIG_V4L2_JPEG_HELPER) += v4l2-jpeg.o
 obj-$(CONFIG_V4L2_MEM2MEM_DEV) += v4l2-mem2mem.o
