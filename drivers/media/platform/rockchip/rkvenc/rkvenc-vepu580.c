@@ -4,8 +4,8 @@
  *
  * The register meanings and the default tuning values below were derived
  * from the Rockchip MPP user space library (hal_h264e_vepu580.c,
- * vepu5xx_common.c, hal_h264e_vepu580_tune.c), which is the only
- * documentation of this block. The values are expressed as named fields
+ * vepu5xx_common.c, hal_h264e_vepu580_tune.c, hal_h265e_vepu580.c), which
+ * is the only documentation of this block. The values are expressed as named fields
  * or as formulas instead of register dumps.
  */
 
@@ -454,6 +454,345 @@ void vepu580_setup_h264_tuning(struct rkvenc_dev *rkvenc,
 	/* Flat quantisation tables */
 	memcpy(&core->shadow[VEPU580_SCL_START / 4], rkvenc->h264_scl,
 	       VEPU580_SCL_H264_WORDS * sizeof(u32));
+}
+
+/*
+ * HEVC motion estimation: the same search window as H.264 (+-44 x +-28
+ * pixels), with the CIME cache sized in 64x64 CTU columns and 4-line row
+ * groups.
+ */
+void vepu580_setup_hevc_me(struct rkvenc_core *core, unsigned int width,
+			   unsigned int height, bool colmv_stor, bool colmv_load)
+{
+	const unsigned int cache_max = 2464;
+	unsigned int width_mbs = DIV_ROUND_UP(width, 16);
+	unsigned int height_mbs = DIV_ROUND_UP(height, 16);
+	unsigned int cols = DIV_ROUND_UP(width, 64);
+	unsigned int blk_w = 44, blk_h = 28, hal;
+	unsigned int srch_w, srch_h, rx, ry, cur_w, rows, rows_max;
+	unsigned int rama_h, ramb_h, l2_tag;
+
+	if (blk_w / 4 * 2 > (width_mbs * 2 + 1) / 2)
+		blk_w = (width_mbs * 2 + 1) / 2 / 2 * 4;
+
+	hal = ALIGN(height_mbs * 16, 64);
+	if (blk_h / 4 > hal / 128 * 4)
+		blk_h = hal / 128 * 16;
+
+	rkvenc_set(core, VEPU580_ME_RNGE,
+		   FIELD_PREP(VEPU580_ME_RNGE_CME_SRCH_H, blk_w / 4) |
+		   FIELD_PREP(VEPU580_ME_RNGE_CME_SRCH_V, blk_h / 4) |
+		   FIELD_PREP(VEPU580_ME_RNGE_RME_SRCH_H, 7) |
+		   FIELD_PREP(VEPU580_ME_RNGE_RME_SRCH_V, 5) |
+		   FIELD_PREP(VEPU580_ME_RNGE_DLT_FRM_NUM, 1));
+
+	rkvenc_set(core, VEPU580_ME_CFG,
+		   FIELD_PREP(VEPU580_ME_CFG_PMV_MDST_H, 5) |
+		   FIELD_PREP(VEPU580_ME_CFG_PMV_MDST_V, 5) |
+		   FIELD_PREP(VEPU580_ME_CFG_PMV_NUM, 2) |
+		   (colmv_stor ? VEPU580_ME_CFG_COLMV_STOR : 0) |
+		   (colmv_load ? VEPU580_ME_CFG_COLMV_LOAD : 0));
+
+	/* Search window in pixels, with a zero global motion vector. */
+	srch_w = blk_w;
+	srch_h = blk_h;
+	rx = (16 - srch_w % 16) % 16;
+	ry = (4 - srch_h % 4) % 4;
+	cur_w = min(DIV_ROUND_UP(rx + 2 * srch_w, 16) + 1, cols);
+	rows = DIV_ROUND_UP(ry + 2 * srch_h, 4) + 4;
+	rows_max = ALIGN(rows, 4);
+
+	rama_h = 4;
+	ramb_h = rows;
+	while (rama_h < rows_max &&
+	       cache_max > (rama_h - 4) * cols * 4 + ramb_h * 4 * cur_w) {
+		rama_h += 4;
+		ramb_h = max(ramb_h, 8U) - 4;
+	}
+
+	if (rows == 4) {
+		rama_h += 4;
+		ramb_h = 0;
+	}
+
+	if (cache_max < (rama_h - 4) * cols * 4 + ramb_h * 4 * cur_w)
+		rama_h -= 4;
+
+	if (cols <= 8)
+		l2_tag = 0;
+	else if (cols <= 16)
+		l2_tag = 1;
+	else if (cols <= 32)
+		l2_tag = 2;
+	else
+		l2_tag = 3;
+
+	rkvenc_set(core, VEPU580_ME_CACH,
+		   FIELD_PREP(VEPU580_ME_CACH_CME_RAMA_MAX,
+			      (rama_h - 4) / 4 * cols + cur_w) |
+		   FIELD_PREP(VEPU580_ME_CACH_CME_RAMA_H, rama_h) |
+		   FIELD_PREP(VEPU580_ME_CACH_CACH_L2_TAG, l2_tag) |
+		   FIELD_PREP(VEPU580_ME_CACH_CME_LINEBUF_W, cols));
+}
+
+/*
+ * Scale a lambda table entry: base[] holds three (or six) consecutive
+ * entries starting at QP @first, and the table doubles every @period QPs.
+ */
+static u32 vepu580_lambda(const u32 *base, unsigned int period,
+			  unsigned int first, unsigned int qp)
+{
+	int shift = (int)(qp / period) - (int)(first / period);
+	u32 v = base[qp % period];
+
+	if (shift >= 0)
+		return v << shift;
+
+	return (v + BIT(-shift - 1)) >> -shift;
+}
+
+/* HEVC RDO lambdas (mode decision, intra and inter) and SATD weights. */
+static const u32 vepu580_hevc_lambda_intra[3] = { 0x48f5c3, 0x5bec81, 0x73d119 };
+static const u32 vepu580_hevc_lambda_inter[3] = { 112, 137, 176 };
+static const u32 vepu580_hevc_lambda_satd[6] = {
+	0xc147, 0xd8f2, 0xf383, 0x11155, 0x132ce, 0x15861,
+};
+
+/* AQ QP steps (the same for I and P pictures) */
+static const s8 vepu580_hevc_aq_step[16] = {
+	-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 5, 7, 8, 9,
+};
+
+/* Intra pre-selection: candidate directions m0..m9 per edge class */
+static const u8 vepu580_hevc_pre_intra_cla[9][10] = {
+	{ 10, 11, 12, 13, 14,  9, 15,  8, 16,  7 },
+	{ 10,  9,  8,  7,  6, 11,  5, 12,  4, 13 },
+	{ 18, 17, 16, 15, 14, 19, 13, 20, 12, 21 },
+	{ 18, 19, 20, 21, 22, 17, 23, 16, 24, 15 },
+	{ 25, 26, 24, 23, 22, 27, 21, 28, 20, 29 },
+	{ 27, 26, 28, 29, 30, 25, 31, 24, 32, 23 },
+	{ 34, 33, 32, 31, 30,  2, 29,  3, 28,  4 },
+	{ 34,  2,  3,  4,  5, 33,  6, 32,  7, 31 },
+	{ 10, 26, 18, 34,  6, 14, 22, 30,  2, 24 },
+};
+
+static u32 pack5x6(const u8 *v)
+{
+	return (v[0] & 0x3f) | (v[1] & 0x3f) << 6 | (v[2] & 0x3f) << 12 |
+	       (v[3] & 0x3f) << 18 | (v[4] & 0x3f) << 24;
+}
+
+static u32 pack2x15(u32 lo, u32 hi)
+{
+	return (lo & 0x7fff) | (hi & 0x7fff) << 16;
+}
+
+/* RDO weights of a CU size: four rows of three */
+struct vepu580_hevc_atf {
+	u16 cime[4];
+	u8 wgt00;
+	u8 wgt[4][3];
+};
+
+static const struct vepu580_hevc_atf vepu580_hevc_atf_inter = {
+	.cime = { 32, 144, 300 },
+	.wgt = { { 16, 16, 16 }, { 16, 16, 16 }, { 16, 16, 16 }, { 16, 16, 16 } },
+};
+
+static const struct vepu580_hevc_atf vepu580_hevc_atf_intra = {
+	.cime = { 24, 48, 64 },
+	.wgt = { { 26, 25, 25 }, { 25, 24, 23 }, { 21, 19, 18 }, { 16, 16, 16 } },
+};
+
+static const struct vepu580_hevc_atf vepu580_hevc_atf_skip64 = {
+	.cime = { 24, 4, 6, 8 },
+	.wgt00 = 16,
+	.wgt = { { 10, 10, 10 }, { 14, 14, 15 }, { 15, 15, 16 }, { 16, 16, 16 } },
+};
+
+static const struct vepu580_hevc_atf vepu580_hevc_atf_skip32 = {
+	.cime = { 24, 4, 6, 8 },
+	.wgt00 = 18,
+	.wgt = { { 11, 11, 11 }, { 13, 13, 13 }, { 15, 15, 15 }, { 16, 16, 16 } },
+};
+
+static const struct vepu580_hevc_atf vepu580_hevc_atf_skip16 = {
+	.cime = { 24, 24, 48, 96 },
+	.wgt00 = 16,
+	.wgt = { { 16, 16, 16 }, { 16, 16, 16 }, { 16, 16, 16 }, { 16, 16, 16 } },
+};
+
+static void vepu580_hevc_set_atf(struct rkvenc_core *core, u32 base,
+				 const struct vepu580_hevc_atf *atf, bool skip)
+{
+	unsigned int i;
+
+	rkvenc_set(core, base, pack2x12(atf->cime[0], atf->cime[1]));
+	rkvenc_set(core, base + 4, skip ? pack2x12(atf->cime[2], atf->cime[3]) :
+					  atf->cime[2]);
+	/* Variance thresholds */
+	for (i = 0; i < 4; i++)
+		rkvenc_set(core, base + 8 + 4 * i, pack2x12(31, 400));
+
+	for (i = 0; i < 4; i++) {
+		const u8 *w = atf->wgt[i];
+
+		if (skip && !i)
+			rkvenc_set(core, base + 24,
+				   pack4(atf->wgt00, w[0], w[1], w[2]));
+		else
+			rkvenc_set(core, base + 24 + 4 * i,
+				   pack4(w[0], w[1], w[2], 0));
+	}
+}
+
+void vepu580_setup_hevc_tuning(struct rkvenc_core *core, bool intra)
+{
+	static const u8 sobel_a16[5] = { 32, 32, 32, 32, 32 };
+	static const u8 sobel_c16[5] = { 13, 13, 13, 13, 13 };
+	static const u8 sobel_a32[5] = { 18, 18, 18, 18, 18 };
+	static const u8 sobel_c32[5] = { 16, 16, 16, 16, 16 };
+	unsigned int i;
+
+	vepu580_setup_klut(core, intra);
+
+	/* Texture statistics and adaptive QP */
+	rkvenc_set(core, VEPU580_MADI_CFG, FIELD_PREP(VEPU580_MADI_CFG_MADI_THD, 25));
+	rkvenc_set(core, VEPU580_MD_SAD_THD, pack4(20, 30, 40, 0));
+	rkvenc_set(core, VEPU580_MADI_THD, pack4(25, 35, 45, 0));
+	for (i = 0; i < 4; i++) {
+		const s8 *st = &vepu580_hevc_aq_step[4 * i];
+
+		rkvenc_set(core, VEPU580_AQ_TTHD(i),
+			   pack4(vepu580_aq_tthd[4 * i], vepu580_aq_tthd[4 * i + 1],
+				 vepu580_aq_tthd[4 * i + 2], vepu580_aq_tthd[4 * i + 3]));
+		rkvenc_set(core, VEPU580_AQ_STEP(i),
+			   pack4(st[0] & 0x3f, st[1] & 0x3f, st[2] & 0x3f,
+				 st[3] & 0x3f));
+	}
+
+	/* Intra cost thresholds (2, 6, 16, 36) and weights of 32x32 and 16x16 */
+	rkvenc_set(core, VEPU580_LVL32_INTRA_CST_THD0, pack2x12(2, 6));
+	rkvenc_set(core, VEPU580_LVL32_INTRA_CST_THD1, pack2x12(16, 36));
+	rkvenc_set(core, VEPU580_LVL16_INTRA_CST_THD0, pack2x12(2, 6));
+	rkvenc_set(core, VEPU580_LVL16_INTRA_CST_THD1, pack2x12(16, 36));
+	rkvenc_set(core, VEPU580_LVL32_INTRA_CST_WGT0, pack4(23, 22, 21, 20));
+	rkvenc_set(core, VEPU580_LVL32_INTRA_CST_WGT1, pack4(22, 24, 26, 0));
+	rkvenc_set(core, VEPU580_LVL16_INTRA_CST_WGT0, pack4(17, 17, 17, 18));
+	rkvenc_set(core, VEPU580_LVL16_INTRA_CST_WGT1, pack4(17, 18, 18, 0));
+
+	/* Quantisation dead zone: 171/1024 (I), 85/1024 (P) */
+	rkvenc_set(core, VEPU580_RDO_QUANT,
+		   FIELD_PREP(VEPU580_RDO_QUANT_F_BIAS_I, 171) |
+		   FIELD_PREP(VEPU580_RDO_QUANT_F_BIAS_P, 85));
+
+	/* Motion search quality / cost multipliers */
+	rkvenc_set(core, VEPU580_CIME_SQI_CFG,
+		   VEPU580_CIME_SQI_CFG_PMV_SET_ZERO |
+		   FIELD_PREP(VEPU580_CIME_SQI_CFG_PMV_NUM, 3));
+	rkvenc_set(core, VEPU580_CIME_SQI_THD,
+		   FIELD_PREP(VEPU580_CIME_SQI_THD_MVD_TH0, 32) |
+		   FIELD_PREP(VEPU580_CIME_SQI_THD_MVD_TH1, 80) |
+		   FIELD_PREP(VEPU580_CIME_SQI_THD_MVD_TH2, 128));
+	rkvenc_set(core, VEPU580_CIME_SQI_MULTI0,
+		   FIELD_PREP(VEPU580_CIME_SQI_MULTI_LO, 16) |
+		   FIELD_PREP(VEPU580_CIME_SQI_MULTI_HI, 32));
+	rkvenc_set(core, VEPU580_CIME_SQI_MULTI1,
+		   FIELD_PREP(VEPU580_CIME_SQI_MULTI_LO, 96) |
+		   FIELD_PREP(VEPU580_CIME_SQI_MULTI_HI, 96));
+	rkvenc_set(core, VEPU580_RIME_SQI_THD,
+		   FIELD_PREP(VEPU580_RIME_SQI_THD_CIME_SAD_TH0, 48) |
+		   FIELD_PREP(VEPU580_RIME_SQI_THD_MVD_TH0, 3) |
+		   FIELD_PREP(VEPU580_RIME_SQI_THD_MVD_TH1, 8));
+	rkvenc_set(core, VEPU580_RIME_SQI_MULTI,
+		   FIELD_PREP(VEPU580_RIME_SQI_MULTI0, 16) |
+		   FIELD_PREP(VEPU580_RIME_SQI_MULTI1, 16) |
+		   FIELD_PREP(VEPU580_RIME_SQI_MULTI2, 128));
+	rkvenc_set(core, VEPU580_FME_SQI_THD0,
+		   FIELD_PREP(VEPU580_FME_SQI_THD0_PU16_TH, 16) |
+		   FIELD_PREP(VEPU580_FME_SQI_THD0_PU32_TH, 16));
+	rkvenc_set(core, VEPU580_FME_SQI_THD1,
+		   FIELD_PREP(VEPU580_FME_SQI_THD1_PU64_TH, 16) |
+		   FIELD_PREP(VEPU580_FME_SQI_THD1_MOVE_LAMBDA, 1));
+
+	/*
+	 * Lambdas: SATD weights grow by 2^(1/6) per QP, mode decision lambdas
+	 * by 2^(1/3).
+	 */
+	for (i = 0; i < 52; i++) {
+		rkvenc_set(core, VEPU580_IPRD_WGT_QP(i),
+			   vepu580_lambda(vepu580_hevc_lambda_satd, 6, 42, i));
+		rkvenc_set(core, VEPU580_RDO_WGTA_QP(i),
+			   intra ? vepu580_lambda(vepu580_hevc_lambda_intra, 3, 48, i) :
+				   vepu580_lambda(vepu580_hevc_lambda_inter, 3, 0, i));
+	}
+
+	/* Intra pre-selection classes and Sobel edge weights */
+	for (i = 0; i < ARRAY_SIZE(vepu580_hevc_pre_intra_cla); i++) {
+		rkvenc_set(core, VEPU580_HEVC_PRE_INTRA_CLA(i, 0),
+			   pack5x6(&vepu580_hevc_pre_intra_cla[i][0]));
+		rkvenc_set(core, VEPU580_HEVC_PRE_INTRA_CLA(i, 1),
+			   pack5x6(&vepu580_hevc_pre_intra_cla[i][5]));
+	}
+
+	rkvenc_set(core, VEPU580_HEVC_I16_SOBEL_T, pack2x12(64, 200));
+	rkvenc_set(core, VEPU580_HEVC_I16_SOBEL_A(0), pack5x6(sobel_a16));
+	rkvenc_set(core, VEPU580_HEVC_I16_SOBEL_A(1), pack5x6(sobel_a16) & 0xffffff);
+	rkvenc_set(core, VEPU580_HEVC_I16_SOBEL_C(0), pack5x6(sobel_c16));
+	rkvenc_set(core, VEPU580_HEVC_I16_SOBEL_C(1), pack5x6(sobel_c16) & 0xffffff);
+	for (i = 0; i < 4; i++)
+		rkvenc_set(core, VEPU580_HEVC_I16_SOBEL_D(i), pack2x15(23750, 23750));
+	rkvenc_set(core, VEPU580_HEVC_I16_SOBEL_D(4), pack2x15(23750, 0));
+	for (i = 0; i < 9; i++)
+		rkvenc_set(core, VEPU580_HEVC_I16_SOBEL_E_LOW(i), 20000);
+
+	rkvenc_set(core, VEPU580_HEVC_I32_SOBEL_T(0), pack2x12(64, 400));
+	rkvenc_set(core, VEPU580_HEVC_I32_SOBEL_T(1), 8);
+	rkvenc_set(core, VEPU580_HEVC_I32_SOBEL_T(2), pack2x12(100, 100));
+	rkvenc_set(core, VEPU580_HEVC_I32_SOBEL_A, pack5x6(sobel_a32));
+	rkvenc_set(core, VEPU580_HEVC_I32_SOBEL_C, pack5x6(sobel_c32));
+	for (i = 0; i < 5; i++)
+		rkvenc_set(core, VEPU580_HEVC_I32_SOBEL_E_LOW(i), 20000);
+
+	/* RDO thresholds and weights per CU size */
+	rkvenc_set(core, VEPU580_RDO_SQI_CFG,
+		   VEPU580_HEVC_RDO_SQI_CFG_SEGMENT_EN |
+		   VEPU580_HEVC_RDO_SQI_CFG_SMEAR_EN);
+	vepu580_hevc_set_atf(core, VEPU580_HEVC_RDO_B64_INTER, &vepu580_hevc_atf_inter, false);
+	vepu580_hevc_set_atf(core, VEPU580_HEVC_RDO_B64_SKIP, &vepu580_hevc_atf_skip64, true);
+	vepu580_hevc_set_atf(core, VEPU580_HEVC_RDO_B32_INTRA, &vepu580_hevc_atf_intra, false);
+	vepu580_hevc_set_atf(core, VEPU580_HEVC_RDO_B32_INTER, &vepu580_hevc_atf_inter, false);
+	vepu580_hevc_set_atf(core, VEPU580_HEVC_RDO_B32_SKIP, &vepu580_hevc_atf_skip32, true);
+	vepu580_hevc_set_atf(core, VEPU580_HEVC_RDO_B16_INTRA, &vepu580_hevc_atf_intra, false);
+	vepu580_hevc_set_atf(core, VEPU580_HEVC_RDO_B16_INTER, &vepu580_hevc_atf_inter, false);
+	vepu580_hevc_set_atf(core, VEPU580_HEVC_RDO_B16_SKIP, &vepu580_hevc_atf_skip16, true);
+	vepu580_hevc_set_atf(core, VEPU580_HEVC_RDO_B8_INTRA, &vepu580_hevc_atf_intra, false);
+	vepu580_hevc_set_atf(core, VEPU580_HEVC_RDO_B8_INTER, &vepu580_hevc_atf_inter, false);
+	vepu580_hevc_set_atf(core, VEPU580_HEVC_RDO_B8_SKIP, &vepu580_hevc_atf_skip16, true);
+
+	/* Segment (th3..th6 are 4-bit fields for CU64, 2-bit for CU32) */
+	rkvenc_set(core, VEPU580_HEVC_RDO_SEGMENT_B64_THD0, pack2x12(160, 96));
+	rkvenc_set(core, VEPU580_HEVC_RDO_SEGMENT_B64_THD1,
+		   30 | 0 << 16 | 1 << 20 | 4 << 24 | 11 << 28);
+	rkvenc_set(core, VEPU580_HEVC_RDO_SEGMENT_B32_THD0, pack2x12(160, 96));
+	rkvenc_set(core, VEPU580_HEVC_RDO_SEGMENT_B32_THD1,
+		   30 | 0 << 16 | 1 << 20 | 2 << 24 | 3 << 28);
+	rkvenc_set(core, VEPU580_HEVC_RDO_SEGMENT_MULTI, pack4(22, 22, 6, 0));
+	rkvenc_set(core, VEPU580_HEVC_RDO_B16_SMEAR_THD0, pack2x12(64, 32));
+	rkvenc_set(core, VEPU580_HEVC_RDO_B16_SMEAR_THD1, pack2x12(36, 64));
+
+	/* Pre-intra: variance thresholds 9/4, mode threshold 5, weights 31/25 */
+	rkvenc_set(core, VEPU580_HEVC_PREINTRA_B32_CST_VAR_THD,
+		   pack2x12(9, 4) | 5 << 29);
+	rkvenc_set(core, VEPU580_HEVC_PREINTRA_B32_CST_WGT, 31 | 25 << 16);
+	rkvenc_set(core, VEPU580_HEVC_PREINTRA_B16_CST_VAR_THD,
+		   pack2x12(9, 4) | 5 << 29);
+	rkvenc_set(core, VEPU580_HEVC_PREINTRA_B16_CST_WGT, 31 | 25 << 16);
+
+	/*
+	 * The scaling list block is left at zero: with scl_lst_sel = 0 the
+	 * hardware quantises with flat matrices.
+	 */
 }
 
 /*
