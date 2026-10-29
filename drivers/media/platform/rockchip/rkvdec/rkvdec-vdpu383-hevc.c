@@ -124,7 +124,7 @@ struct rkvdec_hevc_priv_tbl {
 struct rkvdec_hevc_ctx {
 	struct rkvdec_aux_buf			priv_tbl;
 	struct v4l2_ctrl_hevc_scaling_matrix	scaling_matrix_cache;
-	struct v4l2_ctrl_hevc_ext_sps_st_rps	st_cache;
+	struct rkvdec_hevc_st_rps_cache		st_cache;
 	struct vdpu383_regs_h26x		regs;
 };
 

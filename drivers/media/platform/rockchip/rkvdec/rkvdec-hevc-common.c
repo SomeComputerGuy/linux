@@ -328,14 +328,26 @@ static void st_ref_pic_set_calculate(struct rkvdec_hevc_run *run, int idx,
 }
 
 static void rkvdec_hevc_prepare_hw_st_rps(struct rkvdec_hevc_run *run, struct rkvdec_rps *rps,
-					  struct v4l2_ctrl_hevc_ext_sps_st_rps *cache)
+					  struct rkvdec_hevc_st_rps_cache *cache)
 {
+	unsigned int num_sets = run->sps->num_short_term_ref_pic_sets;
+	size_t size = num_sets * sizeof(*run->ext_sps_st_rps);
 	int idx;
 
 	if (!run->ext_sps_st_rps)
 		return;
 
-	if (!memcmp(cache, run->ext_sps_st_rps, sizeof(struct v4l2_ctrl_hevc_ext_sps_st_rps)))
+	/* The SPS control's validation limits the count to the table size. */
+	if (WARN_ON_ONCE(num_sets > ARRAY_SIZE(cache->sets)))
+		return;
+
+	/*
+	 * Every set can differ, and so can their number. The zeroed initial
+	 * cache has no sets, so the first SPS that has any always builds the
+	 * table, whatever its sets contain.
+	 */
+	if (cache->num_sets == num_sets &&
+	    !memcmp(cache->sets, run->ext_sps_st_rps, size))
 		return;
 
 	struct calculated_rps_st_set *calculated_rps_st_sets =
@@ -355,11 +367,12 @@ static void rkvdec_hevc_prepare_hw_st_rps(struct rkvdec_hevc_run *run, struct rk
 
 	kfree(calculated_rps_st_sets);
 
-	memcpy(cache, run->ext_sps_st_rps, sizeof(struct v4l2_ctrl_hevc_ext_sps_st_rps));
+	cache->num_sets = num_sets;
+	memcpy(cache->sets, run->ext_sps_st_rps, size);
 }
 
 void rkvdec_hevc_assemble_hw_rps(struct rkvdec_hevc_run *run, struct rkvdec_rps *rps,
-				 struct v4l2_ctrl_hevc_ext_sps_st_rps *st_cache)
+				 struct rkvdec_hevc_st_rps_cache *st_cache)
 {
 	rkvdec_hevc_prepare_hw_st_rps(run, rps, st_cache);
 	rkvdec_hevc_assemble_hw_lt_rps(run, rps);
