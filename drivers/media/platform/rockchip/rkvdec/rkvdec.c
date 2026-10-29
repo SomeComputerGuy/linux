@@ -163,6 +163,12 @@ static int rkvdec_s_ctrl(struct v4l2_ctrl *ctrl)
 	enum rkvdec_image_fmt image_fmt;
 	struct vb2_queue *vq;
 
+	/*
+	 * The RPS controls are EXECUTE_ON_WRITE, so every write by userspace
+	 * gets here with has_changed set, even when the value (such as the
+	 * default) equals the current one. v4l2_ctrl_handler_setup() calls
+	 * this without has_changed, which mustn't count as a write.
+	 */
 	if (ctrl->id == V4L2_CID_STATELESS_HEVC_EXT_SPS_ST_RPS) {
 		ctx->has_sps_st_rps |= !!(ctrl->has_changed);
 		return 0;
@@ -287,11 +293,13 @@ static const struct rkvdec_ctrl_desc vdpu38x_hevc_ctrl_descs[] = {
 	},
 	{
 		.cfg.id = V4L2_CID_STATELESS_HEVC_EXT_SPS_ST_RPS,
+		.cfg.flags = V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
 		.cfg.ops = &rkvdec_ctrl_ops,
 		.cfg.dims = { 64 },
 	},
 	{
 		.cfg.id = V4L2_CID_STATELESS_HEVC_EXT_SPS_LT_RPS,
+		.cfg.flags = V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
 		.cfg.ops = &rkvdec_ctrl_ops,
 		.cfg.dims = { 32 },
 	},
@@ -1346,10 +1354,18 @@ static int rkvdec_add_ctrls(struct rkvdec_ctx *ctx,
 
 	for (i = 0; i < ctrls->num_ctrls; i++) {
 		const struct v4l2_ctrl_config *cfg = &ctrls->ctrls[i].cfg;
+		struct v4l2_ctrl *ctrl;
 
-		v4l2_ctrl_new_custom(&ctx->ctrl_hdl, cfg, ctx);
+		ctrl = v4l2_ctrl_new_custom(&ctx->ctrl_hdl, cfg, ctx);
 		if (ctx->ctrl_hdl.error)
 			return ctx->ctrl_hdl.error;
+
+		/*
+		 * v4l2_ctrl_fill() replaces cfg->flags for standard controls.
+		 * EXECUTE_ON_WRITE only changes when s_ctrl is called, so it
+		 * can be added afterwards.
+		 */
+		ctrl->flags |= cfg->flags & V4L2_CTRL_FLAG_EXECUTE_ON_WRITE;
 	}
 
 	return 0;
