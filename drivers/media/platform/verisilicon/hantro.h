@@ -77,6 +77,8 @@ struct hantro_irq {
  * @double_buffer:		core needs double buffering
  * @legacy_regs:		core uses legacy register set
  * @late_postproc:		postproc must be set up at the end of the job
+ * @multi_core:			identical instances of this variant can be driven as
+ *				a single device, running jobs in parallel
  * @shared_devices:		an array of device ids that cannot run concurrently
  */
 struct hantro_variant {
@@ -102,6 +104,7 @@ struct hantro_variant {
 	unsigned int double_buffer : 1;
 	unsigned int legacy_regs : 1;
 	unsigned int late_postproc : 1;
+	unsigned int multi_core : 1;
 	const struct of_device_id *shared_devices;
 };
 
@@ -173,6 +176,21 @@ hantro_vdev_to_func(struct video_device *vdev)
 }
 
 /**
+ * enum hantro_core_role - role of a VPU instance
+ * @HANTRO_CORE_SINGLE:		Standalone instance.
+ * @HANTRO_CORE_MAIN:		Main core of a multi-core device. It exposes the
+ *				device to userspace and binds the secondary
+ *				cores.
+ * @HANTRO_CORE_SECONDARY:	Secondary core of a multi-core device, running
+ *				jobs scheduled by the main core.
+ */
+enum hantro_core_role {
+	HANTRO_CORE_SINGLE,
+	HANTRO_CORE_MAIN,
+	HANTRO_CORE_SECONDARY,
+};
+
+/**
  * struct hantro_dev - driver data
  * @v4l2_dev:		V4L2 device to register video devices for.
  * @m2m_dev:		mem2mem device associated to this device.
@@ -201,6 +219,9 @@ hantro_vdev_to_func(struct video_device *vdev)
  * @num_cores:		Number of entries in @cores.
  * @cores_lock:		Spinlock protecting @cores, @num_cores and @curr_ctx
  *			of each core.
+ * @role:		Role of this instance in a multi-core device.
+ * @attached_domain:	IOMMU domain of the main core that this secondary
+ *			core is attached to, if any.
  */
 struct hantro_dev {
 	struct v4l2_device v4l2_dev;
@@ -226,6 +247,8 @@ struct hantro_dev {
 	struct hantro_dev **cores;
 	unsigned int num_cores;
 	spinlock_t cores_lock; /* protects the core list and curr_ctx */
+	enum hantro_core_role role;
+	struct iommu_domain *attached_domain;
 };
 
 /**
