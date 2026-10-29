@@ -467,6 +467,13 @@ static void config_registers(struct rkvdec_ctx *ctx,
 			(V4L2_VP9_FRAME_FLAG_KEY_FRAME |
 			 V4L2_VP9_FRAME_FLAG_INTRA_ONLY));
 
+	/*
+	 * The register set is kept in the context and only partially written
+	 * below: start from a clean set so that nothing leaks from the
+	 * previous frame.
+	 */
+	memset(regs, 0, sizeof(*regs));
+
 	regs->common.reg009_dec_mode.dec_mode = VDPU381_MODE_VP9;
 
 	regs->vp9_param.reg103.vp9_intra_only_flag = intra_only;
