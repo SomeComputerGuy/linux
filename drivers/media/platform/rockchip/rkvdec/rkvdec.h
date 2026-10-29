@@ -30,7 +30,11 @@
 #define RKVDEC_4K_PIXELS		(4096 * 2304)
 #define RKVDEC_8K_PIXELS		(7680 * 4320)
 
+/* Maximum number of frames of one context decoded at the same time */
+#define RKVDEC_MAX_JOBS			2
+
 struct rkvdec_ctx;
+struct rkvdec_core;
 struct rkvdec_rcb_config;
 
 struct rkvdec_ctrl_desc {
@@ -130,6 +134,34 @@ struct rkvdec_coded_fmt_desc {
 	u32 subsystem_flags;
 };
 
+/**
+ * struct rkvdec_job - a frame being decoded
+ * @node: entry in the &rkvdec_ctx.jobs list
+ * @ctx: the context the frame belongs to
+ * @core: the core decoding the frame, NULL once the hardware is done
+ * @src: the OUTPUT buffer
+ * @dst: the CAPTURE buffer
+ * @state: the result of the decoding
+ * @slot: index of the job in &rkvdec_ctx.job_slots, selects the per-job
+ *	  auxiliary buffers of the coded format
+ * @detached: the buffers were taken off the m2m queues and the m2m job is
+ *	      finished, so the next frame may start before this one is done
+ * @hw_done: the hardware is done with the frame
+ * @busy: the m2m state of the job is being changed, don't complete it
+ */
+struct rkvdec_job {
+	struct list_head node;
+	struct rkvdec_ctx *ctx;
+	struct rkvdec_core *core;
+	struct vb2_v4l2_buffer *src;
+	struct vb2_v4l2_buffer *dst;
+	enum vb2_buffer_state state;
+	unsigned int slot;
+	bool detached;
+	bool hw_done;
+	bool busy;
+};
+
 struct rkvdec_core {
 	struct device *dev;
 	struct rkvdec_dev *rkvdec;
@@ -148,6 +180,7 @@ struct rkvdec_core {
 	struct iommu_domain *empty_domain;
 	struct rkvdec_rcb_config *rcb_config;
 	struct rkvdec_ctx *curr_ctx;
+	struct rkvdec_job *job;
 	int id;
 };
 
@@ -162,9 +195,10 @@ struct rkvdec_dev {
 	int core_count;
 	struct rkvdec_core **available_cores;
 	unsigned int available_core_count;
-	spinlock_t cores_lock; /* serializes core list access */
+	spinlock_t cores_lock; /* protects the cores, the job lists and held_job */
 	struct rkvdec_core *main_core;
 	struct iommu_domain *iommu_global_domain;
+	struct rkvdec_job *held_job;
 };
 
 struct rkvdec_ctx {
@@ -176,7 +210,16 @@ struct rkvdec_ctx {
 	struct rkvdec_dev *dev;
 	enum rkvdec_image_fmt image_fmt;
 	u32 colmv_offset;
+	/* The core and job being set up, only valid in &rkvdec_coded_fmt_ops.run */
 	struct rkvdec_core *core;
+	struct rkvdec_job *job;
+	struct rkvdec_job job_slots[RKVDEC_MAX_JOBS];
+	unsigned int num_job_slots;
+	unsigned long busy_slots;
+	struct list_head jobs;
+	unsigned int num_jobs;
+	wait_queue_head_t jobs_wq;
+	struct mutex done_lock; /* completes the jobs in decoding order */
 	void *priv;
 	u8 has_sps_st_rps: 1;
 	u8 has_sps_lt_rps: 1;
