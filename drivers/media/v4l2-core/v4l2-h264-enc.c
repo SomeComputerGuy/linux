@@ -470,7 +470,7 @@ static int state_prepare_params(struct v4l2_h264_enc *enc)
 	if (!ctrl)
 		return -EINVAL;
 
-	memcpy(encode, ctrl->p_cur.p_h264_encode_params, sizeof(*encode));
+	memcpy(encode, ctrl->p_cur.p, sizeof(*encode));
 
 	if (encode->slice_type == V4L2_H264_SLICE_TYPE_SI)
 		encode->slice_type = V4L2_H264_SLICE_TYPE_I;
