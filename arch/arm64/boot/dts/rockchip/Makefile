@@ -241,6 +241,8 @@ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-nanopi-r6c.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-odroid-m2.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-orangepi-5.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-orangepi-5-cam1-imx219.dtbo
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-orangepi-5-cam1-ov13850.dtbo
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-orangepi-5-cam1-ov13855.dtbo
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-orangepi-5-lcd1.dtbo
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-orangepi-5-lcd2.dtbo
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-orangepi-5-sata.dtb
@@ -358,6 +360,14 @@ rk3588-tiger-haikou-haikou-video-demo-dtbs := rk3588-tiger-haikou.dtb \
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-orangepi-5-cam1-imx219.dtb
 rk3588s-orangepi-5-cam1-imx219-dtbs := rk3588s-orangepi-5.dtb \
 	rk3588s-orangepi-5-cam1-imx219.dtbo
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-orangepi-5-cam1-ov13850.dtb
+rk3588s-orangepi-5-cam1-ov13850-dtbs := rk3588s-orangepi-5.dtb \
+	rk3588s-orangepi-5-cam1-ov13850.dtbo
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-orangepi-5-cam1-ov13855.dtb
+rk3588s-orangepi-5-cam1-ov13855-dtbs := rk3588s-orangepi-5.dtb \
+	rk3588s-orangepi-5-cam1-ov13855.dtbo
 
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-orangepi-5-sata-cam1-imx219.dtb
 rk3588s-orangepi-5-sata-cam1-imx219-dtbs := rk3588s-orangepi-5-sata.dtb \
