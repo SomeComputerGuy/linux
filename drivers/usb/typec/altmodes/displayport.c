@@ -220,6 +220,21 @@ static int dp_altmode_configured(struct dp_altmode *dp)
 			sysfs_notify(&dp->alt->dev.kobj, "displayport", "irq_hpd");
 			dp->pending_irq_hpd = false;
 		}
+	} else if (dp->hpd) {
+		int ret;
+
+		/*
+		 * A Configure command while HPD is asserted (for example a new
+		 * pin assignment written to sysfs) passes through USB Safe State
+		 * and switches the lanes, which tears down the DisplayPort main
+		 * link. The sink keeps HPD asserted, so nothing else tells the
+		 * DisplayPort driver: notify it once the new configuration is
+		 * in place, so that it can check the link and retrain it.
+		 */
+		ret = dp_altmode_notify(dp);
+		drm_connector_oob_hotplug_event(dp->connector_fwnode,
+						connector_status_connected);
+		return ret;
 	}
 
 	return dp_altmode_notify(dp);
