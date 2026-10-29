@@ -3738,8 +3738,7 @@
 		compatible = "rockchip,rk3588-isp";
 		reg = <0x0 0xfdcb0000 0x0 0x7f00>;
 		interrupts = <GIC_SPI 131 IRQ_TYPE_LEVEL_HIGH 0>,
-			     <GIC_SPI 133 IRQ_TYPE_LEVEL_HIGH 0>,
-			     <GIC_SPI 134 IRQ_TYPE_LEVEL_HIGH 0>;
+			     <GIC_SPI 133 IRQ_TYPE_LEVEL_HIGH 0>;
 		interrupt-names = "isp_irq", "mi_irq";
 		clocks = <&cru ACLK_ISP0>, <&cru HCLK_ISP0>,
 			 <&cru CLK_ISP0_CORE>, <&cru CLK_ISP0_CORE_MARVIN>,
