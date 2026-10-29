@@ -48,6 +48,10 @@ config V4L2_H264
 config V4L2_H264_ENC
 	tristate
 
+# Used by drivers that need v4l2-hevc-enc-rbsp.ko
+config V4L2_HEVC_ENC_RBSP
+	tristate
+
 # Used by drivers that need v4l2-vp9.ko
 config V4L2_VP9
 	tristate
