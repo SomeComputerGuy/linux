@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0
+config VIDEO_ROCKCHIP_VENC
+	tristate "Rockchip VEPU580 stateless video encoder driver"
+	depends on ARCH_ROCKCHIP || COMPILE_TEST
+	depends on VIDEO_DEV
+	select MEDIA_CONTROLLER
+	select VIDEOBUF2_DMA_CONTIG
+	select V4L2_MEM2MEM_DEV
+	select V4L2_H264
+	select V4L2_H264_ENC
+	help
+	  Support for the VEPU580 (RKVENC) video encoder of the Rockchip
+	  RK3588, using the V4L2 stateless encoder interface. H.264 is
+	  supported.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called rockchip-venc.
