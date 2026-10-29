@@ -15,6 +15,7 @@
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-h264-enc.h>
+#include <media/v4l2-hevc-enc.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-core.h>
@@ -45,12 +46,15 @@ struct rkvenc_aux_buf {
  * @thumb: 1/4 x 1/4 down-scaled luma used by the coarse motion search
  * @colmv: collocated motion vectors (HEVC TMVP only)
  * @fbc_hdr_size: offset of the FBC body inside @pixel
+ * @colmv_valid: the hardware stored the motion vectors of the picture in
+ *		 @colmv (HEVC, inter pictures only)
  */
 struct rkvenc_rec_buf {
 	struct rkvenc_aux_buf pixel;
 	struct rkvenc_aux_buf thumb;
 	struct rkvenc_aux_buf colmv;
 	size_t fbc_hdr_size;
+	bool colmv_valid;
 };
 
 enum rkvenc_pnum {
@@ -201,6 +205,30 @@ struct rkvenc_h264_ctx {
 	bool hw_rc;
 };
 
+/**
+ * struct rkvenc_hevc_rc - HEVC constant bitrate frame rate control
+ * @bitrate: bitrate the state was set up for, 0 before the first picture
+ * @qp: QP of the next I and P picture
+ * @buffer_bits: accumulated difference between the coded and the nominal
+ *		 picture sizes
+ * @target_bits: size target of the current picture
+ */
+struct rkvenc_hevc_rc {
+	unsigned int bitrate;
+	int qp[2];
+	s64 buffer_bits;
+	u64 target_bits;
+};
+
+/**
+ * struct rkvenc_hevc_ctx - HEVC per-context state
+ */
+struct rkvenc_hevc_ctx {
+	struct v4l2_hevc_enc enc;
+	struct rkvenc_hevc_rc rc;
+	bool hw_rc;
+};
+
 struct rkvenc_ctx {
 	struct v4l2_fh fh;
 	struct rkvenc_dev *dev;
@@ -242,6 +270,9 @@ void vepu580_setup_me(struct rkvenc_core *core, unsigned int width_mbs,
 		      bool intra);
 void vepu580_setup_h264_tuning(struct rkvenc_dev *rkvenc,
 			       struct rkvenc_core *core, bool intra);
+void vepu580_setup_hevc_me(struct rkvenc_core *core, unsigned int width,
+			   unsigned int height, bool colmv_stor, bool colmv_load);
+void vepu580_setup_hevc_tuning(struct rkvenc_core *core, bool intra);
 
 /**
  * struct vepu580_row_rc - codec-specific row rate control parameters
@@ -269,5 +300,6 @@ dma_addr_t rkvenc_dst_addr(struct rkvenc_run *run);
 size_t rkvenc_dst_size(struct rkvenc_run *run);
 
 extern const struct rkvenc_coded_fmt_desc rkvenc_h264_fmt_desc;
+extern const struct rkvenc_coded_fmt_desc rkvenc_hevc_fmt_desc;
 
 #endif /* RKVENC_H_ */
