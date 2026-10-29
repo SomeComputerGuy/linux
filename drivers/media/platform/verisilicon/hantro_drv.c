@@ -1114,6 +1114,22 @@ init_new_m2m_dev:
 	return v4l2_m2m_init(&vpu_m2m_ops);
 }
 
+/*
+ * The resets may also cover the bus interface that the IOMMU of the VPU is
+ * accessed through, e.g. on the RK3588 AV1 decoder. The IOMMU is a separate
+ * device which is runtime resumed with the VPU while it is unbound, and
+ * accesses its registers again when it runtime suspends afterwards. Holding
+ * the VPU in reset at that point causes an asynchronous external abort, so
+ * leave the resets deasserted for a VPU behind an IOMMU.
+ */
+static void hantro_reset_assert(struct hantro_dev *vpu)
+{
+	if (device_iommu_mapped(vpu->dev))
+		return;
+
+	reset_control_assert(vpu->resets);
+}
+
 static void hantro_free_empty_domain(void *data)
 {
 	iommu_domain_free(data);
@@ -1340,7 +1356,7 @@ err_v4l2_unreg:
 err_clk_unprepare:
 	clk_bulk_unprepare(vpu->variant->num_clocks, vpu->clocks);
 err_rst_assert:
-	reset_control_assert(vpu->resets);
+	hantro_reset_assert(vpu);
 err_pm_disable:
 	pm_runtime_dont_use_autosuspend(vpu->dev);
 	pm_runtime_disable(vpu->dev);
@@ -1360,7 +1376,7 @@ static void hantro_remove(struct platform_device *pdev)
 	v4l2_m2m_put(vpu->m2m_dev);
 	v4l2_device_unregister(&vpu->v4l2_dev);
 	clk_bulk_unprepare(vpu->variant->num_clocks, vpu->clocks);
-	reset_control_assert(vpu->resets);
+	hantro_reset_assert(vpu);
 	pm_runtime_dont_use_autosuspend(vpu->dev);
 	pm_runtime_disable(vpu->dev);
 }
