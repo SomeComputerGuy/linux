@@ -388,6 +388,21 @@
 		};
 	};
 
+	dp0_sound: dp0-sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,mclk-fs = <128>;
+		simple-audio-card,name = "dp0";
+		status = "disabled";
+
+		simple-audio-card,codec {
+			sound-dai = <&dp0 1>;
+		};
+
+		simple-audio-card,cpu {
+			sound-dai = <&spdif_tx2>;
+		};
+	};
+
 	pmu-a55 {
 		compatible = "arm,cortex-a55-pmu";
 		interrupts = <GIC_PPI 7 IRQ_TYPE_LEVEL_HIGH &ppi_partition0>;
