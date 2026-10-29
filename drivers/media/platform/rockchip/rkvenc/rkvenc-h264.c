@@ -12,19 +12,11 @@
  */
 
 #include <linux/bitfield.h>
-#include <linux/moduleparam.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <media/v4l2-h264-enc.h>
 
 #include "rkvenc.h"
-
-#define RKVENC_H264_ROW_QP_RANGE	2
-
-static unsigned int row_rc_qp_range = RKVENC_H264_ROW_QP_RANGE;
-module_param(row_rc_qp_range, uint, 0644);
-MODULE_PARM_DESC(row_rc_qp_range,
-		 "CBR: maximum per-row QP change by the hardware rate control (0 = frame-level rate control only)");
 
 #define RKVENC_H264_PROFILE_BASELINE	66
 #define RKVENC_H264_PROFILE_MAIN	77
@@ -392,13 +384,14 @@ static int rkvenc_h264_run(struct rkvenc_ctx *ctx, struct rkvenc_core *core,
 	/*
 	 * In CBR mode the frame size target from the common rate control is
 	 * handed to the hardware row rate control, which adapts the QP of
-	 * each macroblock row by up to RKVENC_H264_ROW_QP_RANGE.
+	 * each macroblock row by up to the row_rc_qp_range parameter.
 	 */
 	h264->hw_rc = rc->mode && rc->mode->type == V4L2_H264_ENC_RC_TYPE_CBR &&
-		      READ_ONCE(row_rc_qp_range);
+		      READ_ONCE(rkvenc_row_rc_qp_range);
 	if (h264->hw_rc)
-		vepu580_setup_row_rc(core, rc->qp, state->qp_min, state->qp_max,
-				     min(READ_ONCE(row_rc_qp_range), 15U),
+		vepu580_setup_row_rc(core, &vepu580_h264_row_rc, rc->qp,
+				     state->qp_min, state->qp_max,
+				     min(READ_ONCE(rkvenc_row_rc_qp_range), 15U),
 				     (u64)rc->size * 8,
 				     mbs, state->width_mbs);
 	else
@@ -506,6 +499,7 @@ static const struct rkvenc_ctrls rkvenc_h264_ctrls = {
 
 const struct rkvenc_coded_fmt_desc rkvenc_h264_fmt_desc = {
 	.fourcc = V4L2_PIX_FMT_H264_SLICE,
+	.size_align = 16,
 	.frmsize = {
 		.min_width = 64,
 		/* The external line buffer for wider pictures is not handled. */
