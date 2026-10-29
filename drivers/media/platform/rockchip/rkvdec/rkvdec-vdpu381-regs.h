@@ -410,7 +410,8 @@ struct rkvdec_vdpu381_regs_vp9_params {
 
 	struct rkvdec_vdpu381_vp9_info_lastframe {
 		u32 vp9_mode_deltas_lastframe : 14;
-		u32 reserved0 : 2;
+		u32 vp9_segment_id_clear : 1;
+		u32 vp9_segment_id_update : 1;
 		u32 segmentation_enable_lstframe : 1;
 		u32 vp9_last_showframe : 1;
 		u32 vp9_last_intra_only : 1;
