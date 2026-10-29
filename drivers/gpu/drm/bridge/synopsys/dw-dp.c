@@ -1670,7 +1670,12 @@ static bool dw_dp_needs_link_retrain(struct dw_dp *dp)
 	struct dw_dp_link *link = &dp->link;
 	u8 link_status[DP_LINK_STATUS_SIZE];
 
-	if (!dw_dp_link_train_valid(&link->train))
+	/*
+	 * Check the link whenever it is enabled, not only after a successful
+	 * training: a retrain attempted while the sink was not ready clears
+	 * the training state, and a later IRQ_HPD must still retry.
+	 */
+	if (!link->enabled)
 		return false;
 
 	if (drm_dp_dpcd_read_link_status(&dp->aux, link_status) < 0)
@@ -2299,6 +2304,7 @@ static void dw_dp_bridge_oob_notify(struct drm_bridge *bridge,
 {
 	bool hpd_high = status != connector_status_disconnected;
 	struct dw_dp *dp = bridge_to_dp(bridge);
+	bool was_high = dp->usbc_hpd;
 	int ret;
 
 	dp->usbc_hpd = hpd_high;
@@ -2312,6 +2318,22 @@ static void dw_dp_bridge_oob_notify(struct drm_bridge *bridge,
 		dp->plat_data.hpd_sw_cfg(dp->plat_data.data, hpd_high);
 	else
 		dev_err_once(dp->dev, "Missing platform handler for OOB HPD handling\n");
+
+	/*
+	 * Forcing the HPD level only lets the controller see plug and unplug
+	 * edges. An out-of-band event that keeps HPD asserted (a DP Alt Mode
+	 * Attention with IRQ_HPD, or a new pin assignment, which reinitializes
+	 * the PHY) is the equivalent of an HPD short pulse: the sink may have
+	 * lost the link, so check the link status and retrain if needed.
+	 * Don't override a pending long pulse.
+	 */
+	if (hpd_high && was_high) {
+		mutex_lock(&dp->irq_lock);
+		if (!work_pending(&dp->hpd_work))
+			dp->hotplug.long_hpd = false;
+		mutex_unlock(&dp->irq_lock);
+		schedule_work(&dp->hpd_work);
+	}
 }
 
 static const struct drm_bridge_funcs dw_dp_bridge_funcs = {
