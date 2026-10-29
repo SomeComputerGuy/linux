@@ -59,11 +59,51 @@ static const struct v4l2_event hantro_eos_event = {
 	.type = V4L2_EVENT_EOS
 };
 
+/*
+ * Pick an idle core for the job of @ctx. The mem2mem framework never runs
+ * more jobs in parallel than there are cores, so this only fails if the
+ * core accounting is broken.
+ */
+static struct hantro_dev *hantro_acquire_core(struct hantro_ctx *ctx)
+{
+	struct hantro_dev *vpu = ctx->dev;
+	unsigned int i;
+
+	guard(spinlock_irqsave)(&vpu->cores_lock);
+
+	for (i = 0; i < vpu->num_cores; i++) {
+		struct hantro_dev *core = vpu->cores[i];
+
+		if (!core->curr_ctx) {
+			core->curr_ctx = ctx;
+			ctx->core = core;
+			return core;
+		}
+	}
+
+	return NULL;
+}
+
+static void hantro_release_core(struct hantro_ctx *ctx)
+{
+	struct hantro_dev *vpu = ctx->dev;
+
+	guard(spinlock_irqsave)(&vpu->cores_lock);
+
+	if (ctx->core) {
+		ctx->core->curr_ctx = NULL;
+		ctx->core = NULL;
+	}
+}
+
 static void hantro_job_finish_no_pm(struct hantro_dev *vpu,
 				    struct hantro_ctx *ctx,
 				    enum vb2_buffer_state result)
 {
 	struct vb2_v4l2_buffer *src, *dst;
+
+	/* Make the core available to the next job before scheduling it. */
+	hantro_release_core(ctx);
 
 	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
@@ -97,11 +137,14 @@ static void hantro_job_finish(struct hantro_dev *vpu,
 	hantro_job_finish_no_pm(vpu, ctx, result);
 }
 
+/*
+ * Called from the interrupt handler of the VPU instance @vpu, which is the
+ * core the job was running on.
+ */
 void hantro_irq_done(struct hantro_dev *vpu,
 		     enum vb2_buffer_state result)
 {
-	struct hantro_ctx *ctx =
-		v4l2_m2m_get_curr_priv(vpu->m2m_dev);
+	struct hantro_ctx *ctx;
 
 	/*
 	 * If cancel_delayed_work returns false
@@ -109,6 +152,7 @@ void hantro_irq_done(struct hantro_dev *vpu,
 	 * and will take care of finishing the job.
 	 */
 	if (cancel_delayed_work(&vpu->watchdog_work)) {
+		ctx = vpu->curr_ctx;
 		if (result == VB2_BUF_STATE_DONE && ctx->codec_ops->done)
 			ctx->codec_ops->done(ctx);
 		hantro_job_finish(vpu, ctx, result);
@@ -122,7 +166,7 @@ void hantro_watchdog(struct work_struct *work)
 
 	vpu = container_of(to_delayed_work(work),
 			   struct hantro_dev, watchdog_work);
-	ctx = v4l2_m2m_get_curr_priv(vpu->m2m_dev);
+	ctx = vpu->curr_ctx;
 	if (ctx) {
 		vpu_err("frame processing timed out!\n");
 		if (ctx->codec_ops->reset)
@@ -163,7 +207,7 @@ void hantro_end_prepare_run(struct hantro_ctx *ctx)
 				   &ctx->ctrl_handler);
 
 	/* Kick the watchdog. */
-	schedule_delayed_work(&ctx->dev->watchdog_work,
+	schedule_delayed_work(&ctx->core->watchdog_work,
 			      msecs_to_jiffies(2000));
 }
 
@@ -171,16 +215,21 @@ static void device_run(void *priv)
 {
 	struct hantro_ctx *ctx = priv;
 	struct vb2_v4l2_buffer *src, *dst;
+	struct hantro_dev *core;
 	int ret;
 
 	src = hantro_get_src_buf(ctx);
 	dst = hantro_get_dst_buf(ctx);
 
-	ret = pm_runtime_resume_and_get(ctx->dev->dev);
+	core = hantro_acquire_core(ctx);
+	if (WARN_ON_ONCE(!core))
+		goto err_cancel_job;
+
+	ret = pm_runtime_resume_and_get(core->dev);
 	if (ret < 0)
 		goto err_cancel_job;
 
-	ret = clk_bulk_enable(ctx->dev->variant->num_clocks, ctx->dev->clocks);
+	ret = clk_bulk_enable(core->variant->num_clocks, core->clocks);
 	if (ret)
 		goto err_cancel_job;
 
@@ -1290,6 +1339,7 @@ static int hantro_probe(struct platform_device *pdev)
 	vpu->pdev = pdev;
 	mutex_init(&vpu->vpu_mutex);
 	spin_lock_init(&vpu->irqlock);
+	spin_lock_init(&vpu->cores_lock);
 
 	match = of_match_node(of_hantro_match, pdev->dev.of_node);
 	vpu->variant = match->data;
@@ -1306,6 +1356,12 @@ static int hantro_probe(struct platform_device *pdev)
 	if (of_device_is_compatible(pdev->dev.of_node, "nxp,imx8mq-vpu"))
 		dev_warn(&pdev->dev, "%s compatible is deprecated\n",
 			 match->compatible);
+
+	vpu->cores = devm_kcalloc(&pdev->dev, 1, sizeof(*vpu->cores),
+				  GFP_KERNEL);
+	if (!vpu->cores)
+		return -ENOMEM;
+	vpu->cores[vpu->num_cores++] = vpu;
 
 	ret = hantro_hw_init(vpu);
 	if (ret)
