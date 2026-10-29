@@ -200,10 +200,11 @@ static int state_prepare_params(struct v4l2_h264_enc *enc)
 	sps->pic_height_in_map_units_minus1 = state->height_mbs - 1;
 
 	/*
-	 * Only pic_order_cnt_type = 0 is currently supported.
-	 * Error out since no pic_order_cnt_lsb was provided.
+	 * Only pic_order_cnt_type 0 and 2 are currently supported. Type 2
+	 * derives the picture order count from frame_num, for hardware that
+	 * can't write pic_order_cnt_lsb in the slice header.
 	 */
-	if (sps->pic_order_cnt_type)
+	if (sps->pic_order_cnt_type == 1)
 		return -EINVAL;
 
 	/* SPS Video */
@@ -933,6 +934,41 @@ static int ref_step_buffers(struct v4l2_h264_enc *enc)
 	return 0;
 }
 
+/* Picture order count type 2, see ITU-T H.264 section 8.2.1.3. */
+static int ref_step_poc_type2(struct v4l2_h264_enc *enc)
+{
+	struct v4l2_h264_enc_state *state = &enc->state_active;
+	struct v4l2_ctrl_h264_sps *sps = &state->sps;
+	struct v4l2_ctrl_h264_encode_params *encode = &state->encode;
+	struct v4l2_h264_enc_ref *ref = &enc->ref;
+	unsigned int max_frame_num = BIT(sps->log2_max_frame_num_minus4 + 4);
+	unsigned int frame_num_offset;
+	unsigned int pic_order_cnt;
+
+	if (encode->flags & V4L2_H264_ENCODE_FLAG_IDR_PIC)
+		frame_num_offset = 0;
+	else if (ref->prev_frame_num > encode->frame_num)
+		frame_num_offset = ref->prev_frame_num_offset + max_frame_num;
+	else
+		frame_num_offset = ref->prev_frame_num_offset;
+
+	if (encode->flags & V4L2_H264_ENCODE_FLAG_IDR_PIC)
+		pic_order_cnt = 0;
+	else if (!encode->nal_ref_idc)
+		pic_order_cnt = 2 * (frame_num_offset + encode->frame_num) - 1;
+	else
+		pic_order_cnt = 2 * (frame_num_offset + encode->frame_num);
+
+	ref->frame_num_offset = frame_num_offset;
+	ref->pic_order_cnt_msb = 0;
+	ref->pic_order_cnt_lsb = 0;
+	ref->top_field_order_cnt = pic_order_cnt;
+	ref->bottom_field_order_cnt = pic_order_cnt;
+	ref->pic_order_cnt = pic_order_cnt;
+
+	return 0;
+}
+
 static int ref_step_poc(struct v4l2_h264_enc *enc)
 {
 	struct v4l2_h264_enc_state *state = &enc->state_active;
@@ -949,7 +985,10 @@ static int ref_step_poc(struct v4l2_h264_enc *enc)
 	unsigned int top_field_order_cnt;
 	unsigned int bottom_field_order_cnt;
 
-	/* Only pic_order_cnt_type = 0 is currently supported. */
+	if (sps->pic_order_cnt_type == 2)
+		return ref_step_poc_type2(enc);
+
+	/* Only pic_order_cnt_type 0 and 2 are currently supported. */
 	if (sps->pic_order_cnt_type)
 		return -EINVAL;
 
@@ -1173,6 +1212,10 @@ static int ref_complete(struct v4l2_h264_enc *enc,
 	struct v4l2_h264_enc_ref *ref = &enc->ref;
 	unsigned int index;
 	int ret;
+
+	/* Keep the frame number of the previous picture for POC type 2. */
+	ref->prev_frame_num = encode->frame_num;
+	ref->prev_frame_num_offset = ref->frame_num_offset;
 
 	if (!encode->nal_ref_idc)
 		return 0;
