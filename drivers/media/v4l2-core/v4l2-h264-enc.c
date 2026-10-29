@@ -762,9 +762,12 @@ static int rbsp_update(struct v4l2_h264_enc *enc)
 	if (ctrl && ctrl->cur.val)
 		enc->rbsp_update |= V4L2_H264_ENC_RBSP_UPDATE_AUD;
 
-	/* SPS */
+	/*
+	 * SPS: always written for the first picture of the stream, then only
+	 * when it changes.
+	 */
 
-	if (!enc->state_serial) {
+	if (enc->state_serial) {
 		if (memcmp(&state_active->sps, &state->sps,
 			   sizeof(state_active->sps)) ||
 		    memcmp(&state_active->sps_video, &state->sps_video,
@@ -774,9 +777,9 @@ static int rbsp_update(struct v4l2_h264_enc *enc)
 		enc->rbsp_update |= V4L2_H264_ENC_RBSP_UPDATE_SPS;
 	}
 
-	/* PPS */
+	/* PPS: same as the SPS. */
 
-	if (!enc->state_serial) {
+	if (enc->state_serial) {
 		if (memcmp(&state_active->pps, &state->pps,
 			   sizeof(state_active->pps)))
 			enc->rbsp_update |= V4L2_H264_ENC_RBSP_UPDATE_PPS;
