@@ -78,20 +78,28 @@ struct rkvdec_h264_priv_tbl {
 };
 
 struct rkvdec_h264_ctx {
-	struct rkvdec_aux_buf priv_tbl;
+	/* One table per job, see &rkvdec_job.slot */
+	struct rkvdec_aux_buf priv_tbl[RKVDEC_MAX_JOBS];
 	struct rkvdec_h264_reflists reflists;
 	struct rkvdec_vdpu381_regs_h264 regs;
 };
 
+static struct rkvdec_aux_buf *rkvdec_h264_priv_tbl(struct rkvdec_ctx *ctx)
+{
+	struct rkvdec_h264_ctx *h264_ctx = ctx->priv;
+
+	return &h264_ctx->priv_tbl[ctx->job->slot];
+}
+
 static void assemble_hw_pps(struct rkvdec_ctx *ctx,
 			    struct rkvdec_h264_run *run)
 {
-	struct rkvdec_h264_ctx *h264_ctx = ctx->priv;
+	struct rkvdec_aux_buf *tbl_buf = rkvdec_h264_priv_tbl(ctx);
 	const struct v4l2_ctrl_h264_sps *sps = run->sps;
 	const struct v4l2_ctrl_h264_pps *pps = run->pps;
 	const struct v4l2_ctrl_h264_decode_params *dec_params = run->decode_params;
 	const struct v4l2_h264_dpb_entry *dpb = dec_params->dpb;
-	struct rkvdec_h264_priv_tbl *priv_tbl = h264_ctx->priv_tbl.cpu;
+	struct rkvdec_h264_priv_tbl *priv_tbl = tbl_buf->cpu;
 	struct rkvdec_sps_pps *hw_ps;
 	dma_addr_t scaling_list_address;
 	u32 scaling_distance;
@@ -174,7 +182,7 @@ static void assemble_hw_pps(struct rkvdec_ctx *ctx,
 	 * To be on the safe side, program the scaling matrix address
 	 */
 	scaling_distance = offsetof(struct rkvdec_h264_priv_tbl, scaling_list);
-	scaling_list_address = h264_ctx->priv_tbl.dma + scaling_distance;
+	scaling_list_address = tbl_buf->dma + scaling_distance;
 	hw_ps->pps.scaling_list_address = scaling_list_address;
 
 	for (i = 0; i < ARRAY_SIZE(dec_params->dpb); i++) {
@@ -211,7 +219,7 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	const struct v4l2_ctrl_h264_decode_params *dec_params = run->decode_params;
 	const struct v4l2_h264_dpb_entry *dpb = dec_params->dpb;
 	struct rkvdec_h264_ctx *h264_ctx = ctx->priv;
-	dma_addr_t priv_start_addr = h264_ctx->priv_tbl.dma;
+	dma_addr_t priv_start_addr = rkvdec_h264_priv_tbl(ctx)->dma;
 	const struct v4l2_pix_format_mplane *dst_fmt;
 	struct vb2_v4l2_buffer *src_buf = run->base.bufs.src;
 	struct vb2_v4l2_buffer *dst_buf = run->base.bufs.dst;
@@ -381,6 +389,7 @@ static int rkvdec_h264_start(struct rkvdec_ctx *ctx)
 	struct rkvdec_h264_priv_tbl *priv_tbl;
 	struct rkvdec_h264_ctx *h264_ctx;
 	struct v4l2_ctrl *ctrl;
+	unsigned int i;
 	int ret;
 
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
@@ -396,22 +405,32 @@ static int rkvdec_h264_start(struct rkvdec_ctx *ctx)
 	if (!h264_ctx)
 		return -ENOMEM;
 
-	priv_tbl = dma_alloc_coherent(ctx->dev->main_core->dev, sizeof(*priv_tbl),
-				      &h264_ctx->priv_tbl.dma, GFP_KERNEL);
-	if (!priv_tbl) {
-		ret = -ENOMEM;
-		goto err_free_ctx;
-	}
+	for (i = 0; i < ctx->num_job_slots; i++) {
+		struct rkvdec_aux_buf *buf = &h264_ctx->priv_tbl[i];
 
-	h264_ctx->priv_tbl.size = sizeof(*priv_tbl);
-	h264_ctx->priv_tbl.cpu = priv_tbl;
-	memcpy(priv_tbl->cabac_table, rkvdec_h264_cabac_table,
-	       sizeof(rkvdec_h264_cabac_table));
+		priv_tbl = dma_alloc_coherent(ctx->dev->main_core->dev,
+					      sizeof(*priv_tbl), &buf->dma,
+					      GFP_KERNEL);
+		if (!priv_tbl) {
+			ret = -ENOMEM;
+			goto err_free_tbl;
+		}
+
+		buf->size = sizeof(*priv_tbl);
+		buf->cpu = priv_tbl;
+		memcpy(priv_tbl->cabac_table, rkvdec_h264_cabac_table,
+		       sizeof(rkvdec_h264_cabac_table));
+	}
 
 	ctx->priv = h264_ctx;
 	return 0;
 
-err_free_ctx:
+err_free_tbl:
+	while (i--)
+		dma_free_coherent(ctx->dev->main_core->dev,
+				  h264_ctx->priv_tbl[i].size,
+				  h264_ctx->priv_tbl[i].cpu,
+				  h264_ctx->priv_tbl[i].dma);
 	kfree(h264_ctx);
 	return ret;
 }
@@ -419,9 +438,13 @@ err_free_ctx:
 static void rkvdec_h264_stop(struct rkvdec_ctx *ctx)
 {
 	struct rkvdec_h264_ctx *h264_ctx = ctx->priv;
+	unsigned int i;
 
-	dma_free_coherent(ctx->dev->main_core->dev, h264_ctx->priv_tbl.size,
-			  h264_ctx->priv_tbl.cpu, h264_ctx->priv_tbl.dma);
+	for (i = 0; i < ctx->num_job_slots; i++)
+		dma_free_coherent(ctx->dev->main_core->dev,
+				  h264_ctx->priv_tbl[i].size,
+				  h264_ctx->priv_tbl[i].cpu,
+				  h264_ctx->priv_tbl[i].dma);
 	kfree(h264_ctx);
 }
 
@@ -430,7 +453,7 @@ static int rkvdec_h264_run(struct rkvdec_ctx *ctx)
 	struct v4l2_h264_reflist_builder reflist_builder;
 	struct rkvdec_core *core = ctx->core;
 	struct rkvdec_h264_ctx *h264_ctx = ctx->priv;
-	struct rkvdec_h264_priv_tbl *tbl = h264_ctx->priv_tbl.cpu;
+	struct rkvdec_h264_priv_tbl *tbl = rkvdec_h264_priv_tbl(ctx)->cpu;
 	struct rkvdec_h264_run run;
 
 	rkvdec_h264_run_preamble(ctx, &run);
