@@ -569,6 +569,44 @@ unlock:
 }
 EXPORT_SYMBOL(v4l2_m2m_buf_done_and_job_finish);
 
+bool v4l2_m2m_buf_detach_and_job_finish(struct v4l2_m2m_dev *m2m_dev,
+					struct v4l2_m2m_ctx *m2m_ctx,
+					struct vb2_v4l2_buffer **src_buf,
+					struct vb2_v4l2_buffer **dst_buf)
+{
+	struct vb2_v4l2_buffer *src, *dst;
+	bool schedule_next = false;
+	unsigned long flags;
+
+	spin_lock_irqsave(&m2m_dev->job_spinlock, flags);
+	if (WARN_ON(!(m2m_ctx->job_flags & TRANS_RUNNING)))
+		goto unlock;
+
+	src = v4l2_m2m_next_src_buf(m2m_ctx);
+	dst = v4l2_m2m_next_dst_buf(m2m_ctx);
+	if (WARN_ON(!src || !dst))
+		goto unlock;
+
+	/* A held capture buffer must stay on the queue for the next job. */
+	if (src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF)
+		goto unlock;
+
+	v4l2_m2m_src_buf_remove(m2m_ctx);
+	v4l2_m2m_dst_buf_remove(m2m_ctx);
+	dst->is_held = false;
+	*src_buf = src;
+	*dst_buf = dst;
+	schedule_next = _v4l2_m2m_job_finish(m2m_dev, m2m_ctx);
+unlock:
+	spin_unlock_irqrestore(&m2m_dev->job_spinlock, flags);
+
+	if (schedule_next)
+		v4l2_m2m_schedule_next_job(m2m_dev, m2m_ctx);
+
+	return schedule_next;
+}
+EXPORT_SYMBOL_GPL(v4l2_m2m_buf_detach_and_job_finish);
+
 void v4l2_m2m_suspend(struct v4l2_m2m_dev *m2m_dev)
 {
 	unsigned long flags;
