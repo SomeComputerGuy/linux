@@ -327,19 +327,20 @@ static void st_ref_pic_set_calculate(struct rkvdec_hevc_run *run, int idx,
 	st_rps->num_delta_pocs = st_rps->num_positive_pics + st_rps->num_negative_pics;
 }
 
-static void rkvdec_hevc_prepare_hw_st_rps(struct rkvdec_hevc_run *run, struct rkvdec_rps *rps,
-					  struct rkvdec_hevc_st_rps_cache *cache)
+static int rkvdec_hevc_prepare_hw_st_rps(struct rkvdec_hevc_run *run, struct rkvdec_rps *rps,
+					 struct rkvdec_hevc_st_rps_cache *cache)
 {
 	unsigned int num_sets = run->sps->num_short_term_ref_pic_sets;
 	size_t size = num_sets * sizeof(*run->ext_sps_st_rps);
+	struct calculated_rps_st_set *calculated_rps_st_sets;
 	int idx;
 
 	if (!run->ext_sps_st_rps)
-		return;
+		return 0;
 
 	/* The SPS control's validation limits the count to the table size. */
 	if (WARN_ON_ONCE(num_sets > ARRAY_SIZE(cache->sets)))
-		return;
+		return -EINVAL;
 
 	/*
 	 * Every set can differ, and so can their number. The zeroed initial
@@ -348,13 +349,18 @@ static void rkvdec_hevc_prepare_hw_st_rps(struct rkvdec_hevc_run *run, struct rk
 	 */
 	if (cache->num_sets == num_sets &&
 	    !memcmp(cache->sets, run->ext_sps_st_rps, size))
-		return;
+		return 0;
 
-	struct calculated_rps_st_set *calculated_rps_st_sets =
-		kzalloc(sizeof(struct calculated_rps_st_set) *
-			run->sps->num_short_term_ref_pic_sets, GFP_KERNEL);
+	/*
+	 * On failure the cache is left as it is, so the next job tries
+	 * again.
+	 */
+	calculated_rps_st_sets = kcalloc(num_sets, sizeof(*calculated_rps_st_sets),
+					 GFP_KERNEL);
+	if (!calculated_rps_st_sets)
+		return -ENOMEM;
 
-	for (idx = 0; idx < run->sps->num_short_term_ref_pic_sets; idx++) {
+	for (idx = 0; idx < num_sets; idx++) {
 		const struct v4l2_ctrl_hevc_ext_sps_st_rps *rps_data = &run->ext_sps_st_rps[idx];
 
 		if (rps_data->flags & V4L2_HEVC_EXT_SPS_ST_RPS_FLAG_INTER_REF_PIC_SET_PRED)
@@ -369,13 +375,22 @@ static void rkvdec_hevc_prepare_hw_st_rps(struct rkvdec_hevc_run *run, struct rk
 
 	cache->num_sets = num_sets;
 	memcpy(cache->sets, run->ext_sps_st_rps, size);
+
+	return 0;
 }
 
-void rkvdec_hevc_assemble_hw_rps(struct rkvdec_hevc_run *run, struct rkvdec_rps *rps,
-				 struct rkvdec_hevc_st_rps_cache *st_cache)
+int rkvdec_hevc_assemble_hw_rps(struct rkvdec_hevc_run *run, struct rkvdec_rps *rps,
+				struct rkvdec_hevc_st_rps_cache *st_cache)
 {
-	rkvdec_hevc_prepare_hw_st_rps(run, rps, st_cache);
+	int ret;
+
+	ret = rkvdec_hevc_prepare_hw_st_rps(run, rps, st_cache);
+	if (ret)
+		return ret;
+
 	rkvdec_hevc_assemble_hw_lt_rps(run, rps);
+
+	return 0;
 }
 
 struct vb2_buffer *
