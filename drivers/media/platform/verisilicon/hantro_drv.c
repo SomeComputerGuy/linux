@@ -11,6 +11,8 @@
  */
 
 #include <linux/clk.h>
+#include <linux/component.h>
+#include <linux/iommu.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
@@ -769,7 +771,7 @@ static const struct of_device_id of_hantro_match[] = {
 	{ .compatible = "rockchip,rk3399-vpu", .data = &rk3399_vpu_variant, },
 	{ .compatible = "rockchip,rk3568-vepu", .data = &rk3568_vepu_variant, },
 	{ .compatible = "rockchip,rk3568-vpu", .data = &rk3568_vpu_variant, },
-	{ .compatible = "rockchip,rk3588-vepu121", .data = &rk3568_vepu_variant, },
+	{ .compatible = "rockchip,rk3588-vepu121", .data = &rk3588_vepu121_variant, },
 	{ .compatible = "rockchip,rk3588-av1-vpu", .data = &rk3588_vpu981_variant, },
 #endif
 #ifdef CONFIG_VIDEO_HANTRO_IMX8M
@@ -1049,46 +1051,70 @@ static const struct media_device_ops hantro_m2m_media_ops = {
 };
 
 /*
- * Some SoCs, like RK3588 have multiple identical Hantro cores, but the
- * kernel is currently missing support for multi-core handling. Exposing
- * separate devices for each core to userspace is bad, since that does
- * not allow scheduling tasks properly (and creates ABI). With this workaround
- * the driver will only probe for the first core and early exit for the other
- * cores. Once the driver gains multi-core support, the same technique
- * for detecting the main core can be used to cluster all cores together.
+ * Some SoCs, like RK3588, have multiple identical Hantro cores. Exposing
+ * separate devices for each core to userspace is bad, since that does not
+ * allow scheduling tasks properly (and creates ABI). The first compatible
+ * and available node is considered the main core. For variants with
+ * multi-core support, the main core binds the other cores as components and
+ * schedules jobs on all of them. For the other variants, only the main core
+ * is used.
+ *
+ * Returns the role of the instance, and for a main core the match of the
+ * secondary cores in @match and the total number of cores in @num_cores.
  */
-static int hantro_disable_multicore(struct hantro_dev *vpu)
+static int hantro_get_core_role(struct hantro_dev *vpu,
+				struct component_match **match,
+				unsigned int *num_cores)
 {
-	struct device_node *node = NULL;
+	struct device_node *np = vpu->dev->of_node;
+	struct device_node *node;
+	bool found_main = false;
+	bool is_main_core = false;
 	const char *compatible;
-	bool is_main_core;
 	int ret;
 
+	*num_cores = 1;
+
 	/* Intentionally ignores the fallback strings */
-	ret = of_property_read_string(vpu->dev->of_node, "compatible", &compatible);
+	ret = of_property_read_string(np, "compatible", &compatible);
 	if (ret)
 		return ret;
 
-	/* The first compatible and available node found is considered the main core */
-	do {
-		node = of_find_compatible_node(node, NULL, compatible);
-		if (of_device_is_available(node))
-			break;
-	} while (node);
+	for_each_compatible_node(node, NULL, compatible) {
+		if (!of_device_is_available(node))
+			continue;
 
-	if (!node)
-		return -EINVAL;
+		if (!found_main) {
+			found_main = true;
+			is_main_core = (node == np);
+			if (is_main_core && vpu->variant->multi_core)
+				continue;
+		} else {
+			of_node_get(node);
+			component_match_add_release(vpu->dev, match,
+						    component_release_of,
+						    component_compare_of, node);
+			(*num_cores)++;
+			continue;
+		}
 
-	is_main_core = (vpu->dev->of_node == node);
-
-	of_node_put(node);
-
-	if (!is_main_core) {
-		dev_info(vpu->dev, "missing multi-core support, ignoring this instance\n");
-		return -ENODEV;
+		of_node_put(node);
+		break;
 	}
 
-	return 0;
+	if (!found_main)
+		return -EINVAL;
+
+	if (!is_main_core) {
+		if (!vpu->variant->multi_core) {
+			dev_info(vpu->dev, "missing multi-core support, ignoring this instance\n");
+			return -ENODEV;
+		}
+
+		return HANTRO_CORE_SECONDARY;
+	}
+
+	return *match ? HANTRO_CORE_MAIN : HANTRO_CORE_SINGLE;
 }
 
 static struct v4l2_m2m_dev *hantro_get_v4l2_m2m_dev(struct hantro_dev *vpu)
@@ -1280,6 +1306,11 @@ static int hantro_register_devices(struct hantro_dev *vpu)
 		return PTR_ERR(vpu->m2m_dev);
 	}
 
+	if (vpu->num_cores > 1) {
+		v4l2_m2m_set_max_parallel_jobs(vpu->m2m_dev, vpu->num_cores);
+		v4l2_info(&vpu->v4l2_dev, "using %u cores\n", vpu->num_cores);
+	}
+
 	vpu->mdev.dev = vpu->dev;
 	strscpy(vpu->mdev.model, DRIVER_NAME, sizeof(vpu->mdev.model));
 	media_device_init(&vpu->mdev);
@@ -1325,9 +1356,117 @@ static void hantro_unregister_devices(struct hantro_dev *vpu)
 	v4l2_m2m_put(vpu->m2m_dev);
 }
 
+static int hantro_core_bind(struct device *dev, struct device *master,
+			    void *data)
+{
+	struct hantro_dev *core = dev_get_drvdata(dev);
+	struct iommu_domain *domain, *core_domain;
+	struct hantro_dev *vpu = data;
+	int ret;
+
+	/*
+	 * Buffers are allocated and mapped through the main core, before the
+	 * job is scheduled on a core. Put this core into the IOMMU domain of
+	 * the main core, so that it uses the same mappings. A core that can't
+	 * share the mappings is left unused rather than failing the whole
+	 * device.
+	 */
+	domain = iommu_get_domain_for_dev(vpu->dev);
+	core_domain = iommu_get_domain_for_dev(dev);
+	if (domain || core_domain) {
+		if (!domain || !core_domain) {
+			dev_warn(dev, "IOMMU differs from the main core, not using this core\n");
+			return 0;
+		}
+
+		ret = iommu_attach_device(domain, dev);
+		if (ret) {
+			dev_warn(dev, "Failed to attach to the IOMMU domain of the main core (%d), not using this core\n",
+				 ret);
+			return 0;
+		}
+		core->attached_domain = domain;
+	}
+
+	scoped_guard(spinlock_irqsave, &vpu->cores_lock)
+		vpu->cores[vpu->num_cores++] = core;
+
+	return 0;
+}
+
+static void hantro_core_unbind(struct device *dev, struct device *master,
+			       void *data)
+{
+	struct hantro_dev *core = dev_get_drvdata(dev);
+	struct hantro_dev *vpu = data;
+	unsigned int i;
+
+	scoped_guard(spinlock_irqsave, &vpu->cores_lock) {
+		for (i = 1; i < vpu->num_cores; i++) {
+			if (vpu->cores[i] != core)
+				continue;
+
+			memmove(&vpu->cores[i], &vpu->cores[i + 1],
+				(vpu->num_cores - i - 1) * sizeof(*vpu->cores));
+			vpu->num_cores--;
+			break;
+		}
+	}
+
+	cancel_delayed_work_sync(&core->watchdog_work);
+
+	/* Return the core to its own DMA domain, so that it can bind again. */
+	if (core->attached_domain) {
+		iommu_detach_device(core->attached_domain, dev);
+		core->attached_domain = NULL;
+	}
+}
+
+static const struct component_ops hantro_core_ops = {
+	.bind = hantro_core_bind,
+	.unbind = hantro_core_unbind,
+};
+
+static int hantro_master_bind(struct device *dev)
+{
+	struct hantro_dev *vpu = dev_get_drvdata(dev);
+	int ret;
+
+	ret = component_bind_all(dev, vpu);
+	if (ret)
+		return ret;
+
+	ret = hantro_register_devices(vpu);
+	if (ret) {
+		component_unbind_all(dev, vpu);
+		return ret;
+	}
+
+	return 0;
+}
+
+static void hantro_master_unbind(struct device *dev)
+{
+	struct hantro_dev *vpu = dev_get_drvdata(dev);
+
+	/* Wait for running jobs and don't start new ones on unbound cores. */
+	v4l2_m2m_suspend(vpu->m2m_dev);
+	cancel_delayed_work_sync(&vpu->watchdog_work);
+
+	hantro_unregister_devices(vpu);
+	component_unbind_all(dev, vpu);
+}
+
+static const struct component_master_ops hantro_master_ops = {
+	.bind = hantro_master_bind,
+	.unbind = hantro_master_unbind,
+};
+
 static int hantro_probe(struct platform_device *pdev)
 {
+	struct component_match *cmatch = NULL;
 	const struct of_device_id *match;
+	unsigned int num_cores;
 	struct hantro_dev *vpu;
 	int ret;
 
@@ -1344,9 +1483,10 @@ static int hantro_probe(struct platform_device *pdev)
 	match = of_match_node(of_hantro_match, pdev->dev.of_node);
 	vpu->variant = match->data;
 
-	ret = hantro_disable_multicore(vpu);
-	if (ret)
+	ret = hantro_get_core_role(vpu, &cmatch, &num_cores);
+	if (ret < 0)
 		return ret;
+	vpu->role = ret;
 
 	/*
 	 * Support for nxp,imx8mq-vpu is kept for backwards compatibility
@@ -1357,7 +1497,23 @@ static int hantro_probe(struct platform_device *pdev)
 		dev_warn(&pdev->dev, "%s compatible is deprecated\n",
 			 match->compatible);
 
-	vpu->cores = devm_kcalloc(&pdev->dev, 1, sizeof(*vpu->cores),
+	if (vpu->role == HANTRO_CORE_SECONDARY) {
+		platform_set_drvdata(pdev, vpu);
+
+		ret = hantro_hw_init(vpu);
+		if (ret)
+			return ret;
+
+		ret = component_add(&pdev->dev, &hantro_core_ops);
+		if (ret) {
+			dev_err(&pdev->dev, "Failed to register core component\n");
+			goto err_hw_cleanup;
+		}
+
+		return 0;
+	}
+
+	vpu->cores = devm_kcalloc(&pdev->dev, num_cores, sizeof(*vpu->cores),
 				  GFP_KERNEL);
 	if (!vpu->cores)
 		return -ENOMEM;
@@ -1374,7 +1530,12 @@ static int hantro_probe(struct platform_device *pdev)
 	}
 	platform_set_drvdata(pdev, vpu);
 
-	ret = hantro_register_devices(vpu);
+	if (vpu->role == HANTRO_CORE_MAIN)
+		ret = component_master_add_with_match(&pdev->dev,
+						      &hantro_master_ops,
+						      cmatch);
+	else
+		ret = hantro_register_devices(vpu);
 	if (ret)
 		goto err_v4l2_unreg;
 
@@ -1391,9 +1552,18 @@ static void hantro_remove(struct platform_device *pdev)
 {
 	struct hantro_dev *vpu = platform_get_drvdata(pdev);
 
+	if (vpu->role == HANTRO_CORE_SECONDARY) {
+		component_del(&pdev->dev, &hantro_core_ops);
+		hantro_hw_cleanup(vpu);
+		return;
+	}
+
 	v4l2_info(&vpu->v4l2_dev, "Removing %s\n", pdev->name);
 
-	hantro_unregister_devices(vpu);
+	if (vpu->role == HANTRO_CORE_MAIN)
+		component_master_del(&pdev->dev, &hantro_master_ops);
+	else
+		hantro_unregister_devices(vpu);
 	v4l2_device_unregister(&vpu->v4l2_dev);
 	hantro_hw_cleanup(vpu);
 }
