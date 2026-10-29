@@ -54,6 +54,9 @@ struct v4l2_h264_enc_ref {
 
 	struct v4l2_h264_reflist_builder builder;
 
+	unsigned int prev_frame_num;
+	unsigned int prev_frame_num_offset;
+	unsigned int frame_num_offset;
 	unsigned int prev_pic_order_cnt_msb;
 	unsigned int prev_pic_order_cnt_lsb;
 	unsigned int pic_order_cnt_msb;
