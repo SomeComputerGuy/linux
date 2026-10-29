@@ -1404,6 +1404,47 @@ static int cpufreq_policy_init_qos(struct cpufreq_policy *policy)
 	return 0;
 }
 
+/*
+ * Sometimes boot loaders set CPU frequency to a value outside of
+ * frequency table present with cpufreq core. In such cases CPU might be
+ * unstable if it has to run on that frequency for long duration of time
+ * and so its better to set it to a frequency which is specified in
+ * freq-table. This also makes cpufreq stats inconsistent as
+ * cpufreq-stats would fail to register because current frequency of CPU
+ * isn't found in freq-table.
+ *
+ * Because we don't want this change to effect boot process badly, we go
+ * for the next freq which is >= policy->cur ('cur' must be set by now,
+ * otherwise we will end up setting freq to lowest of the table as 'cur'
+ * is initialized to zero).
+ *
+ * We are passing target-freq as "policy->cur - 1" otherwise
+ * __cpufreq_driver_target() would simply fail, as policy->cur will be
+ * equal to target-freq.
+ */
+static int cpufreq_check_initial_freq(struct cpufreq_policy *policy)
+{
+	unsigned int old_freq = policy->cur;
+	int ret;
+
+	if (!(cpufreq_driver->flags & CPUFREQ_NEED_INITIAL_FREQ_CHECK) ||
+	    !has_target())
+		return 0;
+
+	/* Are we running at unknown frequency ? */
+	if (cpufreq_frequency_table_get_index(policy, old_freq) != -EINVAL)
+		return 0;
+
+	ret = __cpufreq_driver_target(policy, old_freq - 1, CPUFREQ_RELATION_L);
+	if (ret)
+		return ret;
+
+	pr_info("%s: CPU%d: Running at unlisted initial frequency: %u kHz, changing to: %u kHz\n",
+		__func__, policy->cpu, old_freq, policy->cur);
+
+	return 0;
+}
+
 static int cpufreq_policy_online(struct cpufreq_policy *policy,
 				 unsigned int cpu, bool new_policy)
 {
@@ -1492,42 +1533,19 @@ static int cpufreq_policy_online(struct cpufreq_policy *policy,
 	}
 
 	/*
-	 * Sometimes boot loaders set CPU frequency to a value outside of
-	 * frequency table present with cpufreq core. In such cases CPU might be
-	 * unstable if it has to run on that frequency for long duration of time
-	 * and so its better to set it to a frequency which is specified in
-	 * freq-table. This also makes cpufreq stats inconsistent as
-	 * cpufreq-stats would fail to register because current frequency of CPU
-	 * isn't found in freq-table.
-	 *
-	 * Because we don't want this change to effect boot process badly, we go
-	 * for the next freq which is >= policy->cur ('cur' must be set by now,
-	 * otherwise we will end up setting freq to lowest of the table as 'cur'
-	 * is initialized to zero).
-	 *
-	 * We are passing target-freq as "policy->cur - 1" otherwise
-	 * __cpufreq_driver_target() would simply fail, as policy->cur will be
-	 * equal to target-freq.
+	 * While the system is resuming from suspend, the non-boot CPUs are
+	 * brought back online before any device is resumed, so the regulators
+	 * and clock providers a frequency change needs may not be usable yet.
+	 * cpufreq_resume() checks the frequency once devices are back.
 	 */
-	if ((cpufreq_driver->flags & CPUFREQ_NEED_INITIAL_FREQ_CHECK)
-	    && has_target()) {
-		unsigned int old_freq = policy->cur;
-
-		/* Are we running at unknown frequency ? */
-		ret = cpufreq_frequency_table_get_index(policy, old_freq);
-		if (ret == -EINVAL) {
-			ret = __cpufreq_driver_target(policy, old_freq - 1,
-						      CPUFREQ_RELATION_L);
-
-			/*
-			 * Reaching here after boot in a few seconds may not
-			 * mean that system will remain stable at "unknown"
-			 * frequency for longer duration. Hence, a BUG_ON().
-			 */
-			BUG_ON(ret);
-			pr_info("%s: CPU%d: Running at unlisted initial frequency: %u kHz, changing to: %u kHz\n",
-				__func__, policy->cpu, old_freq, policy->cur);
-		}
+	if (!cpufreq_suspended) {
+		ret = cpufreq_check_initial_freq(policy);
+		/*
+		 * Reaching here after boot in a few seconds may not
+		 * mean that system will remain stable at "unknown"
+		 * frequency for longer duration. Hence, a BUG_ON().
+		 */
+		BUG_ON(ret);
 	}
 
 	if (new_policy) {
@@ -2024,6 +2042,10 @@ void cpufreq_resume(void)
 				cpufreq_driver->name);
 		} else if (has_target()) {
 			scoped_guard(cpufreq_policy_write, policy) {
+				if (cpufreq_check_initial_freq(policy))
+					pr_err("%s: CPU%u: failed to leave unlisted frequency %u kHz\n",
+					       __func__, policy->cpu, policy->cur);
+
 				ret = cpufreq_start_governor(policy);
 			}
 
