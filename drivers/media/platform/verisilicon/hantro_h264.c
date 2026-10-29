@@ -41,7 +41,7 @@ struct hantro_h264_dec_priv_tbl {
  * in https://chromium.googlesource.com/chromiumos/third_party/kernel,
  * chromeos-3.14 branch.
  */
-static const u32 h264_cabac_table[] = {
+const u32 hantro_h264_cabac_table[HANTRO_H264_CABAC_TABLE_SIZE] = {
 	0x14f10236, 0x034a14f1, 0x0236034a, 0xe47fe968, 0xfa35ff36, 0x07330000,
 	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
 	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
@@ -515,7 +515,8 @@ int hantro_h264_dec_init(struct hantro_ctx *ctx)
 
 	priv->size = sizeof(*tbl);
 	tbl = priv->cpu;
-	memcpy(tbl->cabac_table, h264_cabac_table, sizeof(tbl->cabac_table));
+	memcpy(tbl->cabac_table, hantro_h264_cabac_table,
+	       sizeof(tbl->cabac_table));
 
 	return 0;
 }
