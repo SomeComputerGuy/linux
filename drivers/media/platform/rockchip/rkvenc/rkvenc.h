@@ -53,8 +53,24 @@ struct rkvenc_rec_buf {
 	size_t fbc_hdr_size;
 };
 
+enum rkvenc_pnum {
+	RKVENC_PNUM_P64,
+	RKVENC_PNUM_P32,
+	RKVENC_PNUM_P16,
+	RKVENC_PNUM_P8,
+	RKVENC_PNUM_I32,
+	RKVENC_PNUM_I16,
+	RKVENC_PNUM_I8,
+	RKVENC_PNUM_I4,
+	RKVENC_PNUM_COUNT,
+};
+
 /**
  * struct rkvenc_feedback - per-frame values read back from the status block
+ * @pnum: number of inter (P64..P8) and intra (I32..I4) coded blocks per
+ *	  block size, see &enum rkvenc_pnum
+ * @qp_min: lowest QP of an 8x8 block, -1 when the histogram is empty
+ * @qp_max: highest QP of an 8x8 block, -1 when the histogram is empty
  */
 struct rkvenc_feedback {
 	u32 int_sta;
@@ -64,6 +80,9 @@ struct rkvenc_feedback {
 	u32 madi;
 	u32 madp;
 	u32 intra_blocks;
+	u32 pnum[RKVENC_PNUM_COUNT];
+	int qp_min;
+	int qp_max;
 	u32 cycles;
 };
 
@@ -105,9 +124,12 @@ struct rkvenc_ctrls {
 
 /**
  * struct rkvenc_coded_fmt_desc - coded (CAPTURE) format description
+ * @size_align: alignment of the encoded picture size (enc_rsl), the
+ *		hardware pads the source up to it
  */
 struct rkvenc_coded_fmt_desc {
 	u32 fourcc;
+	unsigned int size_align;
 	struct v4l2_frmsize_stepwise frmsize;
 	const struct rkvenc_ctrls *ctrls;
 	const struct rkvenc_codec_ops *ops;
@@ -220,7 +242,24 @@ void vepu580_setup_me(struct rkvenc_core *core, unsigned int width_mbs,
 		      bool intra);
 void vepu580_setup_h264_tuning(struct rkvenc_dev *rkvenc,
 			       struct rkvenc_core *core, bool intra);
-void vepu580_setup_row_rc(struct rkvenc_core *core, unsigned int qp,
+
+/**
+ * struct vepu580_row_rc - codec-specific row rate control parameters
+ * @qp_adj: QP adjustment for each of the nine deviation buckets
+ * @dthd_outer: multiple of the base threshold for the outer buckets
+ * @aq_mode: value of rc_cfg.aq_mode
+ */
+struct vepu580_row_rc {
+	s8 qp_adj[9];
+	unsigned int dthd_outer;
+	bool aq_mode;
+};
+
+extern const struct vepu580_row_rc vepu580_h264_row_rc;
+extern unsigned int rkvenc_row_rc_qp_range;
+
+void vepu580_setup_row_rc(struct rkvenc_core *core,
+			  const struct vepu580_row_rc *cfg, unsigned int qp,
 			  unsigned int qp_min, unsigned int qp_max,
 			  unsigned int qp_range, u64 target_bits,
 			  unsigned int num_blocks, unsigned int blocks_per_row);

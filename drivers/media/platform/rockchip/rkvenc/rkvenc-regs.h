@@ -360,6 +360,11 @@
 #define VEPU580_ST_BUS				0x4030
 #define VEPU580_ST_SNUM				0x4034
 #define VEPU580_ST_SLEN				0x4038
+#define VEPU580_ST_PNUM_P64			0x4100
+#define VEPU580_ST_PNUM_P32			0x4104
+#define VEPU580_ST_PNUM_P16			0x4108
+#define VEPU580_ST_PNUM_P8			0x410c
+#define VEPU580_ST_PNUM_I32			0x4110
 #define VEPU580_ST_PNUM_I16			0x4114
 #define VEPU580_ST_PNUM_I8			0x4118
 #define VEPU580_ST_PNUM_I4			0x411c
@@ -367,6 +372,8 @@
 #define VEPU580_ST_BNUM_CME			0x4124
 #define VEPU580_ST_MADI				0x4128
 #define VEPU580_ST_BNUM_B16			0x412c
+/* Histogram of the QP of the 8x8 blocks, one counter per QP 0..51 */
+#define VEPU580_ST_B8_QP(qp)			(0x4200 + 4 * (qp))
 
 /* Debug class */
 #define VEPU580_DBG_FRAME_CYC			0x5200

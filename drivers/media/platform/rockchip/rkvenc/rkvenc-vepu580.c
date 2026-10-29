@@ -12,9 +12,15 @@
 #include <linux/bitfield.h>
 #include <linux/dma-mapping.h>
 #include <linux/minmax.h>
+#include <linux/moduleparam.h>
 #include <linux/slab.h>
 
 #include "rkvenc.h"
+
+unsigned int rkvenc_row_rc_qp_range = 2;
+module_param_named(row_rc_qp_range, rkvenc_row_rc_qp_range, uint, 0644);
+MODULE_PARM_DESC(row_rc_qp_range,
+		 "CBR: maximum per-row QP change by the hardware rate control (0 = frame-level rate control only)");
 
 int rkvenc_alloc_aux(struct rkvenc_dev *rkvenc, struct rkvenc_aux_buf *buf,
 		     size_t size, bool kernel_mapping)
@@ -74,17 +80,18 @@ static void vepu580_setup_src(struct rkvenc_ctx *ctx, struct rkvenc_core *core,
 	struct vb2_buffer *vb = &run->src->vb2_buf;
 	unsigned int width = ctx->coded_fmt.fmt.pix_mp.width;
 	unsigned int height = ctx->coded_fmt.fmt.pix_mp.height;
+	unsigned int align = ctx->coded_fmt_desc->size_align;
 	unsigned int ystride = pix->plane_fmt[0].bytesperline;
 	unsigned int cstride = 0;
 	dma_addr_t addr[3] = { 0 };
 	unsigned int i;
 
 	rkvenc_set(core, VEPU580_ENC_RSL,
-		   FIELD_PREP(VEPU580_ENC_RSL_PIC_WD8_M1, ALIGN(width, 16) / 8 - 1) |
-		   FIELD_PREP(VEPU580_ENC_RSL_PIC_HD8_M1, ALIGN(height, 16) / 8 - 1));
+		   FIELD_PREP(VEPU580_ENC_RSL_PIC_WD8_M1, ALIGN(width, align) / 8 - 1) |
+		   FIELD_PREP(VEPU580_ENC_RSL_PIC_HD8_M1, ALIGN(height, align) / 8 - 1));
 	rkvenc_set(core, VEPU580_SRC_FILL,
-		   FIELD_PREP(VEPU580_SRC_FILL_PIC_WFILL, ALIGN(width, 16) - width) |
-		   FIELD_PREP(VEPU580_SRC_FILL_PIC_HFILL, ALIGN(height, 16) - height));
+		   FIELD_PREP(VEPU580_SRC_FILL_PIC_WFILL, ALIGN(width, align) - width) |
+		   FIELD_PREP(VEPU580_SRC_FILL_PIC_HFILL, ALIGN(height, align) - height));
 
 	/* MPP sets src_range for every YUV input; out_fmt selects 4:2:0. */
 	rkvenc_set(core, VEPU580_SRC_FMT,
@@ -450,17 +457,24 @@ void vepu580_setup_h264_tuning(struct rkvenc_dev *rkvenc,
 }
 
 /*
- * Frame-level QP with the hardware row rate control: each macroblock row
- * gets target_bits / num_blocks bits per block; the cumulative deviation
- * from that target selects one of nine QP adjustments, bounded by
- * qp_range around the frame QP and by [qp_min, qp_max].
+ * Frame-level QP with the hardware row rate control: each block row
+ * (macroblock row for H.264, CTU row for HEVC) gets target_bits /
+ * num_blocks bits per block; the cumulative deviation from that target
+ * selects one of nine QP adjustments, bounded by qp_range around the frame
+ * QP and by [qp_min, qp_max].
  */
-void vepu580_setup_row_rc(struct rkvenc_core *core, unsigned int qp,
+const struct vepu580_row_rc vepu580_h264_row_rc = {
+	.qp_adj = { -2, -1, 0, 1, 2, 0, 0, 0, 1 },
+	.dthd_outer = 4,
+	.aq_mode = false,
+};
+
+void vepu580_setup_row_rc(struct rkvenc_core *core,
+			  const struct vepu580_row_rc *cfg, unsigned int qp,
 			  unsigned int qp_min, unsigned int qp_max,
 			  unsigned int qp_range, u64 target_bits,
 			  unsigned int num_blocks, unsigned int blocks_per_row)
 {
-	static const s8 qp_adj[9] = { -2, -1, 0, 1, 2, 0, 0, 0, 1 };
 	u64 ebit16 = div_u64(target_bits << 4, num_blocks);
 	s32 row_bits, thd;
 	unsigned int i;
@@ -474,6 +488,7 @@ void vepu580_setup_row_rc(struct rkvenc_core *core, unsigned int qp,
 	rkvenc_or(core, VEPU580_ENC_PIC, FIELD_PREP(VEPU580_ENC_PIC_PIC_QP, qp));
 	rkvenc_set(core, VEPU580_RC_CFG,
 		   VEPU580_RC_CFG_RC_EN | VEPU580_RC_CFG_AQ_EN |
+		   (cfg->aq_mode ? VEPU580_RC_CFG_AQ_MODE : 0) |
 		   FIELD_PREP(VEPU580_RC_CFG_RC_CTU_NUM, blocks_per_row));
 	rkvenc_set(core, VEPU580_RC_QP,
 		   FIELD_PREP(VEPU580_RC_QP_RANGE, qp_range) |
@@ -485,12 +500,12 @@ void vepu580_setup_row_rc(struct rkvenc_core *core, unsigned int qp,
 	rkvenc_set(core, VEPU580_RC_ADJ1, 0);
 	for (i = 0; i < 9; i++)
 		rkvenc_or(core, i < 5 ? VEPU580_RC_ADJ0 : VEPU580_RC_ADJ1,
-			  VEPU580_RC_ADJ_QP(i < 5 ? i : i - 5, qp_adj[i]));
+			  VEPU580_RC_ADJ_QP(i < 5 ? i : i - 5, cfg->qp_adj[i]));
 
-	rkvenc_set(core, VEPU580_RC_DTHD(0), -4 * thd);
+	rkvenc_set(core, VEPU580_RC_DTHD(0), -cfg->dthd_outer * thd);
 	rkvenc_set(core, VEPU580_RC_DTHD(1), -thd);
 	rkvenc_set(core, VEPU580_RC_DTHD(2), thd);
-	rkvenc_set(core, VEPU580_RC_DTHD(3), 4 * thd);
+	rkvenc_set(core, VEPU580_RC_DTHD(3), cfg->dthd_outer * thd);
 	for (i = 4; i < 9; i++)
 		rkvenc_set(core, VEPU580_RC_DTHD(i), 0x7fffffff);
 
