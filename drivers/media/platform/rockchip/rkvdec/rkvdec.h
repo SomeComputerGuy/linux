@@ -97,6 +97,7 @@ struct rkvdec_variant {
 	bool has_single_reg_region;
 	unsigned int quirks;
 	bool has_ccu;
+	bool has_cache_ctrl;
 };
 
 struct rkvdec_coded_fmt_ops {
@@ -201,6 +202,7 @@ struct rkvdec_core {
 	struct rkvdec_rcb_config *rcb_config;
 	struct rkvdec_ctx *curr_ctx;
 	struct rkvdec_job *job;
+	void __iomem *cache;
 	int id;
 	int ccu_port;
 };
