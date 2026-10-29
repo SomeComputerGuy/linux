@@ -758,7 +758,8 @@ int v4l2_h264_enc_rbsp_sps(struct v4l2_h264_enc_rbsp *rbsp,
 			if (ret)
 				return ret;
 		}
-	} else {
+	} else if (sps->pic_order_cnt_type != 2) {
+		/* Type 2 has no further syntax elements. */
 		return -EINVAL;
 	}
 
