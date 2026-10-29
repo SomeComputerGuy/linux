@@ -579,7 +579,7 @@ static int prepare_encode(struct v4l2_hevc_enc *enc,
 	if (!ctrl)
 		return -EINVAL;
 
-	memcpy(encode, ctrl->p_cur.p_hevc_encode_params, sizeof(*encode));
+	memcpy(encode, ctrl->p_cur.p, sizeof(*encode));
 
 	/* The bitstream starts with an IRAP picture. */
 	if (!enc->state_serial && !v4l2_hevc_nal_is_irap(encode->nal_unit_type))
