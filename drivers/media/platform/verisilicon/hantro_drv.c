@@ -1099,6 +1099,22 @@ static void hantro_detach_func(struct hantro_func *func)
 	media_entity_cleanup(&func->vdev.entity);
 }
 
+/* Does the encoder only produce JPEG, which has no use for a frame rate? */
+static bool hantro_jpeg_only_encoder(struct hantro_dev *vpu)
+{
+	unsigned int i;
+
+	for (i = 0; i < vpu->variant->num_enc_fmts; i++) {
+		const struct hantro_fmt *fmt = &vpu->variant->enc_fmts[i];
+
+		if (fmt->codec_mode != HANTRO_MODE_NONE &&
+		    fmt->codec_mode != HANTRO_MODE_JPEG_ENC)
+			return false;
+	}
+
+	return true;
+}
+
 static int hantro_add_func(struct hantro_dev *vpu, unsigned int funcid)
 {
 	const struct of_device_id *match;
@@ -1131,6 +1147,11 @@ static int hantro_add_func(struct hantro_dev *vpu, unsigned int funcid)
 		vpu->encoder = func;
 		v4l2_disable_ioctl(vfd, VIDIOC_TRY_DECODER_CMD);
 		v4l2_disable_ioctl(vfd, VIDIOC_DECODER_CMD);
+		if (hantro_jpeg_only_encoder(vpu)) {
+			v4l2_disable_ioctl(vfd, VIDIOC_ENUM_FRAMEINTERVALS);
+			v4l2_disable_ioctl(vfd, VIDIOC_G_PARM);
+			v4l2_disable_ioctl(vfd, VIDIOC_S_PARM);
+		}
 	} else {
 		vpu->decoder = func;
 		v4l2_disable_ioctl(vfd, VIDIOC_TRY_ENCODER_CMD);
