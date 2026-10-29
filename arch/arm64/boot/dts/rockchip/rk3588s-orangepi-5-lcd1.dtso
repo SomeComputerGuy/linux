@@ -1,0 +1,131 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Orange Pi 10.1" MIPI LCD (Innolux AFJ101-BA2131, ILI9881C, 800x1280,
+ * Goodix GT9271 touch) on the LCD1 connector of the Orange Pi 5.
+ *
+ * LCD1 is wired to DSI0 and MIPI DCPHY0. The connector signals are taken
+ * from the Orange Pi BSP device trees (rk3588s-orangepi-5-lcd.dtsi and
+ * rk3588s-orangepi-5.dtsi in orangepi-xunlong/linux-orangepi):
+ *   LCD power enable: GPIO1_A0, panel reset: GPIO1_B1 (active low),
+ *   backlight PWM: PWM2_M0 (GPIO0_C4),
+ *   touch: I2C7_M0, INT GPIO1_B5, RESET GPIO1_B4.
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+#include <dt-bindings/soc/rockchip,vop2.h>
+
+&{/} {
+	backlight_lcd1: backlight-lcd1 {
+		compatible = "pwm-backlight";
+		pwms = <&pwm2 0 25000 0>;
+	};
+
+	vcc_lcd1: regulator-vcc-lcd1 {
+		compatible = "regulator-fixed";
+		enable-active-high;
+		gpios = <&gpio1 RK_PA0 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&lcd1_pwr_en>;
+		regulator-name = "vcc_lcd1";
+	};
+};
+
+&dsi0 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	panel@0 {
+		compatible = "innolux,afj101-ba2131", "ilitek,ili9881c";
+		reg = <0>;
+		backlight = <&backlight_lcd1>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&lcd1_rst>;
+		power-supply = <&vcc_lcd1>;
+		reset-gpios = <&gpio1 RK_PB1 GPIO_ACTIVE_LOW>;
+
+		port {
+			lcd1_panel_in: endpoint {
+				remote-endpoint = <&dsi0_out_lcd1>;
+			};
+		};
+	};
+};
+
+&dsi0_in {
+	dsi0_in_vp3: endpoint {
+		remote-endpoint = <&vp3_out_dsi0>;
+	};
+};
+
+&dsi0_out {
+	dsi0_out_lcd1: endpoint {
+		remote-endpoint = <&lcd1_panel_in>;
+	};
+};
+
+&i2c7 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c7m0_xfer>;
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	touchscreen@14 {
+		compatible = "goodix,gt9271";
+		reg = <0x14>;
+		interrupt-parent = <&gpio1>;
+		interrupts = <RK_PB5 IRQ_TYPE_LEVEL_LOW>;
+		irq-gpios = <&gpio1 RK_PB5 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&lcd1_touch_int &lcd1_touch_rst>;
+		reset-gpios = <&gpio1 RK_PB4 GPIO_ACTIVE_HIGH>;
+		touchscreen-inverted-x;
+		touchscreen-size-x = <1280>;
+		touchscreen-size-y = <800>;
+		touchscreen-swapped-x-y;
+	};
+};
+
+&mipidcphy0 {
+	status = "okay";
+};
+
+&pinctrl {
+	lcd1 {
+		lcd1_pwr_en: lcd1-pwr-en {
+			rockchip,pins = <1 RK_PA0 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		lcd1_rst: lcd1-rst {
+			rockchip,pins = <1 RK_PB1 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		lcd1_touch_int: lcd1-touch-int {
+			rockchip,pins = <1 RK_PB5 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		lcd1_touch_rst: lcd1-touch-rst {
+			rockchip,pins = <1 RK_PB4 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+};
+
+&pwm2 {
+	status = "okay";
+};
+
+&vp3 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	vp3_out_dsi0: endpoint@ROCKCHIP_VOP2_EP_MIPI0 {
+		reg = <ROCKCHIP_VOP2_EP_MIPI0>;
+		remote-endpoint = <&dsi0_in_vp3>;
+	};
+};
