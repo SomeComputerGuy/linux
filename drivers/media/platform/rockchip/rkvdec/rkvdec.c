@@ -212,6 +212,16 @@ static const struct v4l2_ctrl_ops rkvdec_ctrl_ops = {
 	.s_ctrl = rkvdec_s_ctrl,
 };
 
+/*
+ * The all-zero default SPS has chroma_format_idc 0 (monochrome), which the
+ * driver doesn't support and refuses, so the default value of the control
+ * itself would fail VIDIOC_TRY_EXT_CTRLS and streaming would not start.
+ * Default to 4:2:0 instead.
+ */
+static const struct v4l2_ctrl_hevc_sps rkvdec_hevc_default_sps = {
+	.chroma_format_idc = 1,
+};
+
 static const struct rkvdec_ctrl_desc rkvdec_hevc_ctrl_descs[] = {
 	{
 		.cfg.id = V4L2_CID_STATELESS_HEVC_SLICE_PARAMS,
@@ -222,6 +232,7 @@ static const struct rkvdec_ctrl_desc rkvdec_hevc_ctrl_descs[] = {
 	{
 		.cfg.id = V4L2_CID_STATELESS_HEVC_SPS,
 		.cfg.ops = &rkvdec_ctrl_ops,
+		.cfg.p_def.p_const = &rkvdec_hevc_default_sps,
 	},
 	{
 		.cfg.id = V4L2_CID_STATELESS_HEVC_PPS,
@@ -269,6 +280,7 @@ static const struct rkvdec_ctrl_desc vdpu38x_hevc_ctrl_descs[] = {
 	{
 		.cfg.id = V4L2_CID_STATELESS_HEVC_SPS,
 		.cfg.ops = &rkvdec_ctrl_ops,
+		.cfg.p_def.p_const = &rkvdec_hevc_default_sps,
 	},
 	{
 		.cfg.id = V4L2_CID_STATELESS_HEVC_PPS,
