@@ -231,6 +231,35 @@ void v4l2_m2m_buf_done_and_job_finish(struct v4l2_m2m_dev *m2m_dev,
 				      struct v4l2_m2m_ctx *m2m_ctx,
 				      enum vb2_buffer_state state);
 
+/**
+ * v4l2_m2m_buf_detach_and_job_finish() - take the source/destination buffers
+ * of the running job and inform the framework that the job has been finished
+ *
+ * @m2m_dev: opaque pointer to the internal data to handle M2M context
+ * @m2m_ctx: m2m context assigned to the instance given by struct &v4l2_m2m_ctx
+ * @src_buf: set to the source buffer of the job
+ * @dst_buf: set to the destination buffer of the job
+ *
+ * For drivers that keep processing a job after the next one may start, e.g.
+ * on hardware with several cores that can work on consecutive jobs of the
+ * same context. The source and destination buffers of the job are removed
+ * from the ready lists without being returned, and the job is finished, so
+ * that the next job can be scheduled while the hardware still processes
+ * this one. The driver then owns both buffers and must return them with
+ * v4l2_m2m_buf_done(), the destination buffer first.
+ *
+ * A job whose source buffer has %V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF set keeps
+ * its destination buffer for the next job, so it can't be detached: nothing
+ * is done and the job has to be finished with
+ * v4l2_m2m_buf_done_and_job_finish() as usual.
+ *
+ * Return: true if the buffers were detached and the job finished.
+ */
+bool v4l2_m2m_buf_detach_and_job_finish(struct v4l2_m2m_dev *m2m_dev,
+					struct v4l2_m2m_ctx *m2m_ctx,
+					struct vb2_v4l2_buffer **src_buf,
+					struct vb2_v4l2_buffer **dst_buf);
+
 static inline void
 v4l2_m2m_buf_done(struct vb2_v4l2_buffer *buf, enum vb2_buffer_state state)
 {
