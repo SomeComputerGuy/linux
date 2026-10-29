@@ -894,10 +894,8 @@ int hantro_g2_vp9_dec_run(struct hantro_ctx *ctx)
 	int ret;
 
 	ret = start_prepare_run(ctx, &decode_params);
-	if (ret) {
-		hantro_end_prepare_run(ctx);
+	if (ret)
 		return ret;
-	}
 
 	src = hantro_get_src_buf(ctx);
 	dst = hantro_get_dst_buf(ctx);

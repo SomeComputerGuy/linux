@@ -375,7 +375,11 @@ struct hantro_postproc_ops {
  * @run:	Start single {en,de)coding job. Called from atomic context
  *		to indicate that a pair of buffers is ready and the hardware
  *		should be programmed and started. Returns zero if OK, a
- *		negative value in error cases.
+ *		negative value in error cases. On error, the hardware must
+ *		not have been started, and neither hantro_end_prepare_run()
+ *		nor hantro_irq_done() must have been called: the core then
+ *		completes the request controls, releases the clocks and the
+ *		runtime PM reference, and finishes the job with an error.
  * @done:	Read back processing results and additional data from hardware.
  * @reset:	Reset the hardware in case of a timeout.
  */

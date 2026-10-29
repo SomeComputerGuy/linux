@@ -2175,13 +2175,11 @@ int rockchip_vpu981_av1_dec_run(struct hantro_ctx *ctx)
 
 	ret = rockchip_vpu981_av1_dec_prepare_run(ctx);
 	if (ret)
-		goto prepare_error;
+		return ret;
 
 	vb2_src = hantro_get_src_buf(ctx);
-	if (!vb2_src) {
-		ret = -EINVAL;
-		goto prepare_error;
-	}
+	if (!vb2_src)
+		return -EINVAL;
 
 	rockchip_vpu981_av1_dec_clean_refs(ctx);
 	rockchip_vpu981_av1_dec_frame_ref(ctx, vb2_src->vb2_buf.timestamp);
@@ -2229,11 +2227,6 @@ int rockchip_vpu981_av1_dec_run(struct hantro_ctx *ctx)
 	hantro_reg_write(vpu, &av1_dec_e, 1);
 
 	return 0;
-
-prepare_error:
-	hantro_end_prepare_run(ctx);
-	hantro_irq_done(vpu, VB2_BUF_STATE_ERROR);
-	return ret;
 }
 
 static void rockchip_vpu981_postproc_enable(struct hantro_ctx *ctx)
