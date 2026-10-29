@@ -452,6 +452,15 @@ u16 hantro_h264_get_ref_nbr(struct hantro_ctx *ctx,
 int hantro_h264_dec_prepare_run(struct hantro_ctx *ctx);
 int rockchip_vpu2_h264_dec_run(struct hantro_ctx *ctx);
 int hantro_g1_h264_dec_run(struct hantro_ctx *ctx);
+/*
+ * H.264 CABAC context initialization values (m, n) as signed bytes, packed
+ * two pairs per word with the first one in the most significant half: the
+ * 460 contexts of I slices, then those of P and B slices for each of the
+ * three cabac_init_idc values.
+ */
+#define HANTRO_H264_CABAC_TABLE_SIZE	(460 * 2)
+extern const u32 hantro_h264_cabac_table[HANTRO_H264_CABAC_TABLE_SIZE];
+
 int hantro_h264_dec_init(struct hantro_ctx *ctx);
 void hantro_h264_dec_exit(struct hantro_ctx *ctx);
 
