@@ -52,6 +52,19 @@ config V4L2_H264_ENC
 config V4L2_HEVC_ENC_RBSP
 	tristate
 
+config V4L2_HEVC_ENC_RBSP_KUNIT_TEST
+	tristate "KUnit tests for the V4L2 HEVC encode RBSP writer" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	select V4L2_HEVC_ENC_RBSP
+	default KUNIT_ALL_TESTS
+	help
+	  Build the KUnit tests of the HEVC NAL unit writer used by stateless
+	  HEVC encoders. They check the VPS, SPS, PPS, access unit delimiter
+	  and slice segment headers it writes, byte for byte, against known
+	  bitstreams.
+
+	  If unsure, say N.
+
 # Used by drivers that need v4l2-vp9.ko
 config V4L2_VP9
 	tristate
