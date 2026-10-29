@@ -238,13 +238,21 @@ static void device_run(void *priv)
 	v4l2_m2m_buf_copy_metadata(src, dst);
 
 	if (ctx->codec_ops->run(ctx))
-		goto err_cancel_job;
+		goto err_clk_disable;
 
 	return;
 
+err_clk_disable:
+	clk_bulk_disable(core->variant->num_clocks, core->clocks);
 err_pm_put:
 	pm_runtime_put_autosuspend(core->dev);
 err_cancel_job:
+	/*
+	 * The job is cancelled before the controls of its request were
+	 * completed. Complete them now, or the request would never complete.
+	 */
+	v4l2_ctrl_request_complete(src->vb2_buf.req_obj.req,
+				   &ctx->ctrl_handler);
 	hantro_job_finish_no_pm(ctx->dev, ctx, VB2_BUF_STATE_ERROR);
 }
 
