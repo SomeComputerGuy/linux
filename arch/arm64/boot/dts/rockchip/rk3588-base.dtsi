@@ -1409,6 +1409,62 @@
 		#iommu-cells = <0>;
 	};
 
+	vepu580_0: video-codec@fdbd0000 {
+		compatible = "rockchip,rk3588-vepu580";
+		reg = <0x0 0xfdbd0000 0x0 0x6000>;
+		interrupts = <GIC_SPI 101 IRQ_TYPE_LEVEL_HIGH 0>;
+		clocks = <&cru ACLK_RKVENC0>, <&cru HCLK_RKVENC0>,
+			 <&cru CLK_RKVENC0_CORE>;
+		clock-names = "aclk", "hclk", "core";
+		assigned-clocks = <&cru ACLK_RKVENC0>, <&cru CLK_RKVENC0_CORE>;
+		assigned-clock-rates = <500000000>, <800000000>;
+		resets = <&cru SRST_A_RKVENC0>, <&cru SRST_H_RKVENC0>,
+			 <&cru SRST_RKVENC0_CORE>;
+		reset-names = "aclk", "hclk", "core";
+		iommus = <&vepu580_0_mmu>;
+		power-domains = <&power RK3588_PD_VENC0>;
+	};
+
+	vepu580_0_mmu: iommu@fdbdf000 {
+		compatible = "rockchip,rk3588-iommu", "rockchip,rk3568-iommu";
+		reg = <0x0 0xfdbdf000 0x0 0x40>, <0x0 0xfdbdf040 0x0 0x40>;
+		interrupts = <GIC_SPI 99 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 100 IRQ_TYPE_LEVEL_HIGH 0>;
+		clocks = <&cru ACLK_RKVENC0>, <&cru HCLK_RKVENC0>;
+		clock-names = "aclk", "iface";
+		power-domains = <&power RK3588_PD_VENC0>;
+		rockchip,disable-mmu-reset;
+		#iommu-cells = <0>;
+	};
+
+	vepu580_1: video-codec@fdbe0000 {
+		compatible = "rockchip,rk3588-vepu580";
+		reg = <0x0 0xfdbe0000 0x0 0x6000>;
+		interrupts = <GIC_SPI 104 IRQ_TYPE_LEVEL_HIGH 0>;
+		clocks = <&cru ACLK_RKVENC1>, <&cru HCLK_RKVENC1>,
+			 <&cru CLK_RKVENC1_CORE>;
+		clock-names = "aclk", "hclk", "core";
+		assigned-clocks = <&cru ACLK_RKVENC1>, <&cru CLK_RKVENC1_CORE>;
+		assigned-clock-rates = <500000000>, <800000000>;
+		resets = <&cru SRST_A_RKVENC1>, <&cru SRST_H_RKVENC1>,
+			 <&cru SRST_RKVENC1_CORE>;
+		reset-names = "aclk", "hclk", "core";
+		iommus = <&vepu580_1_mmu>;
+		power-domains = <&power RK3588_PD_VENC1>;
+	};
+
+	vepu580_1_mmu: iommu@fdbef000 {
+		compatible = "rockchip,rk3588-iommu", "rockchip,rk3568-iommu";
+		reg = <0x0 0xfdbef000 0x0 0x40>, <0x0 0xfdbef040 0x0 0x40>;
+		interrupts = <GIC_SPI 102 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 103 IRQ_TYPE_LEVEL_HIGH 0>;
+		clocks = <&cru ACLK_RKVENC1>, <&cru HCLK_RKVENC1>;
+		clock-names = "aclk", "iface";
+		power-domains = <&power RK3588_PD_VENC1>;
+		rockchip,disable-mmu-reset;
+		#iommu-cells = <0>;
+	};
+
 	vdec0: video-codec@fdc38000 {
 		compatible = "rockchip,rk3588-vdec";
 		reg = <0x0 0xfdc38000 0x0 0x100>,
