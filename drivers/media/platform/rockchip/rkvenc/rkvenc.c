@@ -720,6 +720,7 @@ static void rkvenc_read_feedback(struct rkvenc_core *core,
 {
 	void __iomem *r = core->regs;
 	u32 sse_bsl = readl_relaxed(r + VEPU580_ST_SSE_BSL);
+	unsigned int i;
 
 	fb->bs_len = readl_relaxed(r + VEPU580_ST_BS_LGTH_L32) |
 		     (u64)FIELD_GET(VEPU580_ST_BS_LGTH_H8, sse_bsl) << 32;
@@ -728,9 +729,20 @@ static void rkvenc_read_feedback(struct rkvenc_core *core,
 	fb->qp_sum = readl_relaxed(r + VEPU580_ST_QP_SUM);
 	fb->madi = readl_relaxed(r + VEPU580_ST_MADI);
 	fb->madp = readl_relaxed(r + VEPU580_ST_MADP);
-	fb->intra_blocks = readl_relaxed(r + VEPU580_ST_PNUM_I16) +
-			   readl_relaxed(r + VEPU580_ST_PNUM_I8) +
-			   readl_relaxed(r + VEPU580_ST_PNUM_I4);
+	for (i = 0; i < RKVENC_PNUM_COUNT; i++)
+		fb->pnum[i] = readl_relaxed(r + VEPU580_ST_PNUM_P64 + 4 * i);
+	fb->intra_blocks = fb->pnum[RKVENC_PNUM_I16] + fb->pnum[RKVENC_PNUM_I8] +
+			   fb->pnum[RKVENC_PNUM_I4];
+
+	fb->qp_min = -1;
+	fb->qp_max = -1;
+	for (i = 0; i < 52; i++) {
+		if (!readl_relaxed(r + VEPU580_ST_B8_QP(i)))
+			continue;
+		if (fb->qp_min < 0)
+			fb->qp_min = i;
+		fb->qp_max = i;
+	}
 	fb->cycles = readl_relaxed(r + VEPU580_DBG_FRAME_CYC);
 }
 
@@ -941,8 +953,12 @@ static int rkvenc_init_ctrls(struct rkvenc_ctx *ctx)
 	for (i = 0; i < ARRAY_SIZE(rkvenc_coded_fmts); i++) {
 		const struct rkvenc_ctrls *ctrls = rkvenc_coded_fmts[i]->ctrls;
 
-		for (j = 0; j < ctrls->num_ctrls; j++)
+		for (j = 0; j < ctrls->num_ctrls; j++) {
+			/* Controls shared by several codecs are added once. */
+			if (v4l2_ctrl_find(hdl, ctrls->ctrls[j].id))
+				continue;
 			v4l2_ctrl_new_custom(hdl, &ctrls->ctrls[j], NULL);
+		}
 	}
 
 	ctx->avg_qp_ctrl = v4l2_ctrl_find(hdl, V4L2_CID_MPEG_VIDEO_AVERAGE_QP);
