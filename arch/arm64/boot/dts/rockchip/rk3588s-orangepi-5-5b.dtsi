@@ -85,6 +85,10 @@
 	};
 };
 
+&dp0_sound {
+	status = "okay";
+};
+
 &gmac1 {
 	clock_in_out = "output";
 	phy-handle = <&rgmii_phy1>;
@@ -239,6 +243,10 @@
 	};
 };
 
+
+&spdif_tx2 {
+	status = "okay";
+};
 
 &usb_host0_xhci {
 	dr_mode = "otg";
