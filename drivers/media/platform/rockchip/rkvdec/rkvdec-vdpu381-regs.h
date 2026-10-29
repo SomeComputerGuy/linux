@@ -38,6 +38,15 @@
 #define VDPU381_DEC_IRQ_DISABLE	BIT(4)
 #define VDPU381_SOFT_RESET_EN		BIT(20)
 
+/* Registers in the cache block, one set for each of the three caches */
+#define VDPU381_CACHE_CLR(n)		(0x10 + (n) * 0x40)
+#define VDPU381_CACHE_CLR_ALL		BIT(0)
+#define VDPU381_CACHE_CFG(n)		(0x1c + (n) * 0x40)
+#define VDPU381_CACHE_CFG_CACHEABLE	BIT(0)
+#define VDPU381_CACHE_CFG_RD_ALLOCATE	BIT(1)
+#define VDPU381_CACHE_CFG_LINE_64B	BIT(4)
+#define VDPU381_NUM_CACHES		3
+
 #define VDPU381_REG_STA_INT		0x380
 #define VDPU381_STA_INT_DEC_RDY_STA	BIT(2)
 #define VDPU381_STA_INT_ERROR		BIT(4)

@@ -1535,6 +1535,25 @@ void rkvdec_schedule_watchdog(struct rkvdec_core *core, u32 timeout_threshold)
 	schedule_delayed_work(&core->watchdog_work, msecs_to_jiffies(watchdog_time));
 }
 
+/*
+ * Enables the read caches of the core, and drops what they hold: the
+ * reference frames of this job may have been rewritten since they were
+ * cached, by another core or as the destination of an earlier job.
+ */
+static void rkvdec_core_reset_cache(struct rkvdec_core *core)
+{
+	unsigned int i;
+
+	if (!core->cache)
+		return;
+
+	for (i = 0; i < VDPU381_NUM_CACHES; i++) {
+		writel(VDPU381_CACHE_CFG_CACHEABLE | VDPU381_CACHE_CFG_RD_ALLOCATE |
+		       VDPU381_CACHE_CFG_LINE_64B, core->cache + VDPU381_CACHE_CFG(i));
+		writel(VDPU381_CACHE_CLR_ALL, core->cache + VDPU381_CACHE_CLR(i));
+	}
+}
+
 static void rkvdec_device_run(void *priv)
 {
 	struct rkvdec_ctx *ctx = priv;
@@ -1583,6 +1602,8 @@ static void rkvdec_device_run(void *priv)
 
 	if (ctx->dev->ccu)
 		rkvdec_ccu_prepare(ctx);
+
+	rkvdec_core_reset_cache(core);
 
 	if (!rkvdec_rcb_buf_validate_size(ctx)) {
 		rkvdec_free_rcb(ctx->dev, core);
@@ -2248,6 +2269,7 @@ static const struct rkvdec_variant vdpu381_variant = {
 	.num_rcb_sizes = ARRAY_SIZE(vdpu381_rcb_sizes),
 	.ops = &vdpu381_variant_ops,
 	.has_ccu = true,
+	.has_cache_ctrl = true,
 };
 
 static const struct rcb_size_info vdpu383_rcb_sizes[] = {
@@ -2400,6 +2422,12 @@ static int rkvdec_core_probe(struct platform_device *pdev)
 		core->link = devm_platform_ioremap_resource_byname(pdev, "link");
 		if (IS_ERR(core->link))
 			return PTR_ERR(core->link);
+
+		if (variant->has_cache_ctrl) {
+			core->cache = devm_platform_ioremap_resource_byname(pdev, "cache");
+			if (IS_ERR(core->cache))
+				return PTR_ERR(core->cache);
+		}
 	}
 
 	if (iommu_get_domain_for_dev(&pdev->dev)) {
