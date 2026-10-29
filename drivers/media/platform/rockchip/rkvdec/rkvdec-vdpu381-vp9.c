@@ -88,12 +88,17 @@ struct rkvdec_vp9_intra_frame_symbol_counts {
 
 struct rkvdec_vp9_frame_info {
 	u32 valid : 1;
+	/* segmentation map holding the segment IDs after this frame */
 	u32 segmapid : 1;
+	/* segmentation was enabled on a frame since the last intra frame */
+	u32 segmap_valid : 1;
 	u32 frame_context_idx : 2;
 	u32 reference_mode : 2;
 	u32 tx_mode : 3;
 	u32 interpolation_filter : 3;
 	u32 flags;
+	u16 width;
+	u16 height;
 	u64 timestamp;
 	struct v4l2_vp9_segmentation seg;
 	struct v4l2_vp9_loop_filter lf;
@@ -390,6 +395,8 @@ static void update_ctx_cur_info(struct rkvdec_vp9_ctx *vp9_ctx,
 	vp9_ctx->cur.reference_mode = dec_params->reference_mode;
 	vp9_ctx->cur.interpolation_filter = dec_params->interpolation_filter;
 	vp9_ctx->cur.flags = dec_params->flags;
+	vp9_ctx->cur.width = dec_params->frame_width_minus_1 + 1;
+	vp9_ctx->cur.height = dec_params->frame_height_minus_1 + 1;
 	vp9_ctx->cur.timestamp = buf->base.vb.vb2_buf.timestamp;
 	vp9_ctx->cur.seg = dec_params->seg;
 	vp9_ctx->cur.lf = dec_params->lf;
@@ -445,6 +452,7 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	u32 pixels;
 
 	dma_addr_t rlc_addr, dst_addr;
+	bool seg_enabled, segmap_update, last_segmap_valid;
 	bool intra_only;
 	unsigned int i;
 
@@ -531,12 +539,32 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	if (intra_only)
 		memset(vp9_ctx->count_tbl.cpu, 0, vp9_ctx->count_tbl.size);
 
-	vp9_ctx->cur.segmapid = vp9_ctx->last.segmapid;
-	if (!intra_only &&
-	    !(dec_params->flags & V4L2_VP9_FRAME_FLAG_ERROR_RESILIENT) &&
-	    (!(seg->flags & V4L2_VP9_SEGMENTATION_FLAG_ENABLED) ||
-	     (seg->flags & V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP)))
-		vp9_ctx->cur.segmapid++;
+	/*
+	 * Two segmentation maps are used in turn: the hardware reads the
+	 * segment IDs left by the previous frames from segidlast and writes
+	 * the ones of the current frame to segidcur. A frame that does not
+	 * code a new map (segmentation disabled, or update_map == 0) leaves
+	 * the previous map in place for the following frames, as required by
+	 * the spec. Intra-only, error resilient and resized frames start
+	 * from a reset map.
+	 */
+	seg_enabled = seg->flags & V4L2_VP9_SEGMENTATION_FLAG_ENABLED;
+	segmap_update = intra_only || !vp9_ctx->last.valid ||
+			(dec_params->flags & V4L2_VP9_FRAME_FLAG_ERROR_RESILIENT) ||
+			vp9_ctx->last.width != vp9_ctx->cur.width ||
+			vp9_ctx->last.height != vp9_ctx->cur.height ||
+			(seg_enabled &&
+			 (seg->flags & V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP));
+	vp9_ctx->cur.segmapid = vp9_ctx->last.segmapid ^ segmap_update;
+	regs->vp9_param.reg75.vp9_segment_id_update = segmap_update;
+
+	/*
+	 * The map left by the previous frames is only meaningful if
+	 * segmentation was used since the last intra frame.
+	 */
+	last_segmap_valid = !intra_only && vp9_ctx->last.valid &&
+			    vp9_ctx->last.segmap_valid;
+	vp9_ctx->cur.segmap_valid = seg_enabled || last_segmap_valid;
 
 	for (i = 0; i < ARRAY_SIZE(ref_bufs); i++)
 		config_ref_registers(ctx, run, ref_bufs[i], i);
@@ -564,9 +592,7 @@ static void config_registers(struct rkvdec_ctx *ctx,
 				(lf->mode_deltas[i] & 0x7f) << (7 * i);
 	}
 
-	regs->vp9_param.reg75.segmentation_enable_lstframe =
-		vp9_ctx->last.valid && !intra_only &&
-		vp9_ctx->last.seg.flags & V4L2_VP9_SEGMENTATION_FLAG_ENABLED;
+	regs->vp9_param.reg75.segmentation_enable_lstframe = last_segmap_valid;
 
 	regs->vp9_param.reg75.vp9_last_showframe =
 		vp9_ctx->last.valid &&
@@ -579,8 +605,8 @@ static void config_registers(struct rkvdec_ctx *ctx,
 
 	regs->vp9_param.reg75.vp9_last_widhheight_eqcur =
 		vp9_ctx->last.valid &&
-		last->vp9.width == dst->vp9.width &&
-		last->vp9.height == dst->vp9.height;
+		vp9_ctx->last.width == vp9_ctx->cur.width &&
+		vp9_ctx->last.height == vp9_ctx->cur.height;
 
 	regs->vp9_param.reg78_vp9_stream_size = stream_len;
 
@@ -632,11 +658,11 @@ static void config_registers(struct rkvdec_ctx *ctx,
 
 	regs->vp9_addr.vp9_segidlast_base = vp9_ctx->priv_tbl.dma +
 		offsetof(struct rkvdec_vp9_priv_tbl, segmap) +
-		(RKVDEC_VP9_MAX_SEGMAP_SIZE * (!vp9_ctx->cur.segmapid));
+		(RKVDEC_VP9_MAX_SEGMAP_SIZE * vp9_ctx->last.segmapid);
 
 	regs->vp9_addr.avp9_segidcur_base = vp9_ctx->priv_tbl.dma +
 		offsetof(struct rkvdec_vp9_priv_tbl, segmap) +
-		(RKVDEC_VP9_MAX_SEGMAP_SIZE * vp9_ctx->cur.segmapid);
+		(RKVDEC_VP9_MAX_SEGMAP_SIZE * !vp9_ctx->last.segmapid);
 
 	if (!intra_only &&
 	    !(dec_params->flags & V4L2_VP9_FRAME_FLAG_ERROR_RESILIENT) &&
