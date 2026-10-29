@@ -52,6 +52,11 @@ config V4L2_H264_ENC
 config V4L2_HEVC_ENC_RBSP
 	tristate
 
+# Used by drivers that need v4l2-hevc-enc.ko
+config V4L2_HEVC_ENC
+	tristate
+	select V4L2_HEVC_ENC_RBSP
+
 config V4L2_HEVC_ENC_RBSP_KUNIT_TEST
 	tristate "KUnit tests for the V4L2 HEVC encode RBSP writer" if !KUNIT_ALL_TESTS
 	depends on KUNIT
