@@ -11,6 +11,7 @@
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-event.h>
 #include <media/v4l2-fwnode.h>
+#include <media/v4l2-hevc.h>
 
 #include "v4l2-ctrls-priv.h"
 
@@ -18,6 +19,21 @@ static const union v4l2_ctrl_ptr ptr_null;
 
 #define V4L2_HEVC_MAX_SHORT_TERM_REF_PIC_SETS	64
 #define V4L2_HEVC_MAX_LONG_TERM_REF_PICS_SPS	32
+
+#define V4L2_HEVC_ENCODE_FLAGS_ALL \
+	(V4L2_HEVC_ENCODE_FLAG_SLICE_SAO_LUMA | \
+	 V4L2_HEVC_ENCODE_FLAG_SLICE_SAO_CHROMA | \
+	 V4L2_HEVC_ENCODE_FLAG_SLICE_TEMPORAL_MVP_ENABLED | \
+	 V4L2_HEVC_ENCODE_FLAG_MVD_L1_ZERO | \
+	 V4L2_HEVC_ENCODE_FLAG_CABAC_INIT | \
+	 V4L2_HEVC_ENCODE_FLAG_COLLOCATED_FROM_L0 | \
+	 V4L2_HEVC_ENCODE_FLAG_SLICE_DEBLOCKING_FILTER_DISABLED | \
+	 V4L2_HEVC_ENCODE_FLAG_SLICE_LOOP_FILTER_ACROSS_SLICES_ENABLED | \
+	 V4L2_HEVC_ENCODE_FLAG_REFERENCE | \
+	 V4L2_HEVC_ENCODE_FLAG_NO_OUTPUT_OF_PRIOR_PICS | \
+	 V4L2_HEVC_ENCODE_FLAG_NO_PIC_OUTPUT | \
+	 V4L2_HEVC_ENCODE_FLAG_NUM_REF_IDX_ACTIVE_OVERRIDE | \
+	 V4L2_HEVC_ENCODE_FLAG_DEBLOCKING_FILTER_OVERRIDE)
 
 static void fill_event(struct v4l2_event *ev, struct v4l2_ctrl *ctrl,
 		       u32 changes)
@@ -115,6 +131,8 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 	struct v4l2_ctrl_fwht_params *p_fwht_params;
 	struct v4l2_ctrl_h264_scaling_matrix *p_h264_scaling_matrix;
 	struct v4l2_ctrl_av1_sequence *p_av1_sequence;
+	struct v4l2_ctrl_hevc_encode_params *p_hevc_enc_params;
+	struct v4l2_ctrl_hevc_encode_feedback *p_hevc_enc_feedback;
 	void *p = ptr.p + idx * ctrl->elem_size;
 
 	if (ctrl->p_def.p_const)
@@ -187,6 +205,20 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 		 *  (7-8) and (7-9) of the specification.
 		 */
 		memset(p_h264_scaling_matrix, 16, sizeof(*p_h264_scaling_matrix));
+		break;
+	case V4L2_CTRL_TYPE_HEVC_ENCODE_PARAMS:
+		p_hevc_enc_params = p;
+		/* A valid default: an IDR picture. */
+		p_hevc_enc_params->nal_unit_type = V4L2_HEVC_NAL_IDR_W_RADL;
+		p_hevc_enc_params->nuh_temporal_id_plus1 = 1;
+		p_hevc_enc_params->slice_type = V4L2_HEVC_SLICE_TYPE_I;
+		p_hevc_enc_params->flags = V4L2_HEVC_ENCODE_FLAG_REFERENCE;
+		break;
+	case V4L2_CTRL_TYPE_HEVC_ENCODE_FEEDBACK:
+		p_hevc_enc_feedback = p;
+		p_hevc_enc_feedback->nal_unit_type = V4L2_HEVC_NAL_IDR_W_RADL;
+		p_hevc_enc_feedback->nuh_temporal_id_plus1 = 1;
+		p_hevc_enc_feedback->slice_type = V4L2_HEVC_SLICE_TYPE_I;
 		break;
 	}
 }
@@ -441,6 +473,12 @@ void v4l2_ctrl_type_op_log(const struct v4l2_ctrl *ctrl)
 		break;
 	case V4L2_CTRL_TYPE_HEVC_DECODE_PARAMS:
 		pr_cont("HEVC_DECODE_PARAMS");
+		break;
+	case V4L2_CTRL_TYPE_HEVC_ENCODE_PARAMS:
+		pr_cont("HEVC_ENCODE_PARAMS");
+		break;
+	case V4L2_CTRL_TYPE_HEVC_ENCODE_FEEDBACK:
+		pr_cont("HEVC_ENCODE_FEEDBACK");
 		break;
 	case V4L2_CTRL_TYPE_AV1_SEQUENCE:
 		pr_cont("AV1_SEQUENCE");
@@ -981,6 +1019,140 @@ static int validate_av1_sequence(struct v4l2_ctrl_av1_sequence *s)
  * in order to properly detect unchanged controls with v4l2_ctrl_type_op_equal's
  * memcmp.
  */
+static int
+validate_hevc_encode_params(struct v4l2_ctrl_hevc_encode_params *p)
+{
+	u8 nal_unit_type = p->nal_unit_type;
+	bool used = false;
+	unsigned int i, j;
+
+	if (p->flags & ~V4L2_HEVC_ENCODE_FLAGS_ALL)
+		return -EINVAL;
+
+	/* Only the VCL NAL unit types of Table 7-1 that can be produced. */
+	if (nal_unit_type > V4L2_HEVC_NAL_RASL_R &&
+	    (nal_unit_type < V4L2_HEVC_NAL_BLA_W_LP ||
+	     nal_unit_type > V4L2_HEVC_NAL_CRA_NUT))
+		return -EINVAL;
+
+	if (p->slice_type > V4L2_HEVC_SLICE_TYPE_I)
+		return -EINVAL;
+
+	if (!p->nuh_temporal_id_plus1 ||
+	    p->nuh_temporal_id_plus1 > V4L2_HEVC_MAX_SUB_LAYERS)
+		return -EINVAL;
+
+	/* IRAP pictures only contain I slices and have TemporalId 0. */
+	if (v4l2_hevc_nal_is_irap(nal_unit_type) &&
+	    (p->slice_type != V4L2_HEVC_SLICE_TYPE_I ||
+	     p->nuh_temporal_id_plus1 != 1))
+		return -EINVAL;
+
+	/* TSA and STSA pictures cannot have TemporalId 0 (7.4.2.2). */
+	if (nal_unit_type >= V4L2_HEVC_NAL_TSA_N &&
+	    nal_unit_type <= V4L2_HEVC_NAL_STSA_R &&
+	    p->nuh_temporal_id_plus1 == 1)
+		return -EINVAL;
+
+	if (p->num_refs > V4L2_HEVC_DPB_ENTRIES_NUM_MAX)
+		return -EINVAL;
+
+	if (p->five_minus_max_num_merge_cand > 4)
+		return -EINVAL;
+
+	if (p->slice_cb_qp_offset < -12 || p->slice_cb_qp_offset > 12 ||
+	    p->slice_cr_qp_offset < -12 || p->slice_cr_qp_offset > 12)
+		return -EINVAL;
+
+	if (p->num_ref_idx_l0_active_minus1 >= V4L2_HEVC_DPB_ENTRIES_NUM_MAX - 1 ||
+	    p->num_ref_idx_l1_active_minus1 >= V4L2_HEVC_DPB_ENTRIES_NUM_MAX - 1 ||
+	    p->collocated_ref_idx >= V4L2_HEVC_DPB_ENTRIES_NUM_MAX - 1)
+		return -EINVAL;
+
+	if (p->flags & V4L2_HEVC_ENCODE_FLAG_DEBLOCKING_FILTER_OVERRIDE &&
+	    !(p->flags & V4L2_HEVC_ENCODE_FLAG_SLICE_DEBLOCKING_FILTER_DISABLED)) {
+		if (p->slice_beta_offset_div2 < -6 ||
+		    p->slice_beta_offset_div2 > 6 ||
+		    p->slice_tc_offset_div2 < -6 ||
+		    p->slice_tc_offset_div2 > 6)
+			return -EINVAL;
+	} else {
+		p->slice_beta_offset_div2 = 0;
+		p->slice_tc_offset_div2 = 0;
+	}
+
+	if (!(p->flags & V4L2_HEVC_ENCODE_FLAG_DEBLOCKING_FILTER_OVERRIDE))
+		p->flags &= ~V4L2_HEVC_ENCODE_FLAG_SLICE_DEBLOCKING_FILTER_DISABLED;
+
+	/* An IDR picture empties the DPB: it has no reference picture set. */
+	if (v4l2_hevc_nal_is_idr(nal_unit_type)) {
+		p->pic_order_cnt_val = 0;
+		p->num_refs = 0;
+	}
+
+	for (i = 0; i < V4L2_HEVC_DPB_ENTRIES_NUM_MAX; i++) {
+		struct v4l2_hevc_encode_ref *ref = &p->refs[i];
+
+		if (i >= p->num_refs) {
+			memset(ref, 0, sizeof(*ref));
+			continue;
+		}
+
+		if (ref->flags & ~(V4L2_HEVC_ENCODE_REF_FLAG_USED_BY_CURR_PIC |
+				   V4L2_HEVC_ENCODE_REF_FLAG_LONG_TERM))
+			return -EINVAL;
+
+		zero_reserved(*ref);
+
+		for (j = 0; j < i; j++)
+			if (p->refs[j].timestamp == ref->timestamp)
+				return -EINVAL;
+
+		if (ref->flags & V4L2_HEVC_ENCODE_REF_FLAG_USED_BY_CURR_PIC)
+			used = true;
+	}
+
+	/* NumPicTotalCurr is 0 for BLA and CRA pictures (7.4.7.2). */
+	if (v4l2_hevc_nal_is_irap(nal_unit_type) && used)
+		return -EINVAL;
+
+	/* P and B slices need at least one reference (7.4.7.2). */
+	if (p->slice_type != V4L2_HEVC_SLICE_TYPE_I && !used)
+		return -EINVAL;
+
+	if (p->slice_type == V4L2_HEVC_SLICE_TYPE_I) {
+		p->num_ref_idx_l0_active_minus1 = 0;
+		p->num_ref_idx_l1_active_minus1 = 0;
+		p->collocated_ref_idx = 0;
+		p->five_minus_max_num_merge_cand = 0;
+		p->flags &= ~(V4L2_HEVC_ENCODE_FLAG_NUM_REF_IDX_ACTIVE_OVERRIDE |
+			      V4L2_HEVC_ENCODE_FLAG_SLICE_TEMPORAL_MVP_ENABLED |
+			      V4L2_HEVC_ENCODE_FLAG_COLLOCATED_FROM_L0 |
+			      V4L2_HEVC_ENCODE_FLAG_CABAC_INIT);
+	}
+
+	if (p->slice_type != V4L2_HEVC_SLICE_TYPE_B) {
+		p->num_ref_idx_l1_active_minus1 = 0;
+		p->flags &= ~V4L2_HEVC_ENCODE_FLAG_MVD_L1_ZERO;
+
+		/* collocated_from_l0_flag is inferred to be 1 (7.4.7.1). */
+		if (p->slice_type == V4L2_HEVC_SLICE_TYPE_P)
+			p->flags |= V4L2_HEVC_ENCODE_FLAG_COLLOCATED_FROM_L0;
+	}
+
+	if (!(p->flags & V4L2_HEVC_ENCODE_FLAG_NUM_REF_IDX_ACTIVE_OVERRIDE)) {
+		p->num_ref_idx_l0_active_minus1 = 0;
+		p->num_ref_idx_l1_active_minus1 = 0;
+	}
+
+	if (!(p->flags & V4L2_HEVC_ENCODE_FLAG_SLICE_TEMPORAL_MVP_ENABLED))
+		p->collocated_ref_idx = 0;
+
+	zero_reserved(*p);
+
+	return 0;
+}
+
 static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 				 union v4l2_ctrl_ptr ptr)
 {
@@ -1001,6 +1173,7 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 	struct v4l2_ctrl_hevc_slice_params *p_hevc_slice_params;
 	struct v4l2_ctrl_hdr10_mastering_display *p_hdr10_mastering;
 	struct v4l2_ctrl_hevc_decode_params *p_hevc_decode_params;
+	struct v4l2_ctrl_hevc_encode_feedback *p_hevc_enc_feedback;
 	struct v4l2_area *area;
 	struct v4l2_rect *rect;
 	void *p = ptr.p + idx * ctrl->elem_size;
@@ -1393,6 +1566,21 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 
 		if (p_hevc_lt_rps->flags & ~V4L2_HEVC_EXT_SPS_LT_RPS_FLAG_USED_LT)
 			return -EINVAL;
+		break;
+
+	case V4L2_CTRL_TYPE_HEVC_ENCODE_PARAMS:
+		return validate_hevc_encode_params(p);
+
+	case V4L2_CTRL_TYPE_HEVC_ENCODE_FEEDBACK:
+		p_hevc_enc_feedback = p;
+
+		memset(&p_hevc_enc_feedback->reserved0, 0,
+		       sizeof(p_hevc_enc_feedback->reserved0));
+		memset(&p_hevc_enc_feedback->reserved1, 0,
+		       sizeof(p_hevc_enc_feedback->reserved1));
+		memset(&p_hevc_enc_feedback->stats.reserved0, 0,
+		       sizeof(p_hevc_enc_feedback->stats.reserved0));
+		p_hevc_enc_feedback->stats.reserved1 = 0;
 		break;
 
 	case V4L2_CTRL_TYPE_HDR10_CLL_INFO:
@@ -2177,6 +2365,12 @@ static struct v4l2_ctrl *v4l2_ctrl_new(struct v4l2_ctrl_handler *hdl,
 		break;
 	case V4L2_CTRL_TYPE_HEVC_DECODE_PARAMS:
 		elem_size = sizeof(struct v4l2_ctrl_hevc_decode_params);
+		break;
+	case V4L2_CTRL_TYPE_HEVC_ENCODE_PARAMS:
+		elem_size = sizeof(struct v4l2_ctrl_hevc_encode_params);
+		break;
+	case V4L2_CTRL_TYPE_HEVC_ENCODE_FEEDBACK:
+		elem_size = sizeof(struct v4l2_ctrl_hevc_encode_feedback);
 		break;
 	case V4L2_CTRL_TYPE_HDR10_CLL_INFO:
 		elem_size = sizeof(struct v4l2_ctrl_hdr10_cll_info);
