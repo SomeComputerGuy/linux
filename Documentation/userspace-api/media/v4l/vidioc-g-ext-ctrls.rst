@@ -286,6 +286,14 @@ still cause this situation.
       - ``p_hevc_decode_params``
       - A pointer to a struct :c:type:`v4l2_ctrl_hevc_decode_params`. Valid if this
         control is of type ``V4L2_CTRL_TYPE_HEVC_DECODE_PARAMS``.
+    * - struct :c:type:`v4l2_ctrl_hevc_encode_params` *
+      - ``p_hevc_encode_params``
+      - A pointer to a struct :c:type:`v4l2_ctrl_hevc_encode_params`. Valid if this
+        control is of type ``V4L2_CTRL_TYPE_HEVC_ENCODE_PARAMS``.
+    * - struct :c:type:`v4l2_ctrl_hevc_encode_feedback` *
+      - ``p_hevc_encode_feedback``
+      - A pointer to a struct :c:type:`v4l2_ctrl_hevc_encode_feedback`. Valid if this
+        control is of type ``V4L2_CTRL_TYPE_HEVC_ENCODE_FEEDBACK``.
     * - struct :c:type:`v4l2_ctrl_av1_sequence` *
       - ``p_av1_sequence``
       - A pointer to a struct :c:type:`v4l2_ctrl_av1_sequence`. Valid if this control is
