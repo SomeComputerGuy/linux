@@ -23761,6 +23761,7 @@ L:	linux-media@vger.kernel.org
 L:	linux-rockchip@lists.infradead.org
 S:	Maintained
 F:	Documentation/devicetree/bindings/media/rockchip,rk3588-vepu580.yaml
+F:	drivers/media/platform/rockchip/rkvenc/
 
 ROCKER DRIVER
 M:	Jiri Pirko <jiri@resnulli.us>
