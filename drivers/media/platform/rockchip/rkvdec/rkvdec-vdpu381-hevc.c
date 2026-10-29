@@ -593,6 +593,7 @@ static int rkvdec_hevc_run(struct rkvdec_ctx *ctx)
 	struct rkvdec_hevc_run run;
 	struct rkvdec_hevc_ctx *hevc_ctx = ctx->priv;
 	struct rkvdec_hevc_priv_tbl *tbl = hevc_ctx->priv_tbl.cpu;
+	int ret;
 
 	rkvdec_hevc_run_preamble(ctx, &run);
 
@@ -608,7 +609,11 @@ static int rkvdec_hevc_run(struct rkvdec_ctx *ctx)
 	    (run.sps->num_short_term_ref_pic_sets && !run.ext_sps_st_rps)) {
 		dev_warn_ratelimited(core->dev, "Long and short term RPS not set\n");
 	} else {
-		rkvdec_hevc_assemble_hw_rps(&run, &tbl->rps, &hevc_ctx->st_cache);
+		ret = rkvdec_hevc_assemble_hw_rps(&run, &tbl->rps, &hevc_ctx->st_cache);
+		if (ret) {
+			rkvdec_run_postamble(ctx, &run.base);
+			return ret;
+		}
 	}
 
 	config_registers(ctx, &run);
