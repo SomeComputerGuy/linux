@@ -26,6 +26,7 @@
 
 #include "rkvdec-rcb.h"
 #include "rkvdec.h"
+#include "rkvdec-ccu.h"
 #include "rkvdec-vdpu381-regs.h"
 #include "rkvdec-vp9-common.h"
 
@@ -484,6 +485,7 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	memset(regs, 0, sizeof(*regs));
 
 	regs->common.reg009_dec_mode.dec_mode = VDPU381_MODE_VP9;
+	rkvdec_vdpu381_set_ccu_regs(ctx, &regs->common);
 
 	regs->vp9_param.reg103.vp9_intra_only_flag = intra_only;
 
@@ -806,6 +808,7 @@ static int rkvdec_vp9_run(struct rkvdec_ctx *ctx)
 
 	rkvdec_schedule_watchdog(core, vp9_ctx->regs.common.reg032_timeout_threshold);
 
+	rkvdec_ccu_start(ctx);
 	writel(VDPU381_DEC_E_BIT, core->regs + VDPU381_REG_DEC_E);
 
 	return 0;

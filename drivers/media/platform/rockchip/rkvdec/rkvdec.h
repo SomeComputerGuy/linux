@@ -35,6 +35,7 @@
 
 struct rkvdec_ctx;
 struct rkvdec_core;
+struct rkvdec_ccu;
 struct rkvdec_rcb_config;
 
 struct rkvdec_ctrl_desc {
@@ -95,6 +96,7 @@ struct rkvdec_variant {
 	const struct rkvdec_variant_ops *ops;
 	bool has_single_reg_region;
 	unsigned int quirks;
+	bool has_ccu;
 };
 
 struct rkvdec_coded_fmt_ops {
@@ -124,6 +126,13 @@ struct rkvdec_decoded_fmt_desc {
 	enum rkvdec_image_fmt image_fmt;
 };
 
+/*
+ * The next frame of a stream may be decoded while the previous one, which it
+ * may predict from, is still being decoded on another core: the hardware
+ * synchronizes the reference reads with the core coordination unit.
+ */
+#define RKVDEC_FMT_FLAG_PIPELINE	BIT(0)
+
 struct rkvdec_coded_fmt_desc {
 	u32 fourcc;
 	struct v4l2_frmsize_stepwise frmsize;
@@ -132,7 +141,14 @@ struct rkvdec_coded_fmt_desc {
 	unsigned int num_decoded_fmts;
 	const struct rkvdec_decoded_fmt_desc *decoded_fmts;
 	u32 subsystem_flags;
+	u32 flags;
 };
+
+/* Largest film index, which tells the streams apart in the CCU */
+#define RKVDEC_MAX_FILM_IDX		1023
+
+/* Maximum number of reference frames of a job */
+#define RKVDEC_MAX_REFS			17
 
 /**
  * struct rkvdec_job - a frame being decoded
@@ -148,6 +164,8 @@ struct rkvdec_coded_fmt_desc {
  *	      finished, so the next frame may start before this one is done
  * @hw_done: the hardware is done with the frame
  * @busy: the m2m state of the job is being changed, don't complete it
+ * @num_refs: number of entries in @refs
+ * @refs: the CAPTURE buffers the frame predicts from
  */
 struct rkvdec_job {
 	struct list_head node;
@@ -160,6 +178,8 @@ struct rkvdec_job {
 	bool detached;
 	bool hw_done;
 	bool busy;
+	unsigned int num_refs;
+	const struct vb2_buffer *refs[RKVDEC_MAX_REFS];
 };
 
 struct rkvdec_core {
@@ -182,6 +202,7 @@ struct rkvdec_core {
 	struct rkvdec_ctx *curr_ctx;
 	struct rkvdec_job *job;
 	int id;
+	int ccu_port;
 };
 
 struct rkvdec_dev {
@@ -199,6 +220,8 @@ struct rkvdec_dev {
 	struct rkvdec_core *main_core;
 	struct iommu_domain *iommu_global_domain;
 	struct rkvdec_job *held_job;
+	struct rkvdec_ccu *ccu;
+	struct ida film_ida;
 };
 
 struct rkvdec_ctx {
@@ -220,6 +243,7 @@ struct rkvdec_ctx {
 	unsigned int num_jobs;
 	wait_queue_head_t jobs_wq;
 	struct mutex done_lock; /* completes the jobs in decoding order */
+	int film_idx;
 	void *priv;
 	u8 has_sps_st_rps: 1;
 	u8 has_sps_lt_rps: 1;
@@ -246,6 +270,7 @@ void rkvdec_run_preamble(struct rkvdec_ctx *ctx, struct rkvdec_run *run);
 void rkvdec_run_postamble(struct rkvdec_ctx *ctx, struct rkvdec_run *run);
 void rkvdec_memcpy_toio(void __iomem *dst, void *src, size_t len);
 void rkvdec_schedule_watchdog(struct rkvdec_core *core, u32 timeout_threshold);
+void rkvdec_job_add_ref(struct rkvdec_ctx *ctx, const struct vb2_buffer *ref);
 
 void rkvdec_quirks_disable_qos(struct rkvdec_ctx *ctx);
 
