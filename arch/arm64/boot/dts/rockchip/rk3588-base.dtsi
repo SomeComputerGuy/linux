@@ -1526,6 +1526,16 @@
 		#iommu-cells = <0>;
 	};
 
+	vdec_ccu: video-codec@fdc30000 {
+		compatible = "rockchip,rk3588-vdec-ccu";
+		reg = <0x0 0xfdc30000 0x0 0x100>;
+		clocks = <&cru ACLK_RKVDEC_CCU>;
+		assigned-clocks = <&cru ACLK_RKVDEC_CCU>;
+		assigned-clock-rates = <600000000>;
+		power-domains = <&power RK3588_PD_RKVDEC0>;
+		resets = <&cru SRST_A_RKVDEC_CCU>;
+	};
+
 	vdec0: video-codec@fdc38000 {
 		compatible = "rockchip,rk3588-vdec";
 		reg = <0x0 0xfdc38000 0x0 0x100>,
@@ -1545,6 +1555,7 @@
 		resets = <&cru SRST_A_RKVDEC0>, <&cru SRST_H_RKVDEC0>, <&cru SRST_RKVDEC0_CA>,
 			 <&cru SRST_RKVDEC0_CORE>, <&cru SRST_RKVDEC0_HEVC_CA>;
 		reset-names = "axi", "ahb", "cabac", "core", "hevc_cabac";
+		rockchip,ccu = <&vdec_ccu 0>;
 		sram = <&vdec0_sram>;
 	};
 
@@ -1577,6 +1588,7 @@
 		resets = <&cru SRST_A_RKVDEC1>, <&cru SRST_H_RKVDEC1>, <&cru SRST_RKVDEC1_CA>,
 			 <&cru SRST_RKVDEC1_CORE>, <&cru SRST_RKVDEC1_HEVC_CA>;
 		reset-names = "axi", "ahb", "cabac", "core", "hevc_cabac";
+		rockchip,ccu = <&vdec_ccu 1>;
 		sram = <&vdec1_sram>;
 	};
 
