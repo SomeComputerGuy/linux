@@ -23755,6 +23755,7 @@ M:	Ezequiel Garcia <ezequiel@vanguardiasur.com.ar>
 L:	linux-media@vger.kernel.org
 L:	linux-rockchip@lists.infradead.org
 S:	Maintained
+F:	Documentation/devicetree/bindings/media/rockchip,rk3588-vdec-ccu.yaml
 F:	Documentation/devicetree/bindings/media/rockchip,vdec.yaml
 F:	drivers/media/platform/rockchip/rkvdec/
 
