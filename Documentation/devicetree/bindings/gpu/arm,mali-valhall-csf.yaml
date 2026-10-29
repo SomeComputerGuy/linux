@@ -40,7 +40,7 @@ properties:
 
   clocks:
     minItems: 1
-    maxItems: 3
+    maxItems: 4
 
   clock-names:
     minItems: 1
@@ -50,6 +50,7 @@ properties:
           - coregroup
           - stacks
       - const: stacks
+      - const: bus
 
   nvmem-cells:
     items:
@@ -116,6 +117,8 @@ allOf:
       properties:
         clocks:
           minItems: 3
+        clock-names:
+          minItems: 3
         nvmem-cells: false
         nvmem-cell-names: false
         power-domains:
@@ -123,6 +126,12 @@ allOf:
         power-domain-names: false
       required:
         - mali-supply
+    else:
+      properties:
+        clocks:
+          maxItems: 3
+        clock-names:
+          maxItems: 3
   - if:
       properties:
         compatible:
