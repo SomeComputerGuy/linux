@@ -222,6 +222,8 @@ enum hantro_core_role {
  * @role:		Role of this instance in a multi-core device.
  * @attached_domain:	IOMMU domain of the main core that this secondary
  *			core is attached to, if any.
+ * @empty_domain:	Empty IOMMU domain, used to reinitialize the IOMMU after
+ *			a timeout. NULL if the VPU isn't behind an IOMMU.
  */
 struct hantro_dev {
 	struct v4l2_device v4l2_dev;
@@ -249,6 +251,7 @@ struct hantro_dev {
 	spinlock_t cores_lock; /* protects the core list and curr_ctx */
 	enum hantro_core_role role;
 	struct iommu_domain *attached_domain;
+	struct iommu_domain *empty_domain;
 };
 
 /**
