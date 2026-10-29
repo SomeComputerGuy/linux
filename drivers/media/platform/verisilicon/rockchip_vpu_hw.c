@@ -488,7 +488,7 @@ static void rockchip_vpu2_dec_reset(struct hantro_ctx *ctx)
 
 static void rockchip_vpu2_enc_reset(struct hantro_ctx *ctx)
 {
-	struct hantro_dev *vpu = ctx->dev;
+	struct hantro_dev *vpu = ctx->core;
 
 	vepu_write(vpu, VEPU_REG_INTERRUPT_DIS_BIT, VEPU_REG_INTERRUPT);
 	vepu_write(vpu, 0, VEPU_REG_ENCODE_START);
