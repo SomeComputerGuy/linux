@@ -62,6 +62,46 @@ static const struct hantro_fmt rockchip_vpu_enc_fmts[] = {
 	},
 };
 
+/*
+ * The VEPU2 encoder of the RK3588 VPU121, next to its decoder, encodes H.264.
+ * Unlike the VEPU121 cores of the RK3588, which are JPEG encoders only.
+ */
+static const struct hantro_fmt rk3588_vpu121_enc_fmts[] = {
+	{
+		.fourcc = V4L2_PIX_FMT_YUV420M,
+		.codec_mode = HANTRO_MODE_NONE,
+		.enc_fmt = ROCKCHIP_VPU_ENC_FMT_YUV420P,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_NV12M,
+		.codec_mode = HANTRO_MODE_NONE,
+		.enc_fmt = ROCKCHIP_VPU_ENC_FMT_YUV420SP,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_YUYV,
+		.codec_mode = HANTRO_MODE_NONE,
+		.enc_fmt = ROCKCHIP_VPU_ENC_FMT_YUYV422,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_UYVY,
+		.codec_mode = HANTRO_MODE_NONE,
+		.enc_fmt = ROCKCHIP_VPU_ENC_FMT_UYVY422,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_H264_SLICE,
+		.codec_mode = HANTRO_MODE_H264_ENC,
+		.max_depth = 2,
+		.frmsize = {
+			.min_width = 96,
+			.max_width = 1920,
+			.step_width = MB_DIM,
+			.min_height = 96,
+			.max_height = 1088,
+			.step_height = MB_DIM,
+		},
+	},
+};
+
 static const struct hantro_fmt rockchip_vpu1_postproc_fmts[] = {
 	{
 		.fourcc = V4L2_PIX_FMT_YUYV,
@@ -635,6 +675,34 @@ static const struct hantro_codec_ops rk3568_vepu_codec_ops[] = {
 	},
 };
 
+static const struct hantro_codec_ops rk3588_vpu121_codec_ops[] = {
+	[HANTRO_MODE_H264_ENC] = {
+		.run = rockchip_vpu2_h264_enc_run,
+		.reset = rockchip_vpu2_enc_reset,
+		.init = rockchip_vpu2_h264_enc_init,
+		.exit = rockchip_vpu2_h264_enc_exit,
+		.done = rockchip_vpu2_h264_enc_done,
+	},
+	[HANTRO_MODE_H264_DEC] = {
+		.run = rockchip_vpu2_h264_dec_run,
+		.reset = rockchip_vpu2_dec_reset,
+		.init = hantro_h264_dec_init,
+		.exit = hantro_h264_dec_exit,
+	},
+	[HANTRO_MODE_MPEG2_DEC] = {
+		.run = rockchip_vpu2_mpeg2_dec_run,
+		.reset = rockchip_vpu2_dec_reset,
+		.init = hantro_mpeg2_dec_init,
+		.exit = hantro_mpeg2_dec_exit,
+	},
+	[HANTRO_MODE_VP8_DEC] = {
+		.run = rockchip_vpu2_vp8_dec_run,
+		.reset = rockchip_vpu2_dec_reset,
+		.init = hantro_vp8_dec_init,
+		.exit = hantro_vp8_dec_exit,
+	},
+};
+
 static const struct hantro_codec_ops rk3588_vpu981_codec_ops[] = {
 	[HANTRO_MODE_AV1_DEC] = {
 		.run = rockchip_vpu981_av1_dec_run,
@@ -662,6 +730,12 @@ static const struct hantro_irq rockchip_vdpu2_irqs[] = {
 
 static const struct hantro_irq rockchip_vpu2_irqs[] = {
 	{ "vepu", rockchip_vpu2_vepu_irq },
+	{ "vdpu", rockchip_vpu2_vdpu_irq },
+};
+
+/* Older device trees only describe the decoder of the RK3588 VPU121. */
+static const struct hantro_irq rk3588_vpu121_irqs[] = {
+	{ "vepu", rockchip_vpu2_vepu_irq, .enc_optional = true },
 	{ "vdpu", rockchip_vpu2_vdpu_irq },
 };
 
@@ -828,6 +902,28 @@ const struct hantro_variant rk3568_vpu_variant = {
 	.codec_ops = rk3399_vpu_codec_ops,
 	.irqs = rockchip_vdpu2_irqs,
 	.num_irqs = ARRAY_SIZE(rockchip_vdpu2_irqs),
+	.init = rockchip_vpu_hw_init,
+	.clk_names = rockchip_vpu_clk_names,
+	.num_clocks = ARRAY_SIZE(rockchip_vpu_clk_names)
+};
+
+/*
+ * The RK3588 VPU121 is a VDPU2 decoder and a VEPU2 encoder sharing clocks,
+ * power domain and IOMMU. The encoder is only used for H.264, JPEG is left
+ * to the VEPU121 JPEG encoder cores.
+ */
+const struct hantro_variant rk3588_vpu121_variant = {
+	.enc_offset = 0x0,
+	.enc_fmts = rk3588_vpu121_enc_fmts,
+	.num_enc_fmts = ARRAY_SIZE(rk3588_vpu121_enc_fmts),
+	.dec_offset = 0x400,
+	.dec_fmts = rockchip_vdpu2_dec_fmts,
+	.num_dec_fmts = ARRAY_SIZE(rockchip_vdpu2_dec_fmts),
+	.codec = HANTRO_H264_ENCODER | HANTRO_MPEG2_DECODER |
+		 HANTRO_VP8_DECODER | HANTRO_H264_DECODER,
+	.codec_ops = rk3588_vpu121_codec_ops,
+	.irqs = rk3588_vpu121_irqs,
+	.num_irqs = ARRAY_SIZE(rk3588_vpu121_irqs),
 	.init = rockchip_vpu_hw_init,
 	.clk_names = rockchip_vpu_clk_names,
 	.num_clocks = ARRAY_SIZE(rockchip_vpu_clk_names)

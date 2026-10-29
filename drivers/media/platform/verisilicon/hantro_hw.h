@@ -12,6 +12,7 @@
 #include <linux/interrupt.h>
 #include <linux/v4l2-controls.h>
 #include <media/v4l2-ctrls.h>
+#include <media/v4l2-h264-enc.h>
 #include <media/v4l2-vp9.h>
 #include <media/videobuf2-core.h>
 
@@ -67,6 +68,25 @@ struct hantro_aux_buf {
 	dma_addr_t dma;
 	size_t size;
 	unsigned long attrs;
+};
+
+/* Number of registers programmed for an H.264 encode on the VEPU2. */
+#define ROCKCHIP_VPU2_H264_ENC_NUM_REGS		184
+
+/**
+ * struct hantro_h264_enc_hw_ctx - Per context data specific to H264 encoding.
+ * @enc:		H.264 stateless encode core state.
+ * @cabac_tbl:		CABAC context initialization tables, one per
+ *			cabac_init_idc value.
+ * @strm_offset:	Offset of the hardware stream in the destination
+ *			buffer, aligned down to 8 bytes.
+ * @regs:		Registers of the encode run being prepared.
+ */
+struct hantro_h264_enc_hw_ctx {
+	struct v4l2_h264_enc enc;
+	struct hantro_aux_buf cabac_tbl;
+	unsigned int strm_offset;
+	u32 regs[ROCKCHIP_VPU2_H264_ENC_NUM_REGS];
 };
 
 /* Max. number of entries in the DPB (HW limitation). */
@@ -418,6 +438,7 @@ extern const struct hantro_variant rk3328_vpu_variant;
 extern const struct hantro_variant rk3399_vpu_variant;
 extern const struct hantro_variant rk3568_vepu_variant;
 extern const struct hantro_variant rk3568_vpu_variant;
+extern const struct hantro_variant rk3588_vpu121_variant;
 extern const struct hantro_variant rk3588_vepu121_variant;
 extern const struct hantro_variant rk3588_vpu981_variant;
 extern const struct hantro_variant sama5d4_vdec_variant;
@@ -444,6 +465,11 @@ int hantro_h1_jpeg_enc_run(struct hantro_ctx *ctx);
 int rockchip_vpu2_jpeg_enc_run(struct hantro_ctx *ctx);
 void hantro_h1_jpeg_enc_done(struct hantro_ctx *ctx);
 void rockchip_vpu2_jpeg_enc_done(struct hantro_ctx *ctx);
+
+int rockchip_vpu2_h264_enc_init(struct hantro_ctx *ctx);
+void rockchip_vpu2_h264_enc_exit(struct hantro_ctx *ctx);
+int rockchip_vpu2_h264_enc_run(struct hantro_ctx *ctx);
+void rockchip_vpu2_h264_enc_done(struct hantro_ctx *ctx);
 
 dma_addr_t hantro_h264_get_ref_buf(struct hantro_ctx *ctx,
 				   unsigned int dpb_idx);

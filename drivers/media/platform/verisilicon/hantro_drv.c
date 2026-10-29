@@ -540,6 +540,118 @@ static const struct hantro_ctrl controls[] = {
 			.flags = V4L2_CTRL_FLAG_READ_ONLY,
 		},
 	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_H264_ENCODE_PARAMS,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_H264_SPS,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_H264_PPS,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_H264_START_CODE,
+			.min = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
+			.max = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
+			.def = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_AU_DELIMITER,
+			.min = 0,
+			.max = 1,
+			.def = 0,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR,
+			.min = 0,
+			.max = 1,
+			.def = 0,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE,
+			.min = 0,
+			.max = 1,
+			.def = 0,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_H264_MIN_QP,
+			.min = 0,
+			.max = 51,
+			.def = 0,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_H264_MAX_QP,
+			.min = 0,
+			.max = 51,
+			.def = 51,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_H264_I_FRAME_QP,
+			.min = 0,
+			.max = 51,
+			.def = 26,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_H264_P_FRAME_QP,
+			.min = 0,
+			.max = 51,
+			.def = 28,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
+			.min = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
+			.max = V4L2_MPEG_VIDEO_BITRATE_MODE_CQ,
+			.def = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_CONSTANT_QUALITY,
+			.min = 0,
+			.max = 100,
+			.def = 80,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_BITRATE,
+			.min = 1000,
+			.max = 100000000,
+			.def = 2000000,
+			.step = 1,
+		},
+	}, {
 		.codec = HANTRO_MPEG2_DECODER,
 		.cfg = {
 			.id = V4L2_CID_STATELESS_MPEG2_SEQUENCE,
@@ -821,6 +933,7 @@ static const struct of_device_id of_hantro_match[] = {
 	{ .compatible = "rockchip,rk3568-vepu", .data = &rk3568_vepu_variant, },
 	{ .compatible = "rockchip,rk3568-vpu", .data = &rk3568_vpu_variant, },
 	{ .compatible = "rockchip,rk3588-vepu121", .data = &rk3588_vepu121_variant, },
+	{ .compatible = "rockchip,rk3588-vpu121", .data = &rk3588_vpu121_variant, },
 	{ .compatible = "rockchip,rk3588-av1-vpu", .data = &rk3588_vpu981_variant, },
 #endif
 #ifdef CONFIG_VIDEO_HANTRO_IMX8M
@@ -1056,7 +1169,7 @@ err_unreg_dev:
 
 static int hantro_add_enc_func(struct hantro_dev *vpu)
 {
-	if (!vpu->variant->enc_fmts)
+	if (!vpu->variant->enc_fmts || vpu->no_encoder)
 		return 0;
 
 	return hantro_add_func(vpu, MEDIA_ENT_F_PROC_VIDEO_ENCODER);
@@ -1324,7 +1437,16 @@ static int hantro_hw_init(struct hantro_dev *vpu)
 		if (!vpu->variant->irqs[i].handler)
 			continue;
 
-		if (vpu->variant->num_irqs > 1) {
+		if (vpu->variant->num_irqs > 1 &&
+		    vpu->variant->irqs[i].enc_optional) {
+			irq_name = vpu->variant->irqs[i].name;
+			irq = platform_get_irq_byname_optional(vpu->pdev,
+							       irq_name);
+			if (irq == -ENXIO) {
+				vpu->no_encoder = true;
+				continue;
+			}
+		} else if (vpu->variant->num_irqs > 1) {
 			irq_name = vpu->variant->irqs[i].name;
 			irq = platform_get_irq_byname(vpu->pdev, irq_name);
 		} else {
