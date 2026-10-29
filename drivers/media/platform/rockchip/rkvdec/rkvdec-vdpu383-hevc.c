@@ -553,6 +553,8 @@ static int rkvdec_hevc_run(struct rkvdec_ctx *ctx)
 	if ((run.sps->num_long_term_ref_pics_sps && !run.ext_sps_lt_rps) ||
 	    (run.sps->num_short_term_ref_pic_sets && !run.ext_sps_st_rps)) {
 		dev_err_ratelimited(core->dev, "Long and short term RPS not set\n");
+		/* Complete the request's controls, or the request never completes. */
+		rkvdec_run_postamble(ctx, &run.base);
 		return -EINVAL;
 	}
 
