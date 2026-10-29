@@ -18,6 +18,7 @@
  * code from rkvdec_vp9_run() followed by rkvdec_vp9_done().
  */
 
+#include <linux/dma-mapping.h>
 #include <linux/kernel.h>
 #include <linux/vmalloc.h>
 #include <media/v4l2-mem2mem.h>
@@ -539,6 +540,10 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	if (intra_only)
 		memset(vp9_ctx->count_tbl.cpu, 0, vp9_ctx->count_tbl.size);
 
+	/* Write back the CPU's view of the count table before the decoder updates it. */
+	dma_sync_single_for_device(ctx->dev->main_core->dev, vp9_ctx->count_tbl.dma,
+				   vp9_ctx->count_tbl.size, DMA_BIDIRECTIONAL);
+
 	/*
 	 * Two segmentation maps are used in turn: the hardware reads the
 	 * segment IDs left by the previous frames from segidlast and writes
@@ -867,6 +872,10 @@ static void rkvdec_vp9_done(struct rkvdec_ctx *ctx,
 		if (frame_is_intra)
 			copy_tx_and_skip(probs, tx_skip);
 
+		/* make the symbol counts written by the decoder visible to the CPU */
+		dma_sync_single_for_cpu(ctx->dev->main_core->dev, vp9_ctx->count_tbl.dma,
+					vp9_ctx->count_tbl.size, DMA_BIDIRECTIONAL);
+
 		counts = frame_is_intra ? &vp9_ctx->intra_cnts : &vp9_ctx->inter_cnts;
 		v4l2_vp9_adapt_coef_probs(probs, counts,
 					  !vp9_ctx->last.valid ||
@@ -1021,8 +1030,14 @@ static int rkvdec_vp9_start(struct rkvdec_ctx *ctx)
 	vp9_ctx->priv_tbl.size = sizeof(*priv_tbl);
 	vp9_ctx->priv_tbl.cpu = priv_tbl;
 
-	count_tbl = dma_alloc_coherent(rkvdec->main_core->dev, RKVDEC_VP9_COUNT_SIZE,
-				       &vp9_ctx->count_tbl.dma, GFP_KERNEL);
+	/*
+	 * The CPU reads every symbol count back for the backward adaptation,
+	 * one 32-bit word at a time, so keep the table cacheable and
+	 * maintain it explicitly instead of using an uncached mapping.
+	 */
+	count_tbl = dma_alloc_noncoherent(rkvdec->main_core->dev, RKVDEC_VP9_COUNT_SIZE,
+					  &vp9_ctx->count_tbl.dma, DMA_BIDIRECTIONAL,
+					  GFP_KERNEL);
 	if (!count_tbl) {
 		ret = -ENOMEM;
 		goto err_free_priv_tbl;
@@ -1048,8 +1063,9 @@ static void rkvdec_vp9_stop(struct rkvdec_ctx *ctx)
 	struct rkvdec_vp9_ctx *vp9_ctx = ctx->priv;
 	struct rkvdec_dev *rkvdec = ctx->dev;
 
-	dma_free_coherent(rkvdec->main_core->dev, vp9_ctx->count_tbl.size,
-			  vp9_ctx->count_tbl.cpu, vp9_ctx->count_tbl.dma);
+	dma_free_noncoherent(rkvdec->main_core->dev, vp9_ctx->count_tbl.size,
+			     vp9_ctx->count_tbl.cpu, vp9_ctx->count_tbl.dma,
+			     DMA_BIDIRECTIONAL);
 
 	dma_free_coherent(rkvdec->main_core->dev, vp9_ctx->priv_tbl.size,
 			  vp9_ctx->priv_tbl.cpu, vp9_ctx->priv_tbl.dma);
