@@ -70,6 +70,20 @@ config V4L2_HEVC_ENC_RBSP_KUNIT_TEST
 
 	  If unsure, say N.
 
+config V4L2_HEVC_ENC_KUNIT_TEST
+	tristate "KUnit tests for the V4L2 HEVC encode core" if !KUNIT_ALL_TESTS
+	depends on KUNIT && VIDEO_DEV
+	select V4L2_HEVC_ENC
+	select VIDEOBUF2_CORE
+	default KUNIT_ALL_TESTS
+	help
+	  Build the KUnit tests of the stateless HEVC encode core. They run
+	  short sequences of pictures through it and check the reference
+	  picture sets, reference picture lists, decoded picture buffer and
+	  feedback that result, and the validation of the encode parameters.
+
+	  If unsure, say N.
+
 # Used by drivers that need v4l2-vp9.ko
 config V4L2_VP9
 	tristate
