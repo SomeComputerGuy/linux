@@ -1077,37 +1077,15 @@ init_new_m2m_dev:
 	return v4l2_m2m_init(&vpu_m2m_ops);
 }
 
-static int hantro_probe(struct platform_device *pdev)
+/*
+ * Acquire and initialize the hardware resources of one VPU instance:
+ * clocks, resets, registers, interrupts and runtime PM.
+ */
+static int hantro_hw_init(struct hantro_dev *vpu)
 {
-	const struct of_device_id *match;
-	struct hantro_dev *vpu;
+	struct platform_device *pdev = vpu->pdev;
 	int num_bases;
 	int i, ret;
-
-	vpu = devm_kzalloc(&pdev->dev, sizeof(*vpu), GFP_KERNEL);
-	if (!vpu)
-		return -ENOMEM;
-
-	vpu->dev = &pdev->dev;
-	vpu->pdev = pdev;
-	mutex_init(&vpu->vpu_mutex);
-	spin_lock_init(&vpu->irqlock);
-
-	match = of_match_node(of_hantro_match, pdev->dev.of_node);
-	vpu->variant = match->data;
-
-	ret = hantro_disable_multicore(vpu);
-	if (ret)
-		return ret;
-
-	/*
-	 * Support for nxp,imx8mq-vpu is kept for backwards compatibility
-	 * but it's deprecated. Please update your DTS file to use
-	 * nxp,imx8mq-vpu-g1 or nxp,imx8mq-vpu-g2 instead.
-	 */
-	if (of_device_is_compatible(pdev->dev.of_node, "nxp,imx8mq-vpu"))
-		dev_warn(&pdev->dev, "%s compatible is deprecated\n",
-			 match->compatible);
 
 	INIT_DELAYED_WORK(&vpu->watchdog_work, hantro_watchdog);
 
@@ -1221,18 +1199,36 @@ static int hantro_probe(struct platform_device *pdev)
 		goto err_rst_assert;
 	}
 
-	ret = v4l2_device_register(&pdev->dev, &vpu->v4l2_dev);
-	if (ret) {
-		dev_err(&pdev->dev, "Failed to register v4l2 device\n");
-		goto err_clk_unprepare;
-	}
-	platform_set_drvdata(pdev, vpu);
+	return 0;
+
+err_rst_assert:
+	reset_control_assert(vpu->resets);
+err_pm_disable:
+	pm_runtime_dont_use_autosuspend(vpu->dev);
+	pm_runtime_disable(vpu->dev);
+	return ret;
+}
+
+static void hantro_hw_cleanup(struct hantro_dev *vpu)
+{
+	clk_bulk_unprepare(vpu->variant->num_clocks, vpu->clocks);
+	reset_control_assert(vpu->resets);
+	pm_runtime_dont_use_autosuspend(vpu->dev);
+	pm_runtime_disable(vpu->dev);
+}
+
+/*
+ * Create the mem2mem device and register the video and media devices that
+ * expose the VPU to userspace. The v4l2_device must already be registered.
+ */
+static int hantro_register_devices(struct hantro_dev *vpu)
+{
+	int ret;
 
 	vpu->m2m_dev = hantro_get_v4l2_m2m_dev(vpu);
 	if (IS_ERR(vpu->m2m_dev)) {
 		v4l2_err(&vpu->v4l2_dev, "Failed to init mem2mem device\n");
-		ret = PTR_ERR(vpu->m2m_dev);
-		goto err_v4l2_unreg;
+		return PTR_ERR(vpu->m2m_dev);
 	}
 
 	vpu->mdev.dev = vpu->dev;
@@ -1243,13 +1239,13 @@ static int hantro_probe(struct platform_device *pdev)
 
 	ret = hantro_add_enc_func(vpu);
 	if (ret) {
-		dev_err(&pdev->dev, "Failed to register encoder\n");
+		dev_err(vpu->dev, "Failed to register encoder\n");
 		goto err_m2m_rel;
 	}
 
 	ret = hantro_add_dec_func(vpu);
 	if (ret) {
-		dev_err(&pdev->dev, "Failed to register decoder\n");
+		dev_err(vpu->dev, "Failed to register decoder\n");
 		goto err_rm_enc_func;
 	}
 
@@ -1268,15 +1264,70 @@ err_rm_enc_func:
 err_m2m_rel:
 	media_device_cleanup(&vpu->mdev);
 	v4l2_m2m_put(vpu->m2m_dev);
+	return ret;
+}
+
+static void hantro_unregister_devices(struct hantro_dev *vpu)
+{
+	media_device_unregister(&vpu->mdev);
+	hantro_remove_dec_func(vpu);
+	hantro_remove_enc_func(vpu);
+	media_device_cleanup(&vpu->mdev);
+	v4l2_m2m_put(vpu->m2m_dev);
+}
+
+static int hantro_probe(struct platform_device *pdev)
+{
+	const struct of_device_id *match;
+	struct hantro_dev *vpu;
+	int ret;
+
+	vpu = devm_kzalloc(&pdev->dev, sizeof(*vpu), GFP_KERNEL);
+	if (!vpu)
+		return -ENOMEM;
+
+	vpu->dev = &pdev->dev;
+	vpu->pdev = pdev;
+	mutex_init(&vpu->vpu_mutex);
+	spin_lock_init(&vpu->irqlock);
+
+	match = of_match_node(of_hantro_match, pdev->dev.of_node);
+	vpu->variant = match->data;
+
+	ret = hantro_disable_multicore(vpu);
+	if (ret)
+		return ret;
+
+	/*
+	 * Support for nxp,imx8mq-vpu is kept for backwards compatibility
+	 * but it's deprecated. Please update your DTS file to use
+	 * nxp,imx8mq-vpu-g1 or nxp,imx8mq-vpu-g2 instead.
+	 */
+	if (of_device_is_compatible(pdev->dev.of_node, "nxp,imx8mq-vpu"))
+		dev_warn(&pdev->dev, "%s compatible is deprecated\n",
+			 match->compatible);
+
+	ret = hantro_hw_init(vpu);
+	if (ret)
+		return ret;
+
+	ret = v4l2_device_register(&pdev->dev, &vpu->v4l2_dev);
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to register v4l2 device\n");
+		goto err_hw_cleanup;
+	}
+	platform_set_drvdata(pdev, vpu);
+
+	ret = hantro_register_devices(vpu);
+	if (ret)
+		goto err_v4l2_unreg;
+
+	return 0;
+
 err_v4l2_unreg:
 	v4l2_device_unregister(&vpu->v4l2_dev);
-err_clk_unprepare:
-	clk_bulk_unprepare(vpu->variant->num_clocks, vpu->clocks);
-err_rst_assert:
-	reset_control_assert(vpu->resets);
-err_pm_disable:
-	pm_runtime_dont_use_autosuspend(vpu->dev);
-	pm_runtime_disable(vpu->dev);
+err_hw_cleanup:
+	hantro_hw_cleanup(vpu);
 	return ret;
 }
 
@@ -1286,16 +1337,9 @@ static void hantro_remove(struct platform_device *pdev)
 
 	v4l2_info(&vpu->v4l2_dev, "Removing %s\n", pdev->name);
 
-	media_device_unregister(&vpu->mdev);
-	hantro_remove_dec_func(vpu);
-	hantro_remove_enc_func(vpu);
-	media_device_cleanup(&vpu->mdev);
-	v4l2_m2m_put(vpu->m2m_dev);
+	hantro_unregister_devices(vpu);
 	v4l2_device_unregister(&vpu->v4l2_dev);
-	clk_bulk_unprepare(vpu->variant->num_clocks, vpu->clocks);
-	reset_control_assert(vpu->resets);
-	pm_runtime_dont_use_autosuspend(vpu->dev);
-	pm_runtime_disable(vpu->dev);
+	hantro_hw_cleanup(vpu);
 }
 
 #ifdef CONFIG_PM
