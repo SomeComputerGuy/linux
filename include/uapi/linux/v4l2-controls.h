@@ -2138,6 +2138,8 @@ struct v4l2_ctrl_mpeg2_quantisation {
 #define V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS (V4L2_CID_CODEC_STATELESS_BASE + 407)
 #define V4L2_CID_STATELESS_HEVC_EXT_SPS_ST_RPS  (V4L2_CID_CODEC_STATELESS_BASE + 408)
 #define V4L2_CID_STATELESS_HEVC_EXT_SPS_LT_RPS  (V4L2_CID_CODEC_STATELESS_BASE + 409)
+#define V4L2_CID_STATELESS_HEVC_ENCODE_PARAMS	(V4L2_CID_CODEC_STATELESS_BASE + 410)
+#define V4L2_CID_STATELESS_HEVC_ENCODE_FEEDBACK	(V4L2_CID_CODEC_STATELESS_BASE + 411)
 
 enum v4l2_stateless_hevc_decode_mode {
 	V4L2_STATELESS_HEVC_DECODE_MODE_SLICE_BASED,
@@ -2650,6 +2652,192 @@ struct v4l2_ctrl_hevc_ext_sps_st_rps {
 struct v4l2_ctrl_hevc_ext_sps_lt_rps {
 	__u16	lt_ref_pic_poc_lsb_sps;
 	__u16	flags;
+};
+
+#define V4L2_STATELESS_ENCODE_STATS_FLAG_QP		0x00000001
+#define V4L2_STATELESS_ENCODE_STATS_FLAG_SSE_LUMA	0x00000002
+#define V4L2_STATELESS_ENCODE_STATS_FLAG_BLOCKS		0x00000004
+#define V4L2_STATELESS_ENCODE_STATS_FLAG_SKIP_BLOCKS	0x00000008
+
+/**
+ * struct v4l2_stateless_encode_stats - stateless encoder per-frame statistics
+ *
+ * Statistics measured by the hardware while encoding one frame. Only the
+ * fields whose V4L2_STATELESS_ENCODE_STATS_FLAG_{} bit is set in @flags are
+ * valid, the others are zero. This structure does not depend on the codec.
+ *
+ * @flags: see V4L2_STATELESS_ENCODE_STATS_FLAG_{}
+ * @header_size: number of bytes the kernel wrote at the start of the
+ *		 CAPTURE buffer (parameter sets, access unit delimiter, slice
+ *		 header) before the hardware-produced data
+ * @qp_sum: sum of the luma quantisation parameters of all blocks counted in
+ *	    @qp_count. Valid with V4L2_STATELESS_ENCODE_STATS_FLAG_QP.
+ * @qp_count: number of blocks summed in @qp_sum. @qp_sum / @qp_count is the
+ *	      average QP of the frame.
+ * @qp_min: smallest luma quantisation parameter used in the frame
+ * @qp_max: largest luma quantisation parameter used in the frame
+ * @reserved0: padding field. Should be zeroed by applications.
+ * @sse_luma: sum of squared errors between the source and the reconstructed
+ *	      luma samples of the frame. Valid with
+ *	      V4L2_STATELESS_ENCODE_STATS_FLAG_SSE_LUMA.
+ * @num_intra_blocks: number of 8x8 luma blocks coded with intra prediction.
+ *		      Valid with V4L2_STATELESS_ENCODE_STATS_FLAG_BLOCKS, like
+ *		      @num_inter_blocks.
+ * @num_inter_blocks: number of 8x8 luma blocks coded with inter prediction,
+ *		      including skipped blocks
+ * @num_skip_blocks: number of 8x8 luma blocks coded in skip mode, part of
+ *		     @num_inter_blocks. Valid with
+ *		     V4L2_STATELESS_ENCODE_STATS_FLAG_SKIP_BLOCKS.
+ * @reserved1: padding field. Should be zeroed by applications.
+ */
+struct v4l2_stateless_encode_stats {
+	__u32	flags;
+	__u32	header_size;
+	__u32	qp_sum;
+	__u32	qp_count;
+	__s8	qp_min;
+	__s8	qp_max;
+	__u8	reserved0[6];
+	__u64	sse_luma;
+	__u32	num_intra_blocks;
+	__u32	num_inter_blocks;
+	__u32	num_skip_blocks;
+	__u32	reserved1;
+};
+
+#define V4L2_HEVC_ENCODE_REF_FLAG_USED_BY_CURR_PIC	0x01
+#define V4L2_HEVC_ENCODE_REF_FLAG_LONG_TERM		0x02
+
+/**
+ * struct v4l2_hevc_encode_ref - HEVC encoder reference picture set entry
+ *
+ * @timestamp: timestamp of the OUTPUT (source) buffer from which the
+ *	       reference picture was encoded. Use v4l2_timeval_to_ns() to
+ *	       convert the struct timeval to a __u64.
+ * @flags: see V4L2_HEVC_ENCODE_REF_FLAG_{}
+ * @reserved: padding field. Should be zeroed by applications.
+ */
+struct v4l2_hevc_encode_ref {
+	__u64	timestamp;
+	__u8	flags;
+	__u8	reserved[7];
+};
+
+/*
+ * The first flags have the same values as the V4L2_HEVC_SLICE_PARAMS_FLAG_{}
+ * flags that carry the same slice header syntax element.
+ */
+#define V4L2_HEVC_ENCODE_FLAG_SLICE_SAO_LUMA			(1ULL << 0)
+#define V4L2_HEVC_ENCODE_FLAG_SLICE_SAO_CHROMA			(1ULL << 1)
+#define V4L2_HEVC_ENCODE_FLAG_SLICE_TEMPORAL_MVP_ENABLED	(1ULL << 2)
+#define V4L2_HEVC_ENCODE_FLAG_MVD_L1_ZERO			(1ULL << 3)
+#define V4L2_HEVC_ENCODE_FLAG_CABAC_INIT			(1ULL << 4)
+#define V4L2_HEVC_ENCODE_FLAG_COLLOCATED_FROM_L0		(1ULL << 5)
+#define V4L2_HEVC_ENCODE_FLAG_SLICE_DEBLOCKING_FILTER_DISABLED	(1ULL << 7)
+#define V4L2_HEVC_ENCODE_FLAG_SLICE_LOOP_FILTER_ACROSS_SLICES_ENABLED (1ULL << 8)
+#define V4L2_HEVC_ENCODE_FLAG_REFERENCE				(1ULL << 16)
+#define V4L2_HEVC_ENCODE_FLAG_NO_OUTPUT_OF_PRIOR_PICS		(1ULL << 17)
+#define V4L2_HEVC_ENCODE_FLAG_NO_PIC_OUTPUT			(1ULL << 18)
+#define V4L2_HEVC_ENCODE_FLAG_NUM_REF_IDX_ACTIVE_OVERRIDE	(1ULL << 19)
+#define V4L2_HEVC_ENCODE_FLAG_DEBLOCKING_FILTER_OVERRIDE	(1ULL << 20)
+
+/**
+ * struct v4l2_ctrl_hevc_encode_params - HEVC stateless encode parameters
+ *
+ * Per-picture parameters of a stateless HEVC encode run. The kernel writes
+ * the NAL unit header and the slice segment header(s) from these values,
+ * or has the hardware write them.
+ *
+ * @nal_unit_type: NAL unit type of the coded slice segments (ITU-T Rec.
+ *		   H.265 Table 7-1, VCL types 0 to 9 and 16 to 21)
+ * @nuh_temporal_id_plus1: TemporalId of the picture plus 1
+ * @slice_type: slice type of the picture, see V4L2_HEVC_SLICE_TYPE_{}
+ * @pic_parameter_set_id: identifies the PPS in use
+ * @pic_order_cnt_val: picture order count of the picture (PicOrderCntVal).
+ *		       The kernel derives slice_pic_order_cnt_lsb from it.
+ * @num_ref_idx_l0_active_minus1: maximum reference index for reference
+ *				  picture list 0, used with
+ *				  V4L2_HEVC_ENCODE_FLAG_NUM_REF_IDX_ACTIVE_OVERRIDE
+ * @num_ref_idx_l1_active_minus1: maximum reference index for reference
+ *				  picture list 1, used with
+ *				  V4L2_HEVC_ENCODE_FLAG_NUM_REF_IDX_ACTIVE_OVERRIDE
+ * @collocated_ref_idx: reference index of the collocated picture used for
+ *			temporal motion vector prediction
+ * @five_minus_max_num_merge_cand: maximum number of merging motion vector
+ *				   prediction candidates subtracted from 5
+ * @slice_cb_qp_offset: difference to be added to pps_cb_qp_offset
+ * @slice_cr_qp_offset: difference to be added to pps_cr_qp_offset
+ * @slice_beta_offset_div2: deblocking parameter offset for beta divided by 2
+ * @slice_tc_offset_div2: deblocking parameter offset for tC divided by 2
+ * @num_refs: number of valid entries in @refs
+ * @reserved: padding field. Should be zeroed by applications.
+ * @refs: reference picture set of the picture: every previously encoded
+ *	  picture that the current picture or a following picture uses for
+ *	  inter prediction. Pictures that are not listed are removed from the
+ *	  decoded picture buffer.
+ * @flags: see V4L2_HEVC_ENCODE_FLAG_{}
+ */
+struct v4l2_ctrl_hevc_encode_params {
+	__u8	nal_unit_type;
+	__u8	nuh_temporal_id_plus1;
+	__u8	slice_type;
+	__u8	pic_parameter_set_id;
+	__s32	pic_order_cnt_val;
+	__u8	num_ref_idx_l0_active_minus1;
+	__u8	num_ref_idx_l1_active_minus1;
+	__u8	collocated_ref_idx;
+	__u8	five_minus_max_num_merge_cand;
+	__s8	slice_cb_qp_offset;
+	__s8	slice_cr_qp_offset;
+	__s8	slice_beta_offset_div2;
+	__s8	slice_tc_offset_div2;
+	__u8	num_refs;
+	__u8	reserved[7];
+	struct v4l2_hevc_encode_ref refs[V4L2_HEVC_DPB_ENTRIES_NUM_MAX];
+	__u64	flags;
+};
+
+#define V4L2_HEVC_ENCODE_FEEDBACK_FLAG_REFERENCE		0x01
+
+/**
+ * struct v4l2_ctrl_hevc_encode_feedback - HEVC stateless encode feedback
+ *
+ * Read-only description of how a picture was actually encoded. The kernel
+ * sets it when the encode run completes, so applications read it from the
+ * completed request.
+ *
+ * @timestamp: timestamp of the OUTPUT (source) buffer that was encoded
+ * @pic_order_cnt_val: picture order count of the picture
+ * @nal_unit_type: NAL unit type that was used
+ * @nuh_temporal_id_plus1: TemporalId that was used, plus 1
+ * @slice_type: slice type that was used, see V4L2_HEVC_SLICE_TYPE_{}
+ * @slice_qp: luma quantisation parameter of the first slice (SliceQpY)
+ * @num_ref_idx_l0_active: number of entries in reference picture list 0
+ * @num_ref_idx_l1_active: number of entries in reference picture list 1
+ * @reserved0: padding field. Should be zeroed by applications.
+ * @ref_idx_l0: index in &v4l2_ctrl_hevc_encode_params.refs of each entry of
+ *		reference picture list 0
+ * @ref_idx_l1: index in &v4l2_ctrl_hevc_encode_params.refs of each entry of
+ *		reference picture list 1
+ * @reserved1: padding field. Should be zeroed by applications.
+ * @stats: statistics measured while encoding the picture
+ * @flags: see V4L2_HEVC_ENCODE_FEEDBACK_FLAG_{}
+ */
+struct v4l2_ctrl_hevc_encode_feedback {
+	__u64	timestamp;
+	__s32	pic_order_cnt_val;
+	__u8	nal_unit_type;
+	__u8	nuh_temporal_id_plus1;
+	__u8	slice_type;
+	__s8	slice_qp;
+	__u8	num_ref_idx_l0_active;
+	__u8	num_ref_idx_l1_active;
+	__u8	reserved0[2];
+	__u8	ref_idx_l0[V4L2_HEVC_DPB_ENTRIES_NUM_MAX];
+	__u8	ref_idx_l1[V4L2_HEVC_DPB_ENTRIES_NUM_MAX];
+	__u8	reserved1[4];
+	struct v4l2_stateless_encode_stats stats;
+	__u64	flags;
 };
 
 /* Stateless VP9 controls */
