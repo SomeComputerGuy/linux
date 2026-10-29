@@ -34,6 +34,7 @@
 #include <media/videobuf2-vmalloc.h>
 
 #include "rkvdec.h"
+#include "rkvdec-ccu.h"
 #include "rkvdec-regs.h"
 #include "rkvdec-vdpu381-regs.h"
 #include "rkvdec-vdpu383-regs.h"
@@ -593,6 +594,7 @@ static const struct rkvdec_coded_fmt_desc vdpu381_coded_fmts[] = {
 		.num_decoded_fmts = ARRAY_SIZE(rkvdec_hevc_decoded_fmts),
 		.decoded_fmts = rkvdec_hevc_decoded_fmts,
 		.subsystem_flags = VB2_V4L2_FL_SUPPORTS_M2M_HOLD_CAPTURE_BUF,
+		.flags = RKVDEC_FMT_FLAG_PIPELINE,
 	},
 	{
 		.fourcc = V4L2_PIX_FMT_H264_SLICE,
@@ -609,6 +611,7 @@ static const struct rkvdec_coded_fmt_desc vdpu381_coded_fmts[] = {
 		.num_decoded_fmts = ARRAY_SIZE(rkvdec_h264_decoded_fmts),
 		.decoded_fmts = rkvdec_h264_decoded_fmts,
 		.subsystem_flags = VB2_V4L2_FL_SUPPORTS_M2M_HOLD_CAPTURE_BUF,
+		.flags = RKVDEC_FMT_FLAG_PIPELINE,
 	},
 	{
 		.fourcc = V4L2_PIX_FMT_VP9_FRAME,
@@ -1078,6 +1081,11 @@ static int rkvdec_start_streaming(struct vb2_queue *q, unsigned int count)
 	if (WARN_ON(!desc))
 		return -EINVAL;
 
+	ctx->num_job_slots = 1;
+	if (ctx->dev->ccu && (desc->flags & RKVDEC_FMT_FLAG_PIPELINE))
+		ctx->num_job_slots = min_t(unsigned int, ctx->dev->core_count,
+					   RKVDEC_MAX_JOBS);
+
 	if (desc->ops->start)
 		ret = desc->ops->start(ctx);
 
@@ -1283,6 +1291,44 @@ static void rkvdec_ctx_complete_jobs(struct rkvdec_ctx *ctx)
 }
 
 /*
+ * The cores connected to the CCU are kept powered while one of them works, as
+ * the Rockchip BSP does: the CCU synchronizes the core with the other ones.
+ */
+static int rkvdec_ccu_power_get(struct rkvdec_dev *rkvdec)
+{
+	int i, ret;
+
+	ret = rkvdec_ccu_get(rkvdec->ccu);
+	if (ret < 0)
+		return ret;
+
+	for (i = 0; i < rkvdec->core_count; i++) {
+		ret = pm_runtime_resume_and_get(rkvdec->cores[i]->dev);
+		if (ret < 0)
+			goto err_put;
+	}
+
+	return 0;
+
+err_put:
+	while (i--)
+		pm_runtime_put_autosuspend(rkvdec->cores[i]->dev);
+	rkvdec_ccu_put(rkvdec->ccu);
+	return ret;
+}
+
+static void rkvdec_ccu_power_put(struct rkvdec_dev *rkvdec)
+{
+	int i;
+
+	for (i = 0; i < rkvdec->core_count; i++) {
+		pm_runtime_mark_last_busy(rkvdec->cores[i]->dev);
+		pm_runtime_put_autosuspend(rkvdec->cores[i]->dev);
+	}
+	rkvdec_ccu_put(rkvdec->ccu);
+}
+
+/*
  * Called when the hardware is done with the job of @core, or when the job
  * couldn't be started. Releases the core and completes the job when the
  * jobs decoded before it are done.
@@ -1317,6 +1363,8 @@ static void rkvdec_job_hw_done(struct rkvdec_core *core,
 	}
 
 	if (pm_put) {
+		if (rkvdec->ccu)
+			rkvdec_ccu_power_put(rkvdec);
 		pm_runtime_mark_last_busy(core->dev);
 		pm_runtime_put_autosuspend(core->dev);
 	}
@@ -1359,13 +1407,69 @@ static void rkvdec_job_started(struct rkvdec_job *job)
 	rkvdec_ctx_complete_jobs(ctx);
 }
 
+void rkvdec_job_add_ref(struct rkvdec_ctx *ctx, const struct vb2_buffer *ref)
+{
+	struct rkvdec_job *job = ctx->job;
+	unsigned int i;
+
+	if (!ref)
+		return;
+
+	for (i = 0; i < job->num_refs; i++)
+		if (job->refs[i] == ref)
+			return;
+
+	if (!WARN_ON(job->num_refs >= ARRAY_SIZE(job->refs)))
+		job->refs[job->num_refs++] = ref;
+}
+
+/* Is @buf a reference of a frame of @ctx that is still being decoded? */
+static bool rkvdec_ctx_buf_is_ref(struct rkvdec_ctx *ctx,
+				  const struct vb2_buffer *buf)
+{
+	struct rkvdec_job *job;
+	unsigned int i;
+
+	list_for_each_entry(job, &ctx->jobs, node)
+		for (i = 0; i < job->num_refs; i++)
+			if (job->refs[i] == buf)
+				return true;
+
+	return false;
+}
+
 static int rkvdec_job_ready(void *priv)
 {
 	struct rkvdec_ctx *ctx = priv;
+	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
+	struct vb2_v4l2_buffer *src, *dst;
+
+	src = v4l2_m2m_next_src_buf(m2m_ctx);
+	dst = v4l2_m2m_next_dst_buf(m2m_ctx);
 
 	guard(spinlock_irqsave)(&ctx->dev->cores_lock);
 
-	return !ctx->num_jobs;
+	if (!ctx->num_jobs)
+		return 1;
+
+	/* Only formats with more than one job slot can be pipelined. */
+	if (ctx->num_jobs >= ctx->num_job_slots)
+		return 0;
+
+	/* A CAPTURE buffer shared by two jobs (two fields): one at a time. */
+	if (!src || !dst || dst->is_held ||
+	    (src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF))
+		return 0;
+
+	/*
+	 * Userspace may queue a CAPTURE buffer again as soon as no future frame
+	 * predicts from it, possibly before the frames being decoded are done
+	 * reading it.
+	 */
+	if (rkvdec_ctx_buf_is_ref(ctx, &dst->vb2_buf))
+		return 0;
+
+	return 1;
 }
 
 void rkvdec_run_preamble(struct rkvdec_ctx *ctx, struct rkvdec_run *run)
@@ -1465,8 +1569,20 @@ static void rkvdec_device_run(void *priv)
 		goto out;
 	}
 
+	if (ctx->dev->ccu) {
+		ret = rkvdec_ccu_power_get(ctx->dev);
+		if (ret < 0) {
+			pm_runtime_put_autosuspend(core->dev);
+			rkvdec_job_hw_done(core, VB2_BUF_STATE_ERROR, false);
+			goto out;
+		}
+	}
+
 	if (WARN_ON(!desc))
 		goto err;
+
+	if (ctx->dev->ccu)
+		rkvdec_ccu_prepare(ctx);
 
 	if (!rkvdec_rcb_buf_validate_size(ctx)) {
 		rkvdec_free_rcb(ctx->dev, core);
@@ -1611,6 +1727,12 @@ static int rkvdec_open(struct file *filp)
 	init_waitqueue_head(&ctx->jobs_wq);
 	mutex_init(&ctx->done_lock);
 	ctx->num_job_slots = 1;
+
+	ret = ida_alloc_range(&rkvdec->film_ida, 1, RKVDEC_MAX_FILM_IDX, GFP_KERNEL);
+	if (ret < 0)
+		goto err_free_ctx;
+	ctx->film_idx = ret;
+
 	rkvdec_reset_coded_fmt(ctx);
 	rkvdec_reset_decoded_fmt(ctx);
 	v4l2_fh_init(&ctx->fh, video_devdata(filp));
@@ -1619,7 +1741,7 @@ static int rkvdec_open(struct file *filp)
 					    rkvdec_queue_init);
 	if (IS_ERR(ctx->fh.m2m_ctx)) {
 		ret = PTR_ERR(ctx->fh.m2m_ctx);
-		goto err_free_ctx;
+		goto err_free_film;
 	}
 
 	ret = rkvdec_init_ctrls(ctx);
@@ -1632,6 +1754,9 @@ static int rkvdec_open(struct file *filp)
 
 err_cleanup_m2m_ctx:
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
+
+err_free_film:
+	ida_free(&rkvdec->film_ida, ctx->film_idx);
 
 err_free_ctx:
 	kfree(ctx);
@@ -1646,6 +1771,7 @@ static int rkvdec_release(struct file *filp)
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
 	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
 	v4l2_fh_exit(&ctx->fh);
+	ida_free(&ctx->dev->film_ida, ctx->film_idx);
 	mutex_destroy(&ctx->done_lock);
 	kfree(ctx);
 
@@ -2121,6 +2247,7 @@ static const struct rkvdec_variant vdpu381_variant = {
 	.rcb_sizes = vdpu381_rcb_sizes,
 	.num_rcb_sizes = ARRAY_SIZE(vdpu381_rcb_sizes),
 	.ops = &vdpu381_variant_ops,
+	.has_ccu = true,
 };
 
 static const struct rcb_size_info vdpu383_rcb_sizes[] = {
@@ -2240,7 +2367,19 @@ static int rkvdec_core_probe(struct platform_device *pdev)
 	core->dev = &pdev->dev;
 	core->variant = variant;
 	core->stopped = true;
+	core->ccu_port = -1;
 	INIT_DELAYED_WORK(&core->watchdog_work, rkvdec_watchdog_func);
+
+	if (variant->has_ccu) {
+		struct of_phandle_args args;
+
+		if (!of_parse_phandle_with_fixed_args(pdev->dev.of_node,
+						      "rockchip,ccu", 1, 0,
+						      &args)) {
+			core->ccu_port = args.args[0];
+			of_node_put(args.np);
+		}
+	}
 
 	ret = devm_clk_bulk_get_all_enabled(&pdev->dev, &core->clocks);
 	if (ret < 0)
@@ -2368,6 +2507,40 @@ static struct platform_driver rkvdec_core_pdrv = {
 	},
 };
 
+/*
+ * Returns the CCU the available cores are connected to, if they all are
+ * connected to the same available one.
+ */
+static struct device_node *rkvdec_find_ccu_node(const char *compatible)
+{
+	struct device_node *core_node, *ccu_node = NULL;
+
+	for_each_compatible_node(core_node, NULL, compatible) {
+		struct device_node *np;
+
+		if (!of_device_is_available(core_node))
+			continue;
+
+		np = of_parse_phandle(core_node, "rockchip,ccu", 0);
+		if (!np || (ccu_node && np != ccu_node)) {
+			of_node_put(np);
+			of_node_put(ccu_node);
+			of_node_put(core_node);
+			return NULL;
+		}
+
+		of_node_put(ccu_node);
+		ccu_node = np;
+	}
+
+	if (ccu_node && !of_device_is_available(ccu_node)) {
+		of_node_put(ccu_node);
+		return NULL;
+	}
+
+	return ccu_node;
+}
+
 static int rkvdec_bind(struct device *dev)
 {
 	struct rkvdec_dev *rkvdec = dev_get_drvdata(dev);
@@ -2379,6 +2552,40 @@ static int rkvdec_bind(struct device *dev)
 		return ret;
 	}
 
+	if (rkvdec->variant->has_ccu) {
+		const struct of_device_id *match_desc = dev->platform_data;
+		struct device_node *np;
+
+		np = rkvdec_find_ccu_node(match_desc->compatible);
+		if (np) {
+			rkvdec->ccu = rkvdec_ccu_find(np);
+			of_node_put(np);
+		}
+	}
+
+	if (rkvdec->ccu) {
+		unsigned long ports = 0;
+		int i;
+
+		for (i = 0; i < rkvdec->core_count; i++) {
+			int port = rkvdec->cores[i]->ccu_port;
+
+			if (port < 0 || port >= 16 || (ports & BIT(port)))
+				break;
+			ports |= BIT(port);
+		}
+
+		if (i < rkvdec->core_count) {
+			dev_warn(rkvdec->cores[i]->dev,
+				 "invalid CCU port, not using the CCU\n");
+			rkvdec_ccu_release(rkvdec->ccu);
+			rkvdec->ccu = NULL;
+		} else {
+			dev_info(dev, "%d cores, decoding with the CCU\n",
+				 rkvdec->core_count);
+		}
+	}
+
 	ret = rkvdec_v4l2_init(rkvdec);
 	if (ret)
 		goto err_unbind;
@@ -2386,6 +2593,9 @@ static int rkvdec_bind(struct device *dev)
 	return 0;
 
 err_unbind:
+	if (rkvdec->ccu)
+		rkvdec_ccu_release(rkvdec->ccu);
+	rkvdec->ccu = NULL;
 	component_unbind_all(dev, NULL);
 	return ret;
 }
@@ -2402,6 +2612,10 @@ static void rkvdec_unbind(struct device *dev)
 
 	for (i = 0; i < rkvdec->core_count; i++)
 		rkvdec_free_rcb(rkvdec, rkvdec->cores[i]);
+
+	if (rkvdec->ccu)
+		rkvdec_ccu_release(rkvdec->ccu);
+	rkvdec->ccu = NULL;
 
 	component_unbind_all(dev, NULL);
 }
@@ -2458,6 +2672,7 @@ static int rkvdec_probe(struct platform_device *pdev)
 
 	mutex_init(&rkvdec->vdev_lock);
 	spin_lock_init(&rkvdec->cores_lock);
+	ida_init(&rkvdec->film_ida);
 
 	dev_set_drvdata(dev, rkvdec);
 
@@ -2466,7 +2681,10 @@ static int rkvdec_probe(struct platform_device *pdev)
 
 static void rkvdec_remove(struct platform_device *pdev)
 {
+	struct rkvdec_dev *rkvdec = platform_get_drvdata(pdev);
+
 	component_master_del(&pdev->dev, &rkvdec_master_ops);
+	ida_destroy(&rkvdec->film_ida);
 }
 
 static struct platform_driver rkvdec_pdrv = {
@@ -2535,9 +2753,13 @@ static int __init rkvdec_init(void)
 	if (ret)
 		return ret;
 
-	ret = platform_driver_register(&rkvdec_pdrv);
+	ret = platform_driver_register(&rkvdec_ccu_pdrv);
 	if (ret)
 		goto unregister_core_driver;
+
+	ret = platform_driver_register(&rkvdec_pdrv);
+	if (ret)
+		goto unregister_ccu_driver;
 
 	for (i = 0; i < ARRAY_SIZE(master_pdevs); i++) {
 		if (!rkvdec_of_has_available_node(of_rkvdec_match[i].compatible))
@@ -2559,6 +2781,8 @@ unregister_platform_devices:
 		}
 	}
 	platform_driver_unregister(&rkvdec_pdrv);
+unregister_ccu_driver:
+	platform_driver_unregister(&rkvdec_ccu_pdrv);
 unregister_core_driver:
 	platform_driver_unregister(&rkvdec_core_pdrv);
 	return ret;
@@ -2576,6 +2800,7 @@ static void __exit rkvdec_exit(void)
 		}
 	}
 	platform_driver_unregister(&rkvdec_pdrv);
+	platform_driver_unregister(&rkvdec_ccu_pdrv);
 	platform_driver_unregister(&rkvdec_core_pdrv);
 }
 module_exit(rkvdec_exit);

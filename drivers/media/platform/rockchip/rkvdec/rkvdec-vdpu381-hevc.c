@@ -10,6 +10,7 @@
 
 #include "rkvdec.h"
 #include "rkvdec-cabac.h"
+#include "rkvdec-ccu.h"
 #include "rkvdec-rcb.h"
 #include "rkvdec-hevc-common.h"
 #include "rkvdec-vdpu381-regs.h"
@@ -470,6 +471,8 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	else
 		regs->common.reg032_timeout_threshold = RKVDEC_TIMEOUT_MAX;
 
+	rkvdec_vdpu381_set_ccu_regs(ctx, &regs->common);
+
 	/* Set POC val */
 	regs->hevc_param.reg065_cur_top_poc = dec_params->pic_order_cnt_val;
 
@@ -478,6 +481,9 @@ static void config_registers(struct rkvdec_ctx *ctx,
 		struct vb2_buffer *vb_buf = get_ref_buf(ctx, run, i);
 		dma_addr_t buf_dma = vb2_dma_contig_plane_dma_addr(vb_buf, 0);
 		u32 valid = !!(dec_params->num_active_dpb_entries > i);
+
+		if (valid)
+			rkvdec_job_add_ref(ctx, vb_buf);
 
 		/* Set reference addresses */
 		regs->hevc_addr.reg164_180_ref_base[i] = buf_dma;
@@ -650,6 +656,7 @@ static int rkvdec_hevc_run(struct rkvdec_ctx *ctx)
 	rkvdec_schedule_watchdog(core, hevc_ctx->regs.common.reg032_timeout_threshold);
 
 	/* Start decoding! */
+	rkvdec_ccu_start(ctx);
 	writel(VDPU381_DEC_E_BIT, ctx->core->regs + VDPU381_REG_DEC_E);
 
 	return 0;
