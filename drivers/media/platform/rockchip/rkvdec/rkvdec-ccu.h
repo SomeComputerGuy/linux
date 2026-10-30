@@ -22,6 +22,8 @@ void rkvdec_ccu_put(struct rkvdec_ccu *ccu);
 bool rkvdec_ctx_uses_ccu(struct rkvdec_ctx *ctx);
 void rkvdec_ccu_prepare(struct rkvdec_ctx *ctx);
 void rkvdec_ccu_start(struct rkvdec_ctx *ctx);
+void rkvdec_ccu_disconnect(struct rkvdec_ccu *ccu, struct rkvdec_core *core);
+void rkvdec_ccu_reconnect(struct rkvdec_ccu *ccu, struct rkvdec_core *core);
 void rkvdec_vdpu381_set_ccu_regs(struct rkvdec_ctx *ctx,
 				 struct rkvdec_vdpu381_regs_common *common);
 

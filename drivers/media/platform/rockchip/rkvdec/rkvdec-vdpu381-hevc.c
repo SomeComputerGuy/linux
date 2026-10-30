@@ -475,6 +475,7 @@ static void config_registers(struct rkvdec_ctx *ctx,
 
 	/* Set POC val */
 	regs->hevc_param.reg065_cur_top_poc = dec_params->pic_order_cnt_val;
+	rkvdec_job_add_poc(ctx, dec_params->pic_order_cnt_val, false);
 
 	/* Set ref pic address & poc */
 	for (i = 0; i < ARRAY_SIZE(dec_params->dpb); i++) {
@@ -482,8 +483,10 @@ static void config_registers(struct rkvdec_ctx *ctx,
 		dma_addr_t buf_dma = vb2_dma_contig_plane_dma_addr(vb_buf, 0);
 		u32 valid = !!(dec_params->num_active_dpb_entries > i);
 
-		if (valid)
+		if (valid) {
 			rkvdec_job_add_ref(ctx, vb_buf);
+			rkvdec_job_add_poc(ctx, dpb[i].pic_order_cnt_val, true);
+		}
 
 		/* Set reference addresses */
 		regs->hevc_addr.reg164_180_ref_base[i] = buf_dma;
@@ -652,6 +655,9 @@ static int rkvdec_hevc_run(struct rkvdec_ctx *ctx)
 	config_registers(ctx, &run);
 
 	rkvdec_run_postamble(ctx, &run.base);
+
+	/* Before the watchdog: this may wait for the earlier frames. */
+	rkvdec_job_wait_poc_alias(ctx);
 
 	rkvdec_schedule_watchdog(core, hevc_ctx->regs.common.reg032_timeout_threshold);
 

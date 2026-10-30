@@ -28,6 +28,8 @@
 #define RKVDEC_CCU_WORK_MODE_TASK	BIT(0)
 #define RKVDEC_CCU_CORE_WORK		0x044
 #define RKVDEC_CCU_CORE_STA		0x048
+#define RKVDEC_CCU_CORE_IDLE		0x04c
+#define RKVDEC_CCU_CORE_ERR		0x054
 /* Sets the bit of a core in the CORE_* registers */
 #define RKVDEC_CCU_CORE_SET(port)	(0x10001U << (port))
 
@@ -86,6 +88,22 @@ void rkvdec_ccu_prepare(struct rkvdec_ctx *ctx)
 	writel(RKVDEC_CCU_WORK_EN, ccu->regs + RKVDEC_CCU_WORK);
 	writel(RKVDEC_CCU_WORK_MODE_TASK, ccu->regs + RKVDEC_CCU_WORK_MODE);
 	writel(RKVDEC_CCU_CORE_SET(core->ccu_port), ccu->regs + RKVDEC_CCU_CORE_WORK);
+}
+
+/*
+ * Forces a core that is being reset idle in the CCU, so that the other core
+ * doesn't wait for it, and connects it again with its error state cleared,
+ * as the BSP's soft-CCU reset does.
+ */
+void rkvdec_ccu_disconnect(struct rkvdec_ccu *ccu, struct rkvdec_core *core)
+{
+	writel(RKVDEC_CCU_CORE_SET(core->ccu_port), ccu->regs + RKVDEC_CCU_CORE_IDLE);
+}
+
+void rkvdec_ccu_reconnect(struct rkvdec_ccu *ccu, struct rkvdec_core *core)
+{
+	writel(BIT(core->ccu_port + 16), ccu->regs + RKVDEC_CCU_CORE_ERR);
+	writel(BIT(core->ccu_port + 16), ccu->regs + RKVDEC_CCU_CORE_IDLE);
 }
 
 /* Tells the CCU that the core of the job being set up starts decoding. */
