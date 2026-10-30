@@ -634,6 +634,7 @@ static int rkvdec_hevc_run(struct rkvdec_ctx *ctx)
 	struct rkvdec_hevc_ctx *hevc_ctx = ctx->priv;
 	struct rkvdec_hevc_job_tbl *job_tbl = rkvdec_hevc_job_tbl(ctx);
 	struct rkvdec_hevc_priv_tbl *tbl = job_tbl->priv_tbl.cpu;
+	int ret;
 
 	rkvdec_hevc_run_preamble(ctx, &run);
 
@@ -657,7 +658,9 @@ static int rkvdec_hevc_run(struct rkvdec_ctx *ctx)
 	rkvdec_run_postamble(ctx, &run.base);
 
 	/* Before the watchdog: this may wait for the earlier frames. */
-	rkvdec_job_wait_poc_alias(ctx);
+	ret = rkvdec_job_wait_poc_alias(ctx);
+	if (ret)
+		return ret;
 
 	rkvdec_schedule_watchdog(core, hevc_ctx->regs.common.reg032_timeout_threshold);
 
