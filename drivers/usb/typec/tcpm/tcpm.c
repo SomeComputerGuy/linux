@@ -7376,7 +7376,7 @@ static void tcpm_vdm_discovery_work(struct kthread_work *work)
 	case VDM_DISCOVERY_PARTNER_MODES:
 		/* Not all modes have been discovered yet */
 		if (modep->svid_index < modep->nsvids) {
-			msg[0] = VDO(modep_prime->svids[modep->svid_index], 1, svdm_version,
+			msg[0] = VDO(modep->svids[modep->svid_index], 1, svdm_version,
 				     CMD_DISCOVER_MODES);
 		} else if (tcpm_can_communicate_sop_prime(port) && tcpm_cable_vdm_supported(port)) {
 			tx_sop_type = TCPC_TX_SOP_PRIME;
@@ -7411,7 +7411,7 @@ static void tcpm_vdm_discovery_work(struct kthread_work *work)
 		if (modep_prime->svid_index < modep_prime->nsvids) {
 			tx_sop_type = TCPC_TX_SOP_PRIME;
 			svdm_version = typec_get_cable_svdm_version(typec);
-			msg[0] = VDO(modep_prime->svids[modep->svid_index], 1, svdm_version,
+			msg[0] = VDO(modep_prime->svids[modep_prime->svid_index], 1, svdm_version,
 				     CMD_DISCOVER_MODES);
 		} else {
 			goto unlock;
