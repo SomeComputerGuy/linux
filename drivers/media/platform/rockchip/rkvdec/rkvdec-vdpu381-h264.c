@@ -313,10 +313,23 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	rkvdec_vdpu381_set_ccu_regs(ctx, &regs->common);
 
 	/* Set TOP and BOTTOM POCs */
-	regs->h264_param.reg065_cur_top_poc = dec_params->top_field_order_cnt;
-	regs->h264_param.reg066_cur_bot_poc = dec_params->bottom_field_order_cnt;
-	rkvdec_job_add_poc(ctx, dec_params->top_field_order_cnt, false);
-	rkvdec_job_add_poc(ctx, dec_params->bottom_field_order_cnt, false);
+	ctx->job->field_pic = !!(dec_params->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC);
+
+	/*
+	 * A field picture only has the POC of its own field, the other one is
+	 * 0, as in the Rockchip MPP (h264d_fill.c): in CCU mode, the cores take
+	 * these as the fields the core is writing.
+	 */
+	if (!(dec_params->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC) ||
+	    !(dec_params->flags & V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD)) {
+		regs->h264_param.reg065_cur_top_poc = dec_params->top_field_order_cnt;
+		rkvdec_job_add_poc(ctx, dec_params->top_field_order_cnt, false);
+	}
+	if (!(dec_params->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC) ||
+	    (dec_params->flags & V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD)) {
+		regs->h264_param.reg066_cur_bot_poc = dec_params->bottom_field_order_cnt;
+		rkvdec_job_add_poc(ctx, dec_params->bottom_field_order_cnt, false);
+	}
 
 	/*
 	 * POC high bits, which tell the cores what a reference is: the field
