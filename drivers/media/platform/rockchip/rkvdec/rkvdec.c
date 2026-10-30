@@ -15,6 +15,7 @@
 #include <linux/genalloc.h>
 #include <linux/interrupt.h>
 #include <linux/iommu.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
@@ -22,6 +23,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
+#include <linux/reset.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/videodev2.h>
@@ -1278,6 +1280,12 @@ static void rkvdec_device_run(void *priv)
 	if (WARN_ON(!ctx->core))
 		return;
 
+	/* A core that couldn't be stopped after a failure must not run. */
+	if (READ_ONCE(ctx->core->broken)) {
+		rkvdec_job_finish_no_pm(ctx, VB2_BUF_STATE_ERROR);
+		return;
+	}
+
 	ret = pm_runtime_resume_and_get(ctx->core->dev);
 	if (ret < 0) {
 		rkvdec_job_finish_no_pm(ctx, VB2_BUF_STATE_ERROR);
@@ -1544,39 +1552,141 @@ static void rkvdec_v4l2_cleanup(struct rkvdec_dev *rkvdec)
 	v4l2_device_unregister(&rkvdec->v4l2_dev);
 }
 
-static void rkvdec_iommu_restore(struct rkvdec_core *core)
+/*
+ * Reprograms the IOMMU of @core with the domain the cores share. Only called
+ * once the core is stopped (see rkvdec_core_recover()): each attach goes
+ * through the IOMMU's bypass state (paging disabled), so a core that still
+ * had a bus transaction pending, such as one held by a page fault, would
+ * have it go out to the physical address of its IOVA. Returns false if the
+ * shared domain couldn't be attached again.
+ */
+static bool rkvdec_iommu_restore(struct rkvdec_core *core)
 {
-	struct iommu_domain *domain;
+	struct iommu_domain *domain = core->rkvdec->iommu_global_domain;
 	int ret;
 
-	/* Not bound yet: no job ran on this core. */
-	if (!core->rkvdec)
-		return;
+	if (!core->empty_domain || !domain)
+		return true;
 
-	domain = core->rkvdec->iommu_global_domain;
-	if (core->empty_domain && domain) {
-		/*
-		 * To rewrite mapping into the attached IOMMU core, attach a new empty domain that
-		 * will program an empty table, then detach it to restore the default domain and
-		 * all cached mappings.
-		 * This is safely done in this interrupt handler to make sure no memory get mapped
-		 * through the IOMMU while the empty domain is attached.
-		 */
-		iommu_detach_device(domain, core->dev);
-		ret = iommu_attach_device(core->empty_domain, core->dev);
-		if (ret)
-			dev_warn(core->dev, "Cannot attach empty domain: %d\n", ret);
+	/*
+	 * Attaching the domain that is already attached does nothing: go
+	 * through an empty domain, so that the IOMMU is reset and programmed
+	 * again with the shared domain and its mappings.
+	 */
+	iommu_detach_device(domain, core->dev);
+	ret = iommu_attach_device(core->empty_domain, core->dev);
+	if (ret)
+		dev_warn(core->dev, "Cannot attach empty domain: %d\n", ret);
+	else
 		iommu_detach_device(core->empty_domain, core->dev);
-		ret = iommu_attach_device(domain, core->dev);
-		if (ret)
-			dev_warn(core->dev, "Cannot attach global domain: %d\n", ret);
+	ret = iommu_attach_device(domain, core->dev);
+	if (ret)
+		dev_err(core->dev, "Cannot attach global domain: %d\n", ret);
+
+	return !ret;
+}
+
+/*
+ * Soft resets a core whose job failed or timed out and clears its interrupt
+ * status. Returns true if the core is idle: reset, and done with its bus
+ * transactions.
+ */
+static bool rk3399_reset(struct rkvdec_core *core)
+{
+	u32 status;
+	int ret;
+
+	writel(RKVDEC_IRQ_DIS | RKVDEC_SOFTRST_EN_P, core->regs + RKVDEC_REG_INTERRUPT);
+	ret = readl_poll_timeout(core->regs + RKVDEC_REG_INTERRUPT, status,
+				 status & RKVDEC_SOFTRESET_RDY, 1, 100);
+	writel(RKVDEC_IRQ_DIS, core->regs + RKVDEC_REG_INTERRUPT);
+
+	return !ret;
+}
+
+static bool vdpu381_reset(struct rkvdec_core *core)
+{
+	u32 status;
+	int ret;
+
+	writel(VDPU381_DEC_IRQ_DISABLE | VDPU381_SOFT_RESET_EN,
+	       core->regs + VDPU381_REG_IMPORTANT_EN);
+	ret = readl_poll_timeout(core->regs + VDPU381_REG_STA_INT, status,
+				 status & VDPU381_STA_INT_SOFTRESET_RDY, 1, 100);
+	writel(0, core->regs + VDPU381_REG_STA_INT);
+	if (ret)
+		return false;
+
+	/* The soft reset doesn't wait for the bus transactions of the core. */
+	return !readl_poll_timeout(core->regs + VDPU381_REG_DEBUG_INT, status,
+				   status & VDPU381_DEBUG_INT_BUS_IDLE, 1, 1000);
+}
+
+static bool vdpu383_reset(struct rkvdec_core *core)
+{
+	writel(FIELD_PREP_WM16(VDPU383_INT_EN_IRQ | VDPU383_INT_EN_LINE_IRQ, 0),
+	       core->link + VDPU383_LINK_INT_EN);
+	writel(FIELD_PREP_WM16(VDPU383_STA_INT_ALL, 0), core->link + VDPU383_LINK_STA_INT);
+
+	/* No soft reset known: only the reset lines stop the core. */
+	return false;
+}
+
+/*
+ * Stops a core whose job failed or timed out, before the job is completed
+ * and before anything else uses the core. The core may still be decoding,
+ * or stuck with a bus transaction held by a page fault of its IOMMU: it
+ * would keep writing to buffers that go back to userspace, and its IOMMU
+ * can't be reinitialized under it.
+ *
+ * As the Rockchip BSP does, soft reset the core, which lets it finish its
+ * bus transactions, then pulse its reset lines. On RK3588, both the soft
+ * reset and the AXI reset line reset the IOMMU of the core too, leaving it
+ * in bypass (the core also soft resets itself when its hardware timeout
+ * fires). Reprogram the IOMMU last, before the core can be started again.
+ *
+ * Must be called with the interrupt of the core masked. Returns false if
+ * the core couldn't be stopped or its IOMMU couldn't be programmed: it is
+ * then marked broken and never started again, since its bus accesses could
+ * reach memory untranslated.
+ */
+static bool rkvdec_core_recover(struct rkvdec_core *core)
+{
+	bool idle;
+	int ret;
+
+	idle = core->variant->ops->reset(core);
+	if (core->resets) {
+		if (!idle)
+			dev_warn(core->dev, "soft reset failed, pulsing the reset lines\n");
+		ret = reset_control_assert(core->resets);
+		if (!ret) {
+			udelay(5);
+			ret = reset_control_deassert(core->resets);
+		}
+		idle = !ret;
 	}
+
+	if (!idle)
+		dev_err(core->dev, "could not stop the core\n");
+	else if (!rkvdec_iommu_restore(core))
+		idle = false;
+
+	if (!idle) {
+		dev_err(core->dev, "disabling the core\n");
+		WRITE_ONCE(core->broken, true);
+	}
+
+	return idle;
 }
 
 /*
  * Completes the job of @core with @state, unless the watchdog already did or
  * the core has no job: the interrupt status is acknowledged in any case, a
  * late interrupt (after a timeout) or a spurious one doesn't belong to a job.
+ * A failed job leaves the core in an unknown state: it is stopped before the
+ * job is completed. The interrupt of the core is masked while its threaded
+ * handler runs.
  */
 static void rkvdec_irq_job_done(struct rkvdec_core *core,
 				enum vb2_buffer_state state)
@@ -1592,57 +1702,42 @@ static void rkvdec_irq_job_done(struct rkvdec_core *core,
 		return;
 
 	ctx = READ_ONCE(core->curr_ctx);
-	if (!WARN_ON(!ctx))
-		rkvdec_job_finish(ctx, state);
+	if (WARN_ON(!ctx))
+		return;
+
+	if (state == VB2_BUF_STATE_ERROR)
+		rkvdec_core_recover(core);
+	rkvdec_job_finish(ctx, state);
 }
 
 static irqreturn_t rk3399_irq_handler(struct rkvdec_core *core)
 {
-	enum vb2_buffer_state state;
 	u32 status;
 
 	status = readl(core->regs + RKVDEC_REG_INTERRUPT);
 	writel(0, core->regs + RKVDEC_REG_INTERRUPT);
 
-	if (status & RKVDEC_RDY_STA) {
-		state = VB2_BUF_STATE_DONE;
-	} else {
-		state = VB2_BUF_STATE_ERROR;
-		if (status & RKVDEC_SOFTRESET_RDY)
-			rkvdec_iommu_restore(core);
-	}
-
-	rkvdec_irq_job_done(core, state);
+	rkvdec_irq_job_done(core, (status & RKVDEC_RDY_STA) ?
+			    VB2_BUF_STATE_DONE : VB2_BUF_STATE_ERROR);
 
 	return IRQ_HANDLED;
 }
 
 static irqreturn_t vdpu381_irq_handler(struct rkvdec_core *core)
 {
-	enum vb2_buffer_state state;
 	u32 status;
 
 	status = readl(core->regs + VDPU381_REG_STA_INT);
 	writel(0, core->regs + VDPU381_REG_STA_INT);
 
-	if (status & VDPU381_STA_INT_DEC_RDY_STA) {
-		state = VB2_BUF_STATE_DONE;
-	} else {
-		state = VB2_BUF_STATE_ERROR;
-		if (status & (VDPU381_STA_INT_SOFTRESET_RDY |
-			      VDPU381_STA_INT_TIMEOUT |
-			      VDPU381_STA_INT_ERROR))
-			rkvdec_iommu_restore(core);
-	}
-
-	rkvdec_irq_job_done(core, state);
+	rkvdec_irq_job_done(core, (status & VDPU381_STA_INT_DEC_RDY_STA) ?
+			    VB2_BUF_STATE_DONE : VB2_BUF_STATE_ERROR);
 
 	return IRQ_HANDLED;
 }
 
 static irqreturn_t vdpu383_irq_handler(struct rkvdec_core *core)
 {
-	enum vb2_buffer_state state;
 	u32 status;
 
 	status = readl(core->link + VDPU383_LINK_STA_INT);
@@ -1651,14 +1746,8 @@ static irqreturn_t vdpu383_irq_handler(struct rkvdec_core *core)
 	writel(FIELD_PREP_WM16(VDPU383_INT_EN_IRQ | VDPU383_INT_EN_LINE_IRQ, 0),
 	       core->link + VDPU383_LINK_INT_EN);
 
-	if (status & VDPU383_STA_INT_DEC_RDY_STA) {
-		state = VB2_BUF_STATE_DONE;
-	} else {
-		state = VB2_BUF_STATE_ERROR;
-		rkvdec_iommu_restore(core);
-	}
-
-	rkvdec_irq_job_done(core, state);
+	rkvdec_irq_job_done(core, (status & VDPU383_STA_INT_DEC_RDY_STA) ?
+			    VB2_BUF_STATE_DONE : VB2_BUF_STATE_ERROR);
 
 	return IRQ_HANDLED;
 }
@@ -1752,13 +1841,17 @@ static void rkvdec_watchdog_func(struct work_struct *work)
 	ctx = core->curr_ctx;
 	if (ctx) {
 		dev_err(core->dev, "Frame processing timed out!\n");
-		writel(RKVDEC_IRQ_DIS, core->regs + RKVDEC_REG_INTERRUPT);
+		/* No interrupt handler on this core while it's stopped. */
+		disable_irq(core->irq);
+		rkvdec_core_recover(core);
+		enable_irq(core->irq);
 		rkvdec_job_finish(ctx, VB2_BUF_STATE_ERROR);
 	}
 }
 
 static const struct rkvdec_variant_ops rk3399_variant_ops = {
 	.irq_handler = rk3399_irq_handler,
+	.reset = rk3399_reset,
 	.colmv_size = rkvdec_colmv_size,
 	.flatten_matrices = transpose_and_flatten_matrices,
 };
@@ -1803,6 +1896,7 @@ static const struct rcb_size_info vdpu381_rcb_sizes[] = {
 
 static const struct rkvdec_variant_ops vdpu381_variant_ops = {
 	.irq_handler = vdpu381_irq_handler,
+	.reset = vdpu381_reset,
 	.colmv_size = vdpu381_colmv_size,
 	.flatten_matrices = transpose_and_flatten_matrices,
 };
@@ -1830,6 +1924,7 @@ static const struct rcb_size_info vdpu383_rcb_sizes[] = {
 
 static const struct rkvdec_variant_ops vdpu383_variant_ops = {
 	.irq_handler = vdpu383_irq_handler,
+	.reset = vdpu383_reset,
 	.colmv_size = vdpu383_colmv_size,
 	.flatten_matrices = vdpu383_flatten_matrices,
 };
@@ -1969,9 +2064,15 @@ static int rkvdec_core_probe(struct platform_device *pdev)
 
 	vb2_dma_contig_set_max_seg_size(&pdev->dev, DMA_BIT_MASK(32));
 
+	core->resets = devm_reset_control_array_get_optional_exclusive(&pdev->dev);
+	if (IS_ERR(core->resets))
+		return dev_err_probe(&pdev->dev, PTR_ERR(core->resets),
+				     "failed to get the resets\n");
+
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
 		return irq;
+	core->irq = irq;
 
 	ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
 					rkvdec_irq_handler, IRQF_ONESHOT,

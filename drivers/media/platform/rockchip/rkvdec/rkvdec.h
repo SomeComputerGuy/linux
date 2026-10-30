@@ -76,6 +76,7 @@ struct rkvdec_core;
 
 struct rkvdec_variant_ops {
 	irqreturn_t (*irq_handler)(struct rkvdec_core *core);
+	bool (*reset)(struct rkvdec_core *core);
 	u32 (*colmv_size)(u16 width, u16 height);
 	void (*flatten_matrices)(u8 *output, const u8 *input, int matrices, int row_length);
 };
@@ -138,6 +139,9 @@ struct rkvdec_core {
 	void __iomem *regs;
 	void __iomem *link;
 	struct delayed_work watchdog_work;
+	struct reset_control *resets;
+	int irq;
+	bool broken;
 	struct gen_pool *sram_pool;
 	struct iommu_domain *empty_domain;
 	struct rkvdec_rcb_config *rcb_config;
