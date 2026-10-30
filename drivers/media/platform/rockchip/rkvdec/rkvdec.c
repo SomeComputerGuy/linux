@@ -1401,6 +1401,7 @@ static void rkvdec_job_hw_done(struct rkvdec_core *core,
 		job = core->job;
 		core->job = NULL;
 		core->curr_ctx = NULL;
+		core->needs_reset = false;
 		rkvdec->available_cores[rkvdec->available_core_count++] = core;
 
 		job->core = NULL;
@@ -1414,6 +1415,8 @@ static void rkvdec_job_hw_done(struct rkvdec_core *core,
 		if (held)
 			held->busy = true;
 	}
+
+	wake_up(&rkvdec->reset_wq);
 
 	if (pm_put) {
 		if (rkvdec->ccu)
@@ -1489,9 +1492,11 @@ void rkvdec_job_add_poc(struct rkvdec_ctx *ctx, s32 poc, bool ref)
  * Does an earlier frame of the stream that is still being decoded have a
  * reference with a POC of the frame being set up? The cores identify
  * references by POC: that earlier frame would wait for this one, which in
- * turn waits for it.
+ * turn waits for it. Returns 1 if so, 0 if not, or -EIO if an earlier frame
+ * failed and waits for the cores to be reset (the frame being set up is
+ * failed with it, see rkvdec_core_failed()).
  */
-static bool rkvdec_job_poc_alias(struct rkvdec_ctx *ctx)
+static int rkvdec_job_poc_alias(struct rkvdec_ctx *ctx)
 {
 	struct rkvdec_job *job = ctx->job, *prev;
 	unsigned int i, j;
@@ -1503,26 +1508,34 @@ static bool rkvdec_job_poc_alias(struct rkvdec_ctx *ctx)
 			break;
 		if (prev->hw_done)
 			continue;
+		/* It failed: this frame predicts from it, or waits for it. */
+		if (prev->core && prev->core->needs_reset)
+			return -EIO;
 		for (i = 0; i < prev->num_ref_pocs; i++)
 			for (j = 0; j < job->num_pocs; j++)
 				if (prev->ref_pocs[i] == job->pocs[j])
-					return true;
+					return 1;
 	}
 
-	return false;
+	return 0;
 }
 
 /*
  * POCs repeat in a stream (IDR pictures, memory_management_control_operation
  * 5, CRA): before starting a frame in CCU mode, wait for the earlier frames
- * that would take it for one of their references.
+ * that would take it for one of their references. Returns 0 when the frame
+ * can start, -EIO if it must fail.
  */
-void rkvdec_job_wait_poc_alias(struct rkvdec_ctx *ctx)
+int rkvdec_job_wait_poc_alias(struct rkvdec_ctx *ctx)
 {
-	if (!rkvdec_ctx_uses_ccu(ctx) || !rkvdec_job_poc_alias(ctx))
-		return;
+	int ret;
 
-	wait_event(ctx->jobs_wq, !rkvdec_job_poc_alias(ctx));
+	if (!rkvdec_ctx_uses_ccu(ctx))
+		return 0;
+
+	wait_event(ctx->jobs_wq, (ret = rkvdec_job_poc_alias(ctx)) <= 0);
+
+	return ret;
 }
 
 /* Is @buf a reference of a frame of @ctx that is still being decoded? */
@@ -1672,6 +1685,17 @@ static void rkvdec_device_run(void *priv)
 	struct rkvdec_job *job;
 	int ret;
 
+	/*
+	 * No new job while the cores wait to be reset, see rkvdec_core_failed():
+	 * the reset work runs this m2m job once it is done.
+	 */
+	scoped_guard(spinlock_irqsave, &ctx->dev->cores_lock) {
+		if (ctx->dev->ccu_reset_pending) {
+			ctx->dev->deferred_ctx = ctx;
+			return;
+		}
+	}
+
 	scoped_guard(mutex, &ctx->done_lock)
 		job = rkvdec_job_start(ctx);
 	if (WARN_ON(!job)) {
@@ -1728,6 +1752,11 @@ static void rkvdec_device_run(void *priv)
 	ret = desc->ops->run(ctx);
 	if (ret)
 		goto err;
+
+	/* A failed core is reset only once its job was started. */
+	scoped_guard(spinlock_irqsave, &ctx->dev->cores_lock)
+		job->started = true;
+	wake_up(&ctx->dev->reset_wq);
 
 	ctx->core = NULL;
 	ctx->job = NULL;
@@ -2163,6 +2192,148 @@ static bool rkvdec_core_recover(struct rkvdec_core *core)
 }
 
 /*
+ * Can the cores be reset? Each one is idle, or its job failed and is started
+ * (device_run() is done with the core).
+ */
+static bool rkvdec_cores_settled(struct rkvdec_dev *rkvdec)
+{
+	unsigned int i;
+
+	guard(spinlock_irqsave)(&rkvdec->cores_lock);
+
+	for (i = 0; i < rkvdec->core_count; i++) {
+		struct rkvdec_core *core = rkvdec->cores[i];
+
+		if (core->job && !(core->needs_reset && core->job->started))
+			return false;
+	}
+
+	return true;
+}
+
+/*
+ * In CCU mode, the cores wait for each other: resetting a core, or forcing it
+ * idle in the CCU, breaks the frame the other core is decoding. Like the BSP's
+ * soft-CCU worker, start no job once a core failed, wait for the jobs still
+ * running on the other cores to be done (or to fail too), and reset all the
+ * cores. The failed jobs are completed only then: until its core is reset, a
+ * failed job may still access its buffers.
+ */
+static void rkvdec_ccu_reset_work(struct work_struct *work)
+{
+	struct rkvdec_dev *rkvdec = container_of(work, struct rkvdec_dev,
+						 reset_work);
+	struct rkvdec_ctx *ctx;
+	bool powered;
+	int i;
+
+	wait_event(rkvdec->reset_wq, rkvdec_cores_settled(rkvdec));
+
+	/* A failed job holds the runtime PM references of all the cores. */
+	powered = !rkvdec_ccu_power_get(rkvdec);
+
+	/*
+	 * Force all the cores idle in the CCU first: a core that waits for a
+	 * failed one can then finish its job, see rkvdec_core_recover().
+	 */
+	for (i = 0; i < rkvdec->core_count; i++)
+		if (powered || rkvdec->cores[i]->needs_reset)
+			rkvdec_ccu_disconnect(rkvdec->ccu, rkvdec->cores[i]);
+
+	for (i = 0; i < rkvdec->core_count; i++) {
+		struct rkvdec_core *core = rkvdec->cores[i];
+
+		if (!powered && !core->needs_reset)
+			continue;
+
+		disable_irq(core->irq);
+		rkvdec_core_recover(core);
+		enable_irq(core->irq);
+	}
+	if (powered)
+		rkvdec_ccu_power_put(rkvdec);
+
+	/* Their cores are idle now: complete the failed jobs. */
+	for (i = 0; i < rkvdec->core_count; i++) {
+		struct rkvdec_core *core = rkvdec->cores[i];
+		bool failed;
+
+		scoped_guard(spinlock_irqsave, &rkvdec->cores_lock)
+			failed = core->job && core->needs_reset;
+		if (failed)
+			rkvdec_job_hw_done(core, VB2_BUF_STATE_ERROR, true);
+	}
+
+	scoped_guard(spinlock_irqsave, &rkvdec->cores_lock) {
+		rkvdec->ccu_reset_pending = false;
+		ctx = rkvdec->deferred_ctx;
+		rkvdec->deferred_ctx = NULL;
+	}
+
+	if (ctx)
+		rkvdec_device_run(ctx);
+}
+
+/*
+ * Called when the job of @core failed or timed out, with the interrupt of the
+ * core masked. Returns true if the job can be completed now: without a CCU,
+ * the core is recovered at once. In CCU mode, the job is completed by the
+ * reset work once all the cores are reset, and so are the later frames of the
+ * same stream that the other cores decode: they predict from this one and
+ * won't finish.
+ */
+static bool rkvdec_core_failed(struct rkvdec_core *core)
+{
+	struct rkvdec_dev *rkvdec = core->rkvdec;
+	struct rkvdec_core *dependents[RKVDEC_MAX_JOBS];
+	unsigned int num_dependents = 0, i;
+	struct rkvdec_job *job, *later;
+
+	if (!rkvdec->ccu) {
+		rkvdec_core_recover(core);
+		return true;
+	}
+
+	scoped_guard(spinlock_irqsave, &rkvdec->cores_lock) {
+		core->needs_reset = true;
+		rkvdec->ccu_reset_pending = true;
+		/* See rkvdec_job_poc_alias(). */
+		wake_up(&core->job->ctx->jobs_wq);
+
+		job = core->job;
+		later = job;
+		list_for_each_entry_continue(later, &job->ctx->jobs, node) {
+			if (later->core && num_dependents < ARRAY_SIZE(dependents))
+				dependents[num_dependents++] = later->core;
+		}
+	}
+
+	/*
+	 * A dependent job whose watchdog already ran, or that completes right
+	 * now, is handled by its own interrupt handler or watchdog.
+	 */
+	for (i = 0; i < num_dependents; i++) {
+		struct rkvdec_core *dep = dependents[i];
+
+		if (cancel_delayed_work(&dep->watchdog_work)) {
+			dev_dbg(dep->dev, "failing the frame that predicts from %s\n",
+				dev_name(core->dev));
+			scoped_guard(spinlock_irqsave, &rkvdec->cores_lock)
+				dep->needs_reset = true;
+		}
+	}
+
+	/*
+	 * The reset work may already be waiting for the other cores: tell it
+	 * that this one, and its dependents, wait for the reset now.
+	 */
+	wake_up(&rkvdec->reset_wq);
+	schedule_work(&rkvdec->reset_work);
+
+	return false;
+}
+
+/*
  * Completes the job of @core with @state, unless the watchdog already did or
  * the core has no job: the interrupt status is acknowledged in any case, a
  * late interrupt (after a timeout) or a spurious one doesn't belong to a job.
@@ -2190,8 +2361,8 @@ static void rkvdec_irq_job_done(struct rkvdec_core *core,
 	if (WARN_ON(!ctx))
 		return;
 
-	if (state == VB2_BUF_STATE_ERROR)
-		rkvdec_core_recover(core);
+	if (state == VB2_BUF_STATE_ERROR && !rkvdec_core_failed(core))
+		return;
 	rkvdec_job_hw_done(core, state, true);
 }
 
@@ -2320,6 +2491,7 @@ static void rkvdec_watchdog_func(struct work_struct *work)
 {
 	struct rkvdec_core *core;
 	struct rkvdec_ctx *ctx;
+	bool done;
 
 	core = container_of(to_delayed_work(work), struct rkvdec_core,
 			      watchdog_work);
@@ -2328,9 +2500,10 @@ static void rkvdec_watchdog_func(struct work_struct *work)
 		dev_err_ratelimited(core->dev, "Frame processing timed out!\n");
 		/* No interrupt handler on this core while it's stopped. */
 		disable_irq(core->irq);
-		rkvdec_core_recover(core);
+		done = rkvdec_core_failed(core);
 		enable_irq(core->irq);
-		rkvdec_job_hw_done(core, VB2_BUF_STATE_ERROR, true);
+		if (done)
+			rkvdec_job_hw_done(core, VB2_BUF_STATE_ERROR, true);
 	}
 }
 
@@ -2760,6 +2933,7 @@ static void rkvdec_unbind(struct device *dev)
 
 	for (i = 0; i < rkvdec->core_count; i++)
 		cancel_delayed_work_sync(&rkvdec->cores[i]->watchdog_work);
+	cancel_work_sync(&rkvdec->reset_work);
 
 	rkvdec_v4l2_cleanup(rkvdec);
 
@@ -2825,6 +2999,8 @@ static int rkvdec_probe(struct platform_device *pdev)
 
 	mutex_init(&rkvdec->vdev_lock);
 	spin_lock_init(&rkvdec->cores_lock);
+	init_waitqueue_head(&rkvdec->reset_wq);
+	INIT_WORK(&rkvdec->reset_work, rkvdec_ccu_reset_work);
 	ida_init(&rkvdec->film_ida);
 	rkvdec->next_film_idx = 1;
 
