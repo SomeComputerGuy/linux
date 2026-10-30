@@ -2827,6 +2827,16 @@ static void tcpm_handle_vdm_request(struct tcpm_port *port,
 		port->vdm_sm_running = true;
 		rlen = tcpm_pd_svdm(port, adev, p, cnt, response, &adev_action,
 				    rx_sop_type, &response_tx_sop_type);
+	} else if (PD_VDO_SVDM(p[0]) && PD_VDO_CMDT(p[0]) != CMDT_INIT) {
+		/*
+		 * A Structured VDM response (ACK, NAK or BUSY) that does not
+		 * belong to an outstanding request, for example one that
+		 * arrives after VDMResponseTimer expired. Not_Supported is the
+		 * reply to a request the port does not support, and must not be
+		 * sent for a response: the port partner may take it as a reply
+		 * to its next message. Drop it.
+		 */
+		tcpm_log(port, "Ignoring unexpected VDM response 0x%08x", p[0]);
 	} else {
 		if (port->negotiated_rev >= PD_REV30)
 			tcpm_pd_handle_msg(port, PD_MSG_CTRL_NOT_SUPP, NONE_AMS);
