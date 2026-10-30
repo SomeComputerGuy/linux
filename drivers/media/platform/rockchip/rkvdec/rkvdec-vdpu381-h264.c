@@ -315,6 +315,8 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	/* Set TOP and BOTTOM POCs */
 	regs->h264_param.reg065_cur_top_poc = dec_params->top_field_order_cnt;
 	regs->h264_param.reg066_cur_bot_poc = dec_params->bottom_field_order_cnt;
+	rkvdec_job_add_poc(ctx, dec_params->top_field_order_cnt, false);
+	rkvdec_job_add_poc(ctx, dec_params->bottom_field_order_cnt, false);
 
 	/*
 	 * POC high bits, which tell the cores what a reference is: the field
@@ -339,10 +341,13 @@ static void config_registers(struct rkvdec_ctx *ctx,
 		 * If a DPB entry is unused or invalid, address of current destination
 		 * buffer is returned.
 		 */
-		if (vb_buf)
+		if (vb_buf) {
 			rkvdec_job_add_ref(ctx, vb_buf);
-		else
+			rkvdec_job_add_poc(ctx, dpb[i].top_field_order_cnt, true);
+			rkvdec_job_add_poc(ctx, dpb[i].bottom_field_order_cnt, true);
+		} else {
 			vb_buf = &dst_buf->vb2_buf;
+		}
 
 		buf_dma = vb2_dma_contig_plane_dma_addr(vb_buf, 0);
 
@@ -494,6 +499,9 @@ static int rkvdec_h264_run(struct rkvdec_ctx *ctx)
 	config_registers(ctx, &run);
 
 	rkvdec_run_postamble(ctx, &run.base);
+
+	/* Before the watchdog: this may wait for the earlier frames. */
+	rkvdec_job_wait_poc_alias(ctx);
 
 	rkvdec_schedule_watchdog(core, h264_ctx->regs.common.reg032_timeout_threshold);
 

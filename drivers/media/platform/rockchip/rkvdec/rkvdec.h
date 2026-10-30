@@ -167,6 +167,10 @@ struct rkvdec_coded_fmt_desc {
  * @busy: the m2m state of the job is being changed, don't complete it
  * @num_refs: number of entries in @refs
  * @refs: the CAPTURE buffers the frame predicts from
+ * @num_pocs: number of entries in @pocs
+ * @pocs: the POCs of the frame (H.264: top and bottom field)
+ * @num_ref_pocs: number of entries in @ref_pocs
+ * @ref_pocs: the POCs of the references of the frame
  */
 struct rkvdec_job {
 	struct list_head node;
@@ -181,6 +185,10 @@ struct rkvdec_job {
 	bool busy;
 	unsigned int num_refs;
 	const struct vb2_buffer *refs[RKVDEC_MAX_REFS];
+	unsigned int num_pocs;
+	s32 pocs[2];
+	unsigned int num_ref_pocs;
+	s32 ref_pocs[2 * RKVDEC_MAX_REFS];
 };
 
 struct rkvdec_core {
@@ -274,6 +282,8 @@ void rkvdec_run_postamble(struct rkvdec_ctx *ctx, struct rkvdec_run *run);
 void rkvdec_memcpy_toio(void __iomem *dst, void *src, size_t len);
 void rkvdec_schedule_watchdog(struct rkvdec_core *core, u32 timeout_threshold);
 void rkvdec_job_add_ref(struct rkvdec_ctx *ctx, const struct vb2_buffer *ref);
+void rkvdec_job_add_poc(struct rkvdec_ctx *ctx, s32 poc, bool ref);
+void rkvdec_job_wait_poc_alias(struct rkvdec_ctx *ctx);
 
 void rkvdec_quirks_disable_qos(struct rkvdec_ctx *ctx);
 
