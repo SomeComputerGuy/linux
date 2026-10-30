@@ -1354,6 +1354,7 @@ static void rkvdec_job_hw_done(struct rkvdec_core *core,
 		job->core = NULL;
 		job->state = state;
 		job->hw_done = true;
+		wake_up(&ctx->jobs_wq);
 
 		/* A core is free now: the held m2m job can be finished. */
 		held = rkvdec->held_job;
@@ -1421,6 +1422,58 @@ void rkvdec_job_add_ref(struct rkvdec_ctx *ctx, const struct vb2_buffer *ref)
 
 	if (!WARN_ON(job->num_refs >= ARRAY_SIZE(job->refs)))
 		job->refs[job->num_refs++] = ref;
+}
+
+void rkvdec_job_add_poc(struct rkvdec_ctx *ctx, s32 poc, bool ref)
+{
+	struct rkvdec_job *job = ctx->job;
+
+	if (ref) {
+		if (!WARN_ON(job->num_ref_pocs >= ARRAY_SIZE(job->ref_pocs)))
+			job->ref_pocs[job->num_ref_pocs++] = poc;
+	} else if (!WARN_ON(job->num_pocs >= ARRAY_SIZE(job->pocs))) {
+		job->pocs[job->num_pocs++] = poc;
+	}
+}
+
+/*
+ * Does an earlier frame of the stream that is still being decoded have a
+ * reference with a POC of the frame being set up? The cores identify
+ * references by POC: that earlier frame would wait for this one, which in
+ * turn waits for it.
+ */
+static bool rkvdec_job_poc_alias(struct rkvdec_ctx *ctx)
+{
+	struct rkvdec_job *job = ctx->job, *prev;
+	unsigned int i, j;
+
+	guard(spinlock_irqsave)(&ctx->dev->cores_lock);
+
+	list_for_each_entry(prev, &ctx->jobs, node) {
+		if (prev == job)
+			break;
+		if (prev->hw_done)
+			continue;
+		for (i = 0; i < prev->num_ref_pocs; i++)
+			for (j = 0; j < job->num_pocs; j++)
+				if (prev->ref_pocs[i] == job->pocs[j])
+					return true;
+	}
+
+	return false;
+}
+
+/*
+ * POCs repeat in a stream (IDR pictures, memory_management_control_operation
+ * 5, CRA): before starting a frame in CCU mode, wait for the earlier frames
+ * that would take it for one of their references.
+ */
+void rkvdec_job_wait_poc_alias(struct rkvdec_ctx *ctx)
+{
+	if (!rkvdec_ctx_uses_ccu(ctx) || !rkvdec_job_poc_alias(ctx))
+		return;
+
+	wait_event(ctx->jobs_wq, !rkvdec_job_poc_alias(ctx));
 }
 
 /* Is @buf a reference of a frame of @ctx that is still being decoded? */
@@ -2013,8 +2066,13 @@ static bool vdpu383_reset(struct rkvdec_core *core)
  */
 static bool rkvdec_core_recover(struct rkvdec_core *core)
 {
+	struct rkvdec_ccu *ccu = core->rkvdec->ccu;
 	bool idle;
 	int ret;
+
+	/* Force it idle in the CCU, so that the other cores don't wait for it. */
+	if (ccu)
+		rkvdec_ccu_disconnect(ccu, core);
 
 	if (!READ_ONCE(core->stopped) && core->variant->ops->wait_stopped &&
 	    !core->variant->ops->wait_stopped(core))
@@ -2041,6 +2099,9 @@ static bool rkvdec_core_recover(struct rkvdec_core *core)
 	if (!idle) {
 		dev_err(core->dev, "disabling the core\n");
 		WRITE_ONCE(core->broken, true);
+	} else if (ccu) {
+		/* Clear its error state in the CCU and connect it again. */
+		rkvdec_ccu_reconnect(ccu, core);
 	}
 
 	return idle;
@@ -2209,7 +2270,7 @@ static void rkvdec_watchdog_func(struct work_struct *work)
 			      watchdog_work);
 	ctx = core->curr_ctx;
 	if (ctx) {
-		dev_err(core->dev, "Frame processing timed out!\n");
+		dev_err_ratelimited(core->dev, "Frame processing timed out!\n");
 		/* No interrupt handler on this core while it's stopped. */
 		disable_irq(core->irq);
 		rkvdec_core_recover(core);
