@@ -58,9 +58,10 @@ void rkvdec_ccu_put(struct rkvdec_ccu *ccu)
 }
 
 /*
- * Only formats whose frames are pipelined (H.264, HEVC) run in CCU mode. The
- * VP9 back-end doesn't program the POC, probability and segmentation-map
- * references the cores synchronize VP9 on, and decodes garbage in CCU mode.
+ * Only formats whose back-end programs what the cores synchronize on (the
+ * POCs of the frame and of its references, for VP9 also those of the frames
+ * that saved the probabilities and the segment IDs it reads), see
+ * RKVDEC_FMT_FLAG_PIPELINE, run in CCU mode.
  */
 bool rkvdec_ctx_uses_ccu(struct rkvdec_ctx *ctx)
 {
