@@ -41,6 +41,8 @@ module_param(debug, bool, 0644);
 #define TRANS_RUNNING		(1 << 1)
 /* Instance is currently aborting */
 #define TRANS_ABORT		(1 << 2)
+/* The held capture buffer is used by detached jobs */
+#define TRANS_HELD_DETACHED	BIT(3)
 
 
 /* The job queue is not running new jobs */
@@ -309,6 +311,32 @@ static void v4l2_m2m_try_run(struct v4l2_m2m_dev *m2m_dev)
 }
 
 /*
+ * v4l2_m2m_release_held_buf() - release the held capture buffer
+ * @m2m_ctx: m2m context
+ * @vbuf: the held capture buffer, first on the capture ready list
+ *
+ * Takes the held capture buffer off the ready list and returns it, unless
+ * detached jobs still write it: the driver then returns it with
+ * v4l2_m2m_detached_buf_done() once they are done.
+ *
+ * Must be called with job_spinlock held.
+ */
+static void v4l2_m2m_release_held_buf(struct v4l2_m2m_ctx *m2m_ctx,
+				      struct vb2_v4l2_buffer *vbuf)
+{
+	vbuf->is_held = false;
+	v4l2_m2m_dst_buf_remove(m2m_ctx);
+
+	if (m2m_ctx->job_flags & TRANS_HELD_DETACHED) {
+		dprintk("Held capture buffer still in use, the driver returns it\n");
+		m2m_ctx->job_flags &= ~TRANS_HELD_DETACHED;
+		return;
+	}
+
+	v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_DONE);
+}
+
+/*
  * __v4l2_m2m_try_queue() - queue a job
  * @m2m_dev: m2m device
  * @m2m_ctx: m2m context
@@ -364,9 +392,7 @@ static void __v4l2_m2m_try_queue(struct v4l2_m2m_dev *m2m_dev,
 	    dst->vb2_buf.copied_timestamp &&
 	    dst->vb2_buf.timestamp != src->vb2_buf.timestamp) {
 		dprintk("Timestamp mismatch, returning held capture buffer\n");
-		dst->is_held = false;
-		v4l2_m2m_dst_buf_remove(m2m_ctx);
-		v4l2_m2m_buf_done(dst, VB2_BUF_STATE_DONE);
+		v4l2_m2m_release_held_buf(m2m_ctx, dst);
 		dst = v4l2_m2m_next_dst_buf(m2m_ctx);
 
 		if (!dst && !m2m_ctx->cap_q_ctx.buffered) {
@@ -548,7 +574,11 @@ void v4l2_m2m_buf_done_and_job_finish(struct v4l2_m2m_dev *m2m_dev,
 	dst_buf->is_held = src_buf->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF;
 	if (!dst_buf->is_held) {
 		v4l2_m2m_dst_buf_remove(m2m_ctx);
-		v4l2_m2m_buf_done(dst_buf, state);
+		/* Detached jobs may still write a held buffer. */
+		if (m2m_ctx->job_flags & TRANS_HELD_DETACHED)
+			m2m_ctx->job_flags &= ~TRANS_HELD_DETACHED;
+		else
+			v4l2_m2m_buf_done(dst_buf, state);
 	}
 	/*
 	 * If the request API is being used, returning the OUTPUT
@@ -587,13 +617,17 @@ bool v4l2_m2m_buf_detach_and_job_finish(struct v4l2_m2m_dev *m2m_dev,
 	if (WARN_ON(!src || !dst))
 		goto unlock;
 
-	/* A held capture buffer must stay on the queue for the next job. */
-	if (src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF)
-		goto unlock;
-
 	v4l2_m2m_src_buf_remove(m2m_ctx);
-	v4l2_m2m_dst_buf_remove(m2m_ctx);
-	dst->is_held = false;
+	if (src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF) {
+		/* The held capture buffer stays on the queue for the next job. */
+		dst->is_held = true;
+		m2m_ctx->job_flags |= TRANS_HELD_DETACHED;
+	} else {
+		/* The driver owns it now, even if it was held. */
+		v4l2_m2m_dst_buf_remove(m2m_ctx);
+		dst->is_held = false;
+		m2m_ctx->job_flags &= ~TRANS_HELD_DETACHED;
+	}
 	*src_buf = src;
 	*dst_buf = dst;
 	schedule_next = _v4l2_m2m_job_finish(m2m_dev, m2m_ctx);
@@ -606,6 +640,28 @@ unlock:
 	return schedule_next;
 }
 EXPORT_SYMBOL_GPL(v4l2_m2m_buf_detach_and_job_finish);
+
+bool v4l2_m2m_detached_buf_done(struct v4l2_m2m_ctx *m2m_ctx,
+				struct vb2_v4l2_buffer *vbuf,
+				enum vb2_buffer_state state)
+{
+	struct v4l2_m2m_dev *m2m_dev = m2m_ctx->m2m_dev;
+	unsigned long flags;
+	bool done = false;
+
+	spin_lock_irqsave(&m2m_dev->job_spinlock, flags);
+	if (vbuf->is_held) {
+		/* Still held for the next job, which returns it as usual. */
+		m2m_ctx->job_flags &= ~TRANS_HELD_DETACHED;
+	} else {
+		v4l2_m2m_buf_done(vbuf, state);
+		done = true;
+	}
+	spin_unlock_irqrestore(&m2m_dev->job_spinlock, flags);
+
+	return done;
+}
+EXPORT_SYMBOL_GPL(v4l2_m2m_detached_buf_done);
 
 void v4l2_m2m_suspend(struct v4l2_m2m_dev *m2m_dev)
 {
@@ -1672,9 +1728,7 @@ int v4l2_m2m_ioctl_stateless_decoder_cmd(struct file *file, void *priv,
 		 * capture buffer that is held, then release that
 		 * buffer.
 		 */
-		cap_vb->is_held = false;
-		v4l2_m2m_dst_buf_remove(fh->m2m_ctx);
-		v4l2_m2m_buf_done(cap_vb, VB2_BUF_STATE_DONE);
+		v4l2_m2m_release_held_buf(fh->m2m_ctx, cap_vb);
 	}
 	spin_unlock_irqrestore(&m2m_dev->job_spinlock, flags);
 
