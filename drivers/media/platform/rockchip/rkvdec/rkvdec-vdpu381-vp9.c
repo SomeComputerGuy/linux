@@ -458,17 +458,15 @@ static void config_ref_registers(struct rkvdec_ctx *ctx,
 				 struct rkvdec_decoded_buffer *ref_buf,
 				 int i)
 {
-	unsigned int aligned_pitch, aligned_height, y_len;
 	struct rkvdec_vp9_ctx *vp9_ctx = ctx->priv;
 	struct rkvdec_vdpu381_regs_vp9 *regs = &vp9_ctx->regs;
+	unsigned int pitch, y_len;
 
 	/*
-	 * Every CAPTURE buffer has the layout of the decoded format, whatever
-	 * the size of the frame stored in it, so plane offsets come from the
-	 * format while the frame size registers use the frame's own size.
+	 * The plane layout of a reference is the one its buffer had when it
+	 * was decoded (see store_buf_layout()), the frame size registers use
+	 * the frame's own size, which can be smaller.
 	 */
-	aligned_height = round_up(ctx->decoded_fmt.fmt.pix_mp.height, 64);
-
 	switch (i) {
 	case 0:
 		regs->vp9_param.reg107.vp9_frameheight_last = ref_buf->vp9.height;
@@ -502,24 +500,23 @@ static void config_ref_registers(struct rkvdec_ctx *ctx,
 	if (&ref_buf->base.vb == run->base.bufs.dst)
 		return;
 
-	/* Real buffer stride, not display-width-derived (see config_registers). */
-	aligned_pitch = ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
-	y_len = aligned_height * aligned_pitch;
+	pitch = ref_buf->vp9.bytesperline;
+	y_len = ref_buf->vp9.luma_size;
 
 	switch (i) {
 	case 0:
-		regs->vp9_param.reg79.vp9_lastfy_hor_virstride = aligned_pitch / 16;
-		regs->vp9_param.reg80.vp9_lastfuv_hor_virstride = aligned_pitch / 16;
+		regs->vp9_param.reg79.vp9_lastfy_hor_virstride = pitch / 16;
+		regs->vp9_param.reg80.vp9_lastfuv_hor_virstride = pitch / 16;
 		regs->vp9_param.reg85.vp9_lastfy_virstride = y_len / 16;
 		break;
 	case 1:
-		regs->vp9_param.reg81.vp9_goldenfy_hor_virstride = aligned_pitch / 16;
-		regs->vp9_param.reg82.vp9_goldenuv_hor_virstride = aligned_pitch / 16;
+		regs->vp9_param.reg81.vp9_goldenfy_hor_virstride = pitch / 16;
+		regs->vp9_param.reg82.vp9_goldenuv_hor_virstride = pitch / 16;
 		regs->vp9_param.reg86.vp9_goldeny_virstride = y_len / 16;
 		break;
 	case 2:
-		regs->vp9_param.reg83.vp9_altreffy_hor_virstride = aligned_pitch / 16;
-		regs->vp9_param.reg84.vp9_altreff_uv_hor_virstride = aligned_pitch / 16;
+		regs->vp9_param.reg83.vp9_altreffy_hor_virstride = pitch / 16;
+		regs->vp9_param.reg84.vp9_altreff_uv_hor_virstride = pitch / 16;
 		regs->vp9_param.reg87.vp9_altrefy_virstride = y_len / 16;
 		break;
 	}
@@ -597,17 +594,38 @@ static void rkvdec_write_regs(struct rkvdec_ctx *ctx)
 			   sizeof(vp9_ctx->regs.vp9_addr));
 }
 
-static dma_addr_t get_mv_base_addr(struct rkvdec_ctx *ctx, struct rkvdec_decoded_buffer *buf)
+static dma_addr_t get_mv_base_addr(struct rkvdec_decoded_buffer *buf)
 {
-	unsigned int aligned_pitch, aligned_height, yuv_len;
-
-	aligned_height = round_up(ctx->decoded_fmt.fmt.pix_mp.height, 64);
-
-	aligned_pitch = ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
-	yuv_len = (aligned_height * aligned_pitch * 3) / 2;
-
 	return vb2_dma_contig_plane_dma_addr(&buf->base.vb.vb2_buf, 0) +
-	       yuv_len;
+	       buf->vp9.colmv_offset;
+}
+
+/*
+ * A reference: the CAPTURE buffer holding the frame with that timestamp. A
+ * buffer that no frame was decoded into has no layout (and, after
+ * VIDIOC_CREATE_BUFS, no meaningful timestamp): use the current one instead,
+ * as for a missing reference.
+ */
+static struct rkvdec_decoded_buffer *
+get_decoded_ref(struct rkvdec_ctx *ctx, struct rkvdec_decoded_buffer *dst,
+		u64 timestamp)
+{
+	struct rkvdec_decoded_buffer *buf;
+
+	buf = get_ref_buf_vp9(ctx, &dst->base.vb, timestamp);
+	return buf->vp9.luma_size ? buf : dst;
+}
+
+/* Remember the layout of the CAPTURE format the frame is decoded with. */
+static void store_buf_layout(struct rkvdec_ctx *ctx,
+			     struct rkvdec_decoded_buffer *buf)
+{
+	const struct v4l2_pix_format_mplane *pix_mp = &ctx->decoded_fmt.fmt.pix_mp;
+
+	buf->vp9.bytesperline = pix_mp->plane_fmt[0].bytesperline;
+	buf->vp9.luma_size = round_up(pix_mp->height, 64) *
+			     buf->vp9.bytesperline;
+	buf->vp9.colmv_offset = ctx->colmv_offset;
 }
 
 /*
@@ -730,12 +748,14 @@ static void config_registers(struct rkvdec_ctx *ctx,
 
 	dec_params = run->decode_params;
 	dst = vb2_to_rkvdec_decoded_buf(&run->base.bufs.dst->vb2_buf);
-	ref_bufs[0] = get_ref_buf_vp9(ctx, &dst->base.vb, dec_params->last_frame_ts);
-	ref_bufs[1] = get_ref_buf_vp9(ctx, &dst->base.vb, dec_params->golden_frame_ts);
-	ref_bufs[2] = get_ref_buf_vp9(ctx, &dst->base.vb, dec_params->alt_frame_ts);
+	/* The layout of dst must be set before references fall back to it. */
+	store_buf_layout(ctx, dst);
+	ref_bufs[0] = get_decoded_ref(ctx, dst, dec_params->last_frame_ts);
+	ref_bufs[1] = get_decoded_ref(ctx, dst, dec_params->golden_frame_ts);
+	ref_bufs[2] = get_decoded_ref(ctx, dst, dec_params->alt_frame_ts);
 
 	if (vp9_ctx->last.valid)
-		last = get_ref_buf_vp9(ctx, &dst->base.vb, vp9_ctx->last.timestamp);
+		last = get_decoded_ref(ctx, dst, vp9_ctx->last.timestamp);
 	else
 		last = dst;
 
@@ -953,7 +973,7 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	regs->common_addr.error_ref_base = dst_addr;
 
 	/* Set colmv address */
-	regs->common_addr.colmv_cur_base = dst_addr + ctx->colmv_offset;
+	regs->common_addr.colmv_cur_base = get_mv_base_addr(dst);
 
 	/* Set RCB addresses */
 	for (i = 0; i < rkvdec_rcb_buf_count(ctx); i++)
@@ -971,7 +991,7 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	else
 		mv_ref = dst;
 
-	regs->vp9_addr.vp9_refcolmv_base = get_mv_base_addr(ctx, mv_ref);
+	regs->vp9_addr.vp9_refcolmv_base = get_mv_base_addr(mv_ref);
 	regs->vp9_param.reg98_vp9_col_ref_poc = mv_ref->vp9.poc;
 	if (mv_ref != dst)
 		rkvdec_job_add_ref(ctx, &mv_ref->base.vb.vb2_buf);

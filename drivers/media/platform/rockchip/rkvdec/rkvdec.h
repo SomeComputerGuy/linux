@@ -61,6 +61,14 @@ struct rkvdec_vp9_decoded_buffer_info {
 	unsigned int bit_depth : 4;
 	/* Tells the frame apart from the other frames of the stream in the CCU */
 	u16 poc;
+	/*
+	 * Layout of the buffer when the frame was decoded (VDPU381): the
+	 * buffers of a stream can have different sizes after a resolution
+	 * change on an inter frame.
+	 */
+	u32 bytesperline;
+	u32 luma_size;
+	u32 colmv_offset;
 };
 
 struct rkvdec_decoded_buffer {
