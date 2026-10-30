@@ -481,6 +481,7 @@ static int rkvdec_h264_run(struct rkvdec_ctx *ctx)
 	struct rkvdec_h264_ctx *h264_ctx = ctx->priv;
 	struct rkvdec_h264_priv_tbl *tbl = rkvdec_h264_priv_tbl(ctx)->cpu;
 	struct rkvdec_h264_run run;
+	int ret;
 
 	rkvdec_h264_run_preamble(ctx, &run);
 
@@ -501,7 +502,9 @@ static int rkvdec_h264_run(struct rkvdec_ctx *ctx)
 	rkvdec_run_postamble(ctx, &run.base);
 
 	/* Before the watchdog: this may wait for the earlier frames. */
-	rkvdec_job_wait_poc_alias(ctx);
+	ret = rkvdec_job_wait_poc_alias(ctx);
+	if (ret)
+		return ret;
 
 	rkvdec_schedule_watchdog(core, h264_ctx->regs.common.reg032_timeout_threshold);
 

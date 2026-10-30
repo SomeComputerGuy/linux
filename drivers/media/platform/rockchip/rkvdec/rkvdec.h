@@ -167,6 +167,7 @@ struct rkvdec_coded_fmt_desc {
  *	      finished, so the next frame may start before this one is done
  * @hw_done: the hardware is done with the frame
  * @busy: the m2m state of the job is being changed, don't complete it
+ * @started: the hardware was started, or the job failed before that
  * @dst_shared: an earlier job wrote @dst too (the other field of the frame)
  *		and left returning it to this one
  * @dst_error: an earlier job that wrote @dst failed
@@ -188,6 +189,7 @@ struct rkvdec_job {
 	bool detached;
 	bool hw_done;
 	bool busy;
+	bool started;
 	bool dst_shared;
 	bool dst_error;
 	unsigned int num_refs;
@@ -214,6 +216,7 @@ struct rkvdec_core {
 	bool stopped;
 	struct gen_pool *sram_pool;
 	struct iommu_domain *empty_domain;
+	bool needs_reset;
 	struct rkvdec_rcb_config *rcb_config;
 	struct rkvdec_ctx *curr_ctx;
 	struct rkvdec_job *job;
@@ -240,6 +243,10 @@ struct rkvdec_dev {
 	struct rkvdec_ccu *ccu;
 	struct ida film_ida;
 	int next_film_idx;
+	bool ccu_reset_pending;
+	struct rkvdec_ctx *deferred_ctx;
+	wait_queue_head_t reset_wq;
+	struct work_struct reset_work;
 };
 
 struct rkvdec_ctx {
@@ -291,7 +298,7 @@ void rkvdec_memcpy_toio(void __iomem *dst, void *src, size_t len);
 void rkvdec_schedule_watchdog(struct rkvdec_core *core, u32 timeout_threshold);
 void rkvdec_job_add_ref(struct rkvdec_ctx *ctx, const struct vb2_buffer *ref);
 void rkvdec_job_add_poc(struct rkvdec_ctx *ctx, s32 poc, bool ref);
-void rkvdec_job_wait_poc_alias(struct rkvdec_ctx *ctx);
+int rkvdec_job_wait_poc_alias(struct rkvdec_ctx *ctx);
 
 void rkvdec_quirks_disable_qos(struct rkvdec_ctx *ctx);
 
