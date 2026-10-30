@@ -31,6 +31,7 @@
 #include <linux/usb/of.h>
 
 #include "ohci.h"
+#include "../core/phy.h"
 
 #define DRIVER_DESC "OHCI generic platform driver"
 #define OHCI_MAX_CLKS 4
@@ -312,7 +313,26 @@ static int ohci_platform_resume_common(struct device *dev, bool hibernated)
 		}
 	}
 
+	/*
+	 * The USB core powered the root hub PHYs off when it suspended the
+	 * root hub, and only powers them up again in hcd_bus_resume(), which
+	 * runs after this. On some SoCs (RK3588) the OHCI registers are not
+	 * accessible while the PHY is down: ohci_resume() would hang the bus.
+	 * Keep the PHYs up while ohci_resume() touches the controller. The
+	 * PHY framework counts these calls, so this nests with the companion
+	 * controller and with the root hub's own resume.
+	 */
+	err = usb_phy_roothub_resume(hcd->self.sysdev, hcd->phy_roothub);
+	if (err) {
+		if (pdata->power_off)
+			pdata->power_off(pdev);
+		reset_control_assert(priv->resets);
+		return err;
+	}
+
 	ohci_resume(hcd, hibernated);
+
+	usb_phy_roothub_suspend(hcd->self.sysdev, hcd->phy_roothub);
 
 	pm_runtime_disable(dev);
 	pm_runtime_set_active(dev);
