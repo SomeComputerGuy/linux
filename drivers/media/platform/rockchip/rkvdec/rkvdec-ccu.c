@@ -60,7 +60,7 @@ void rkvdec_ccu_put(struct rkvdec_ccu *ccu)
  * VP9 back-end doesn't program the POC, probability and segmentation-map
  * references the cores synchronize VP9 on, and decodes garbage in CCU mode.
  */
-static bool rkvdec_ctx_uses_ccu(struct rkvdec_ctx *ctx)
+bool rkvdec_ctx_uses_ccu(struct rkvdec_ctx *ctx)
 {
 	return ctx->dev->ccu &&
 	       (ctx->coded_fmt_desc->flags & RKVDEC_FMT_FLAG_PIPELINE);
