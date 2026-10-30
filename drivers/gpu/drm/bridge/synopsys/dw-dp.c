@@ -364,6 +364,8 @@ struct dw_dp {
 	u8 pixel_mode;
 	bool usbc_mode;
 	bool usbc_hpd;
+	/* the last detect() found a sink answering on AUX */
+	bool sink_detected;
 	bool pm_active;
 
 	struct drm_bridge *next_bridge;
@@ -2097,11 +2099,18 @@ static enum drm_connector_status dw_dp_bridge_detect(struct drm_bridge *bridge,
 	if (PM_RUNTIME_ACQUIRE_ERR(&pm))
 		return connector_status_disconnected;
 
+	WRITE_ONCE(dp->sink_detected, false);
+
 	if (!dw_dp_hpd_detect(dp))
 		return connector_status_disconnected;
 
-	if (!dw_dp_hpd_detect_link(dp, connector))
+	if (!dw_dp_hpd_detect_link(dp, connector)) {
+		dev_warn_ratelimited(dp->dev,
+				     "HPD is high, but the sink does not respond on AUX\n");
 		return connector_status_disconnected;
+	}
+
+	WRITE_ONCE(dp->sink_detected, true);
 
 	return connector_status_connected;
 }
@@ -2387,6 +2396,21 @@ static int dw_dp_link_retrain(struct dw_dp *dp)
 	return ret;
 }
 
+/* A branch device signals changes on its downstream ports with IRQ_HPD */
+static bool dw_dp_downstream_port_changed(struct dw_dp *dp)
+{
+	u8 status;
+	int ret;
+
+	/* AUX goes through the PHY, which is off while the link is disabled */
+	if (phy_power_on(dp->phy))
+		return false;
+	ret = drm_dp_dpcd_readb(&dp->aux, DP_LANE_ALIGN_STATUS_UPDATED, &status);
+	phy_power_off(dp->phy);
+
+	return ret == 1 && (status & DP_DOWNSTREAM_PORT_STATUS_CHANGED);
+}
+
 static void dw_dp_hpd_work(struct work_struct *work)
 {
 	struct dw_dp *dp = container_of(work, struct dw_dp, hpd_work);
@@ -2403,6 +2427,20 @@ static void dw_dp_hpd_work(struct work_struct *work)
 	mutex_unlock(&dp->irq_lock);
 
 	dev_dbg(dp->dev, "[drm] Get hpd irq - %s\n", long_hpd ? "long" : "short");
+
+	/*
+	 * A short pulse (IRQ_HPD, or a DP Alt Mode Attention with HPD still
+	 * high) is only a link status check if the sink was detected. If the
+	 * last detection failed while HPD was high, e.g. because the sink was
+	 * hung or still powering up and did not answer on AUX, nothing else
+	 * would ever detect it again, as HPD does not go low: treat the pulse
+	 * as a hotplug event. The same applies when a branch device reports a
+	 * change on its downstream port (a DP-to-HDMI converter whose monitor
+	 * was power cycled).
+	 */
+	if (!long_hpd && (!READ_ONCE(dp->sink_detected) ||
+			  dw_dp_downstream_port_changed(dp)))
+		long_hpd = true;
 
 	if (!long_hpd) {
 		if (dw_dp_needs_link_retrain(dp)) {
