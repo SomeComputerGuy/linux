@@ -3891,11 +3891,22 @@ static void tcpm_pd_ctrl_request(struct tcpm_port *port,
 			break;
 		case SRC_READY:
 		case SNK_READY:
-			if (port->vdm_state > VDM_STATE_READY) {
+			/* The reply to the VDM that is waiting for a response */
+			if (port->vdm_state == VDM_STATE_BUSY) {
 				port->vdm_state = VDM_STATE_DONE;
 				if (tcpm_vdm_ams(port))
 					tcpm_ams_finish(port);
 				mod_vdm_delayed_work(port, 0);
+				break;
+			}
+			/*
+			 * The VDM is still to be sent, after tSinkTx or after
+			 * the partner answered BUSY, so this Message is not a
+			 * reply to it. Send the VDM as planned.
+			 */
+			if (port->vdm_state > VDM_STATE_READY) {
+				tcpm_log(port, "Ignoring ctrl msg %d, VDM not sent yet",
+					 type);
 				break;
 			}
 			fallthrough;
