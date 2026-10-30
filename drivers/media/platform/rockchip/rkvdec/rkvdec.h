@@ -144,6 +144,13 @@ struct rkvdec_decoded_fmt_desc {
  */
 #define RKVDEC_FMT_FLAG_PIPELINE	BIT(0)
 
+/*
+ * The back-end decodes with references of another size and stores the layout
+ * of each frame with it: the frame size can change while streaming
+ * (VIDIOC_REMOVE_BUFS / VIDIOC_CREATE_BUFS).
+ */
+#define RKVDEC_FMT_FLAG_RES_CHANGE	BIT(1)
+
 struct rkvdec_coded_fmt_desc {
 	u32 fourcc;
 	struct v4l2_frmsize_stepwise frmsize;
