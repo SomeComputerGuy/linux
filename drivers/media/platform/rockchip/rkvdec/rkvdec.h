@@ -175,6 +175,7 @@ struct rkvdec_coded_fmt_desc {
  * @refs: the CAPTURE buffers the frame predicts from
  * @num_pocs: number of entries in @pocs
  * @pocs: the POCs of the frame (H.264: top and bottom field)
+ * @field_pic: an H.264 field picture
  * @num_ref_pocs: number of entries in @ref_pocs
  * @ref_pocs: the POCs of the references of the frame
  */
@@ -196,6 +197,7 @@ struct rkvdec_job {
 	const struct vb2_buffer *refs[RKVDEC_MAX_REFS];
 	unsigned int num_pocs;
 	s32 pocs[2];
+	bool field_pic;
 	unsigned int num_ref_pocs;
 	s32 ref_pocs[2 * RKVDEC_MAX_REFS];
 };
