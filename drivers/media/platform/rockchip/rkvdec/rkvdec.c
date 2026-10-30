@@ -1453,7 +1453,7 @@ static int rkvdec_job_ready(void *priv)
 		return 1;
 
 	/* Only formats with more than one job slot can be pipelined. */
-	if (ctx->num_jobs >= ctx->num_job_slots)
+	if (ctx->num_jobs >= ctx->num_job_slots || !rkvdec_ctx_uses_ccu(ctx))
 		return 0;
 
 	/* A CAPTURE buffer shared by two jobs (two fields): one at a time. */
@@ -1749,10 +1749,19 @@ static int rkvdec_open(struct file *filp)
 	mutex_init(&ctx->done_lock);
 	ctx->num_job_slots = 1;
 
-	ret = ida_alloc_range(&rkvdec->film_ida, 1, RKVDEC_MAX_FILM_IDX, GFP_KERNEL);
+	/*
+	 * Don't hand the film index of a stream that just ended to the next
+	 * one: start after the last one given out.
+	 */
+	ret = ida_alloc_range(&rkvdec->film_ida, READ_ONCE(rkvdec->next_film_idx),
+			      RKVDEC_MAX_FILM_IDX, GFP_KERNEL);
+	if (ret < 0)
+		ret = ida_alloc_range(&rkvdec->film_ida, 1, RKVDEC_MAX_FILM_IDX,
+				      GFP_KERNEL);
 	if (ret < 0)
 		goto err_free_ctx;
 	ctx->film_idx = ret;
+	WRITE_ONCE(rkvdec->next_film_idx, ret < RKVDEC_MAX_FILM_IDX ? ret + 1 : 1);
 
 	rkvdec_reset_coded_fmt(ctx);
 	rkvdec_reset_decoded_fmt(ctx);
@@ -2701,6 +2710,7 @@ static int rkvdec_probe(struct platform_device *pdev)
 	mutex_init(&rkvdec->vdev_lock);
 	spin_lock_init(&rkvdec->cores_lock);
 	ida_init(&rkvdec->film_ida);
+	rkvdec->next_film_idx = 1;
 
 	dev_set_drvdata(dev, rkvdec);
 

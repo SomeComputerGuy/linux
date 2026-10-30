@@ -233,6 +233,8 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	u32 y_virstride;
 	u32 offset;
 	u32 pixels;
+	bool field_pic;
+	u32 *highpoc;
 	u32 i;
 
 	memset(regs, 0, sizeof(*regs));
@@ -314,10 +316,24 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	regs->h264_param.reg065_cur_top_poc = dec_params->top_field_order_cnt;
 	regs->h264_param.reg066_cur_bot_poc = dec_params->bottom_field_order_cnt;
 
+	/*
+	 * POC high bits, which tell the cores what a reference is: the field
+	 * parity of field pictures, 3 for unused entries of frame pictures.
+	 */
+	field_pic = !!(dec_params->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC);
+	highpoc = (u32 *)&regs->h264_highpoc;
+	if (field_pic && (dec_params->flags & V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD))
+		highpoc[4] = 1;
+
 	/* Set ref pic address & poc */
 	for (i = 0; i < ARRAY_SIZE(dec_params->dpb); i++) {
 		struct vb2_buffer *vb_buf = run->ref_buf[i];
 		dma_addr_t buf_dma;
+
+		if (field_pic)
+			highpoc[i / 4] |= 0x10 << ((i % 4) * 8);
+		else if (!vb_buf)
+			highpoc[i / 4] |= 0x33 << ((i % 4) * 8);
 
 		/*
 		 * If a DPB entry is unused or invalid, address of current destination
