@@ -224,6 +224,7 @@ struct rkvdec_dev {
 	struct rkvdec_job *held_job;
 	struct rkvdec_ccu *ccu;
 	struct ida film_ida;
+	int next_film_idx;
 };
 
 struct rkvdec_ctx {

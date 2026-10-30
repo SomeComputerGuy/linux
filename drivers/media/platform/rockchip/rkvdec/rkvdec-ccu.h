@@ -19,6 +19,7 @@ void rkvdec_ccu_release(struct rkvdec_ccu *ccu);
 
 int rkvdec_ccu_get(struct rkvdec_ccu *ccu);
 void rkvdec_ccu_put(struct rkvdec_ccu *ccu);
+bool rkvdec_ctx_uses_ccu(struct rkvdec_ctx *ctx);
 void rkvdec_ccu_prepare(struct rkvdec_ctx *ctx);
 void rkvdec_ccu_start(struct rkvdec_ctx *ctx);
 void rkvdec_vdpu381_set_ccu_regs(struct rkvdec_ctx *ctx,
