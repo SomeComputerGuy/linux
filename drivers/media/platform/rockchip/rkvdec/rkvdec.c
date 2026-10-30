@@ -135,8 +135,19 @@ static void rkvdec_fill_decoded_pixfmt(struct rkvdec_ctx *ctx,
 		plane->bytesperline = aligned_bpl;
 	}
 
-	ctx->colmv_offset = plane->sizeimage;
 	plane->sizeimage += variant->ops->colmv_size(pix_mp->width, pix_mp->height);
+}
+
+/*
+ * The co-located motion vectors follow the pixel data of a decoded buffer.
+ * Only a format that is set (not one that is tried) moves them.
+ */
+static void rkvdec_update_colmv_offset(struct rkvdec_ctx *ctx)
+{
+	const struct v4l2_pix_format_mplane *pix_mp = &ctx->decoded_fmt.fmt.pix_mp;
+
+	ctx->colmv_offset = pix_mp->plane_fmt[0].sizeimage -
+		ctx->dev->variant->ops->colmv_size(pix_mp->width, pix_mp->height);
 }
 
 static void rkvdec_reset_fmt(struct rkvdec_ctx *ctx, struct v4l2_format *f,
@@ -162,6 +173,7 @@ static void rkvdec_reset_decoded_fmt(struct rkvdec_ctx *ctx)
 	f->fmt.pix_mp.width = ctx->coded_fmt.fmt.pix_mp.width;
 	f->fmt.pix_mp.height = ctx->coded_fmt.fmt.pix_mp.height;
 	rkvdec_fill_decoded_pixfmt(ctx, &f->fmt.pix_mp);
+	rkvdec_update_colmv_offset(ctx);
 }
 
 static int rkvdec_try_ctrl(struct v4l2_ctrl *ctrl)
@@ -937,6 +949,7 @@ static int rkvdec_s_capture_fmt(struct file *file, void *priv,
 		return ret;
 
 	ctx->decoded_fmt = *f;
+	rkvdec_update_colmv_offset(ctx);
 	return 0;
 }
 
