@@ -22,6 +22,12 @@
  * frame context buffers, which only the hardware writes, and a table of the
  * default probabilities for the contexts that were reset.
  *
+ * On the RK3588, consecutive frames of a stream may be decoded on both cores
+ * at the same time: the CCU makes a core wait for the parts of the frames it
+ * predicts from, of the probabilities and of the segment IDs it reads that
+ * the other core is still writing. The frames are told apart by POCs, which
+ * the driver takes from a frame counter of the stream.
+ *
  * For following the VP9 spec, start reading this code from rkvdec_vp9_run().
  */
 
@@ -161,6 +167,14 @@ struct rkvdec_vp9_ctx {
 	struct rkvdec_aux_buf job_tbl[RKVDEC_MAX_JOBS];
 	/* The frame contexts the hardware saved, the others hold the defaults */
 	bool ctx_saved[VDPU381_VP9_NUM_FRAME_CTXS];
+	/*
+	 * POCs, from a frame counter, of the last frame of the stream, of the
+	 * last frames that saved each frame context, and of the last frame
+	 * that wrote the segment IDs.
+	 */
+	u16 poc;
+	u16 ctx_poc[VDPU381_VP9_NUM_FRAME_CTXS];
+	u16 segmap_poc;
 	struct rkvdec_vp9_frame_info cur;
 	struct rkvdec_vp9_frame_info last;
 	struct rkvdec_vdpu381_regs_vp9 regs;
@@ -645,6 +659,8 @@ static void config_prob_registers(struct rkvdec_ctx *ctx,
 		regs->vp9_addr.vp9_last_prob_base = ctx_probs +
 			fctx_idx * sizeof(union vdpu381_vp9_prob_tbl);
 		regs->common.reg028_multiply_core_ctrl.vp9_rd_prob_idx = fctx_idx + 1;
+		/* The CCU makes the core wait until that frame saved them. */
+		regs->vp9_param.reg99.vp9_prob_ref_poc = vp9_ctx->ctx_poc[fctx_idx];
 	} else {
 		regs->vp9_addr.vp9_last_prob_base = vp9_ctx->stream_tbl.dma +
 			offsetof(struct vdpu381_vp9_stream_tbl, default_probs);
@@ -656,6 +672,14 @@ static void config_prob_registers(struct rkvdec_ctx *ctx,
 	regs->common.reg028_multiply_core_ctrl.vp9_wr_prob_idx = fctx_idx + 1;
 	if (refresh)
 		vp9_ctx->ctx_saved[fctx_idx] = true;
+	/*
+	 * MPP records a frame as the last writer of its frame context unless
+	 * it is decoded in frame parallel mode, whether it saves the context
+	 * or not. Record a frame parallel one too if it saves the context:
+	 * the next frame reading the context must wait for it.
+	 */
+	if (refresh || !parallel)
+		vp9_ctx->ctx_poc[fctx_idx] = vp9_ctx->poc;
 
 	regs->vp9_addr.vp9_delta_prob_base = job_buf->dma +
 		offsetof(struct vdpu381_vp9_job_tbl, updates);
@@ -717,6 +741,10 @@ static void config_registers(struct rkvdec_ctx *ctx,
 
 	update_dec_buf_info(dst, dec_params);
 	update_ctx_cur_info(vp9_ctx, dst, dec_params);
+
+	/* Frame counter, 1 to 0xffff, 0 stands for no frame (MPP vp9_alloc_frame()) */
+	vp9_ctx->poc = vp9_ctx->poc % 0xffff + 1;
+	dst->vp9.poc = vp9_ctx->poc;
 	seg = &dec_params->seg;
 
 	intra_only = !!(dec_params->flags &
@@ -731,6 +759,7 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	memset(regs, 0, sizeof(*regs));
 
 	regs->common.reg009_dec_mode.dec_mode = VDPU381_MODE_VP9;
+	regs->vp9_param.cur_top_poc = dst->vp9.poc;
 	rkvdec_vdpu381_set_ccu_regs(ctx, &regs->common);
 
 	config_prob_registers(ctx, run, intra_only);
@@ -800,6 +829,15 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	regs->vp9_param.reg75.vp9_segment_id_update = segmap_update;
 
 	/*
+	 * The CCU makes a frame reading the segment IDs of an earlier frame
+	 * wait for them. As in MPP, a frame coding a new map doesn't wait.
+	 */
+	if (segmap_update)
+		vp9_ctx->segmap_poc = dst->vp9.poc;
+	else
+		regs->vp9_param.reg100.vp9_segid_ref_poc = vp9_ctx->segmap_poc;
+
+	/*
 	 * The map left by the previous frames is only meaningful if
 	 * segmentation was used since the last intra frame.
 	 */
@@ -850,6 +888,32 @@ static void config_registers(struct rkvdec_ctx *ctx,
 		vp9_ctx->last.height == vp9_ctx->cur.height;
 
 	regs->vp9_param.reg78_vp9_stream_size = stream_len;
+
+	/*
+	 * The CCU makes the core wait for the parts of the references that
+	 * another core is still decoding, the job_ready() check for the
+	 * buffers that are still read.
+	 */
+	for (i = 0; !intra_only && i < ARRAY_SIZE(ref_bufs); i++) {
+		u32 poc = 0;
+
+		if (ref_bufs[i] != dst) {
+			poc = ref_bufs[i]->vp9.poc;
+			rkvdec_job_add_ref(ctx, &ref_bufs[i]->base.vb.vb2_buf);
+		}
+
+		switch (i) {
+		case 0:
+			regs->vp9_param.reg95_vp9_last_poc = poc;
+			break;
+		case 1:
+			regs->vp9_param.reg96_vp9_golden_poc = poc;
+			break;
+		case 2:
+			regs->vp9_param.reg97_vp9_altref_poc = poc;
+			break;
+		}
+	}
 
 	for (i = 0; !intra_only && i < ARRAY_SIZE(ref_bufs); i++) {
 		unsigned int refw = ref_bufs[i]->vp9.width;
@@ -905,6 +969,9 @@ static void config_registers(struct rkvdec_ctx *ctx,
 		mv_ref = dst;
 
 	regs->vp9_addr.vp9_refcolmv_base = get_mv_base_addr(ctx, mv_ref);
+	regs->vp9_param.reg98_vp9_col_ref_poc = mv_ref->vp9.poc;
+	if (mv_ref != dst)
+		rkvdec_job_add_ref(ctx, &mv_ref->base.vb.vb2_buf);
 
 	rkvdec_write_regs(ctx);
 }
