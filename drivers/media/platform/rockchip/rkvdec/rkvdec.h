@@ -165,6 +165,9 @@ struct rkvdec_coded_fmt_desc {
  *	      finished, so the next frame may start before this one is done
  * @hw_done: the hardware is done with the frame
  * @busy: the m2m state of the job is being changed, don't complete it
+ * @dst_shared: an earlier job wrote @dst too (the other field of the frame)
+ *		and left returning it to this one
+ * @dst_error: an earlier job that wrote @dst failed
  * @num_refs: number of entries in @refs
  * @refs: the CAPTURE buffers the frame predicts from
  * @num_pocs: number of entries in @pocs
@@ -183,6 +186,8 @@ struct rkvdec_job {
 	bool detached;
 	bool hw_done;
 	bool busy;
+	bool dst_shared;
+	bool dst_error;
 	unsigned int num_refs;
 	const struct vb2_buffer *refs[RKVDEC_MAX_REFS];
 	unsigned int num_pocs;
@@ -253,7 +258,8 @@ struct rkvdec_ctx {
 	struct list_head jobs;
 	unsigned int num_jobs;
 	wait_queue_head_t jobs_wq;
-	struct mutex done_lock; /* completes the jobs in decoding order */
+	/* completes the jobs in decoding order, serializes it with new jobs */
+	struct mutex done_lock;
 	int film_idx;
 	void *priv;
 	u8 has_sps_st_rps: 1;
