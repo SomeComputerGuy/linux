@@ -20,6 +20,7 @@
 struct rkvdec_vp9_run {
 	struct rkvdec_run base;
 	const struct v4l2_ctrl_vp9_frame *decode_params;
+	const struct v4l2_ctrl_vp9_compressed_hdr *prob_updates;
 };
 
 struct rkvdec_vp9_intra_mode_probs {

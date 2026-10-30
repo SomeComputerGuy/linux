@@ -14,13 +14,20 @@
  */
 
 /*
- * For following the vp9 spec please start reading this driver
- * code from rkvdec_vp9_run() followed by rkvdec_vp9_done().
+ * The VDPU381 does the probability handling of VP9 itself: it reads the
+ * probabilities of the frame context the frame uses, applies the forward
+ * updates of the compressed header, which the driver passes in an update
+ * table, adapts the probabilities to the symbols of the frame (backward
+ * adaptation) and saves them to the frame context. Every stream has four
+ * frame context buffers, which only the hardware writes, and a table of the
+ * default probabilities for the contexts that were reset.
+ *
+ * For following the VP9 spec, start reading this code from rkvdec_vp9_run().
  */
 
 #include <linux/dma-mapping.h>
 #include <linux/kernel.h>
-#include <linux/vmalloc.h>
+#include <linux/sizes.h>
 #include <media/v4l2-mem2mem.h>
 #include <media/v4l2-vp9.h>
 
@@ -30,62 +37,104 @@
 #include "rkvdec-vdpu381-regs.h"
 #include "rkvdec-vp9-common.h"
 
-#define RKVDEC_VP9_PROBE_SIZE      4864
-#define RKVDEC_VP9_COUNT_SIZE      13208
+/* Size of a probability table, as the hardware reads and writes it */
+#define VDPU381_VP9_PROB_TBL_SIZE	4864
+/* Size of the symbol counts the hardware writes */
+#define VDPU381_VP9_COUNT_TBL_SIZE	13208
 /*
  * VP9 segmap size: ceil(width/64) * ceil(height/64) * 256 / 4
  * For 4K (3840x2160): 60 * 34 * 64 = 130,560 bytes
  * For 8K (7680x4320): 120 * 68 * 64 = 522,240 bytes
  * Use 8K-safe value to cover all supported resolutions.
  */
-#define RKVDEC_VP9_MAX_SEGMAP_SIZE 524288
+#define RKVDEC_VP9_MAX_SEGMAP_SIZE	524288
 
-/* Data structure describing auxiliary buffer format. */
-struct rkvdec_vp9_priv_tbl {
-	struct rkvdec_vp9_probs probs;
+#define VDPU381_VP9_NUM_FRAME_CTXS	4
+
+/*
+ * Probability tables are made of 128-bit units. The coefficient probabilities
+ * of a transform size and plane type (6 bands x 6 contexts x 3 nodes) take 27
+ * bytes of every 32, in four rows: the same holds for their update flags,
+ * 27 bits of every 32.
+ */
+#define VDPU381_VP9_COEF_ROW_LEN	27
+#define VDPU381_VP9_COEF_ROW_SIZE	32
+#define VDPU381_VP9_COEF_PLANE_SIZE	128
+
+/* First 5 x 128 bits of the probability and update tables */
+struct vdpu381_vp9_probs_head {
+	u8 partition[16][3];
+	u8 seg_pred[3];
+	u8 seg_tree[7];
+	u8 skip[3];
+	u8 tx32[2][3];
+	u8 tx16[2][2];
+	u8 tx8[2][1];
+	u8 is_inter[4];
+	u8 reserved[3];
+} __packed;
+
+/*
+ * The probabilities of a frame context, in the default table and in the
+ * frame contexts the hardware saves. The update table of an inter frame
+ * holds the updates in the same layout.
+ */
+struct vdpu381_vp9_frame_probs {
+	struct vdpu381_vp9_probs_head head;
+	u8 y_mode[4][9];
+	u8 comp_mode[5];
+	u8 comp_ref[5];
+	u8 single_ref[5][2];
+	u8 inter_mode[7][3];
+	u8 interp_filter[4][2];
+	u8 reserved0[11];
+	/* [ref][tx size][plane type] */
+	u8 coef[2][4][2][VDPU381_VP9_COEF_PLANE_SIZE];
+	/* three modes per row, the last row holds mode 9 */
+	u8 uv_mode[4][32];
+	struct v4l2_vp9_frame_mv_context mv;
+	u8 reserved1[27];
+} __packed;
+
+/* Bit flags telling which probabilities are updated, then the updates */
+struct vdpu381_vp9_inter_updates {
+	u8 flags[320];
+	struct vdpu381_vp9_frame_probs delta;
+} __packed;
+
+/*
+ * Intra frames code no mode probabilities: the update table holds the key
+ * frame probabilities of the partition and intra modes instead.
+ */
+struct vdpu381_vp9_intra_updates {
+	u8 flags[272];
+	struct vdpu381_vp9_probs_head head;
+	u8 coef_intra[4][2][VDPU381_VP9_COEF_PLANE_SIZE];
+	struct rkvdec_vp9_intra_mode_probs intra_mode[10];
+	u8 coef_inter[4][2][VDPU381_VP9_COEF_PLANE_SIZE];
+} __packed;
+
+union vdpu381_vp9_prob_tbl {
+	struct vdpu381_vp9_frame_probs probs;
+	u8 raw[ALIGN(VDPU381_VP9_PROB_TBL_SIZE, SZ_4K)];
+};
+
+/* Tables of a stream */
+struct vdpu381_vp9_stream_tbl {
+	union vdpu381_vp9_prob_tbl default_probs;
+	/* Written by the hardware only */
+	union vdpu381_vp9_prob_tbl ctx_probs[VDPU381_VP9_NUM_FRAME_CTXS];
 	u8 segmap[2][RKVDEC_VP9_MAX_SEGMAP_SIZE];
 };
 
-struct rkvdec_vp9_refs_counts {
-	u32 eob[2];
-	u32 coeff[3];
-};
-
-struct rkvdec_vp9_inter_frame_symbol_counts {
-	u32 partition[16][4];
-	u32 skip[3][2];
-	u32 inter[4][2];
-	u32 tx32p[2][4];
-	u32 tx16p[2][4];
-	u32 tx8p[2][2];
-	u32 y_mode[4][10];
-	u32 uv_mode[10][10];
-	u32 comp[5][2];
-	u32 comp_ref[5][2];
-	u32 single_ref[5][2][2];
-	u32 mv_mode[7][4];
-	u32 filter[4][3];
-	u32 mv_joint[4];
-	u32 sign[2][2];
-	/* add 1 element for align */
-	u32 classes[2][11 + 1];
-	u32 class0[2][2];
-	u32 bits[2][10][2];
-	u32 class0_fp[2][2][4];
-	u32 fp[2][4];
-	u32 class0_hp[2][2];
-	u32 hp[2][2];
-	struct rkvdec_vp9_refs_counts ref_cnt[2][4][2][6][6];
-};
-
-struct rkvdec_vp9_intra_frame_symbol_counts {
-	u32 partition[4][4][4];
-	u32 skip[3][2];
-	u32 intra[4][2];
-	u32 tx32p[2][4];
-	u32 tx16p[2][4];
-	u32 tx8p[2][2];
-	struct rkvdec_vp9_refs_counts ref_cnt[2][4][2][6][6];
+/* Tables of a job, the hardware reads and writes them while it decodes */
+struct vdpu381_vp9_job_tbl {
+	union {
+		struct vdpu381_vp9_inter_updates inter;
+		struct vdpu381_vp9_intra_updates intra;
+		u8 raw[ALIGN(VDPU381_VP9_PROB_TBL_SIZE, SZ_4K)];
+	} updates;
+	u8 counts[ALIGN(VDPU381_VP9_COUNT_TBL_SIZE, SZ_4K)];
 };
 
 struct rkvdec_vp9_frame_info {
@@ -107,176 +156,287 @@ struct rkvdec_vp9_frame_info {
 };
 
 struct rkvdec_vp9_ctx {
-	struct rkvdec_aux_buf priv_tbl;
-	struct rkvdec_aux_buf count_tbl;
-	struct v4l2_vp9_frame_symbol_counts inter_cnts;
-	struct v4l2_vp9_frame_symbol_counts intra_cnts;
-	struct v4l2_vp9_frame_context probability_tables;
-	struct v4l2_vp9_frame_context frame_context[4];
+	struct rkvdec_aux_buf stream_tbl;
+	/* One table per job, see &rkvdec_job.slot */
+	struct rkvdec_aux_buf job_tbl[RKVDEC_MAX_JOBS];
+	/* The frame contexts the hardware saved, the others hold the defaults */
+	bool ctx_saved[VDPU381_VP9_NUM_FRAME_CTXS];
 	struct rkvdec_vp9_frame_info cur;
 	struct rkvdec_vp9_frame_info last;
 	struct rkvdec_vdpu381_regs_vp9 regs;
 };
 
-static void init_intra_only_probs(struct rkvdec_ctx *ctx,
-				  const struct rkvdec_vp9_run *run)
+struct vdpu381_vp9_flag_writer {
+	u8 *flags;
+	unsigned int pos;
+};
+
+static void vdpu381_vp9_skip_flags(struct vdpu381_vp9_flag_writer *fw,
+				   unsigned int n)
 {
-	struct rkvdec_vp9_ctx *vp9_ctx = ctx->priv;
-	struct rkvdec_vp9_priv_tbl *tbl = vp9_ctx->priv_tbl.cpu;
-	struct rkvdec_vp9_intra_only_frame_probs *rkprobs;
-	const struct v4l2_vp9_frame_context *probs;
-	unsigned int i, j, k;
+	fw->pos += n;
+}
 
-	rkprobs = &tbl->probs.intra_only;
-	probs = &vp9_ctx->probability_tables;
+static void vdpu381_vp9_set_flag(struct vdpu381_vp9_flag_writer *fw,
+				 unsigned int pos)
+{
+	fw->flags[pos / 8] |= BIT(pos % 8);
+}
 
-	/*
-	 * intra only 149 x 128 bits ,aligned to 152 x 128 bits coeff related
-	 * prob 64 x 128 bits
-	 */
-	for (i = 0; i < ARRAY_SIZE(probs->coef); i++) {
-		for (j = 0; j < ARRAY_SIZE(probs->coef[0]); j++)
-			write_coeff_plane(probs->coef[i][j][0],
-					  rkprobs->coef_intra[i][j]);
+/*
+ * The compressed header codes the update of a probability as an index into
+ * inv_map_table[] (spec 6.3.5). V4L2 passes the table entry, the hardware
+ * wants the index back. The first 20 entries are 7 + 13 * i, the others are
+ * the remaining values in increasing order.
+ */
+static u8 vdpu381_vp9_update_index(u8 v)
+{
+	if (v >= 7 && !((v - 7) % 13))
+		return (v - 7) / 13;
+
+	return 20 + v - 1 - (v + 6) / 13;
+}
+
+/*
+ * Writes the flags of @n probabilities, and the updates to @delta in the
+ * hardware form. A zero update means that the probability isn't updated,
+ * and @upd is NULL if none of them can be. Motion vector updates are new
+ * probabilities, which the hardware takes as they are (@mv).
+ */
+static void vdpu381_vp9_put_updates(struct vdpu381_vp9_flag_writer *fw,
+				    u8 *delta, const u8 *upd, unsigned int n,
+				    bool mv)
+{
+	unsigned int i;
+
+	for (i = 0; upd && i < n; i++) {
+		if (!upd[i])
+			continue;
+
+		vdpu381_vp9_set_flag(fw, fw->pos + i);
+		if (delta)
+			delta[i] = mv ? upd[i] : vdpu381_vp9_update_index(upd[i]);
 	}
 
-	/* intra mode prob  80 x 128 bits */
+	vdpu381_vp9_skip_flags(fw, n);
+}
+
+/* The coefficient updates of one transform size and plane type */
+static void vdpu381_vp9_put_coef_updates(struct vdpu381_vp9_flag_writer *fw,
+					 u8 *plane, const u8 upd[6][6][3])
+{
+	const u8 *u = upd ? &upd[0][0][0] : NULL;
+	unsigned int i, off;
+
+	for (i = 0; u && i < 6 * 6 * 3; i++) {
+		if (!u[i])
+			continue;
+
+		off = i / VDPU381_VP9_COEF_ROW_LEN * VDPU381_VP9_COEF_ROW_SIZE +
+		      i % VDPU381_VP9_COEF_ROW_LEN;
+		vdpu381_vp9_set_flag(fw, fw->pos + off);
+		plane[off] = vdpu381_vp9_update_index(u[i]);
+	}
+
+	vdpu381_vp9_skip_flags(fw, VDPU381_VP9_COEF_PLANE_SIZE);
+}
+
+/*
+ * The coefficient updates of all transform sizes and plane types, first those
+ * of intra blocks, then those of inter blocks (@ref). The compressed header
+ * codes no updates for the transform sizes the frame doesn't use (spec 6.3.7).
+ */
+static void vdpu381_vp9_put_coefs(struct vdpu381_vp9_flag_writer *fw,
+				  u8 planes[4][2][VDPU381_VP9_COEF_PLANE_SIZE],
+				  const struct v4l2_ctrl_vp9_compressed_hdr *hdr,
+				  unsigned int ref)
+{
+	unsigned int i, j;
+
+	for (i = 0; i < 4; i++) {
+		bool coded = i <= hdr->tx_mode;
+
+		for (j = 0; j < 2; j++)
+			vdpu381_vp9_put_coef_updates(fw, planes[i][j],
+						     coded ? hdr->coef[i][j][ref] : NULL);
+	}
+}
+
+/* The skip and transform size updates, coded by intra and inter frames */
+static void vdpu381_vp9_put_tx_skip(struct vdpu381_vp9_flag_writer *fw,
+				    struct vdpu381_vp9_probs_head *head,
+				    const struct v4l2_ctrl_vp9_compressed_hdr *hdr)
+{
+	bool tx_select = hdr->tx_mode == V4L2_VP9_TX_MODE_SELECT;
+
+	vdpu381_vp9_put_updates(fw, head->skip, hdr->skip, 3, false);
+	vdpu381_vp9_put_updates(fw, &head->tx32[0][0],
+				tx_select ? &hdr->tx32[0][0] : NULL, 6, false);
+	vdpu381_vp9_put_updates(fw, &head->tx16[0][0],
+				tx_select ? &hdr->tx16[0][0] : NULL, 4, false);
+	vdpu381_vp9_put_updates(fw, &head->tx8[0][0],
+				tx_select ? &hdr->tx8[0][0] : NULL, 2, false);
+}
+
+static void vdpu381_vp9_put_seg_probs(struct vdpu381_vp9_probs_head *head,
+				      const struct v4l2_ctrl_vp9_frame *dec_params)
+{
+	memcpy(head->seg_pred, dec_params->seg.pred_probs, sizeof(head->seg_pred));
+	memcpy(head->seg_tree, dec_params->seg.tree_probs, sizeof(head->seg_tree));
+}
+
+static void vdpu381_vp9_write_intra_updates(struct vdpu381_vp9_intra_updates *tbl,
+					    const struct v4l2_ctrl_vp9_frame *dec_params,
+					    const struct v4l2_ctrl_vp9_compressed_hdr *hdr)
+{
+	struct vdpu381_vp9_flag_writer fw = { .flags = tbl->flags };
+	unsigned int i, j, k, idx;
+
+	/* No partition, segmentation and is_inter updates */
+	vdpu381_vp9_skip_flags(&fw, 48 + 3 + 7);
+	vdpu381_vp9_put_tx_skip(&fw, &tbl->head, hdr);
+	vdpu381_vp9_skip_flags(&fw, 4 + 3);
+
+	vdpu381_vp9_put_coefs(&fw, tbl->coef_intra, hdr, 0);
+	vdpu381_vp9_put_coefs(&fw, tbl->coef_inter, hdr, 1);
+	WARN_ON(fw.pos > sizeof(tbl->flags) * 8);
+
+	memcpy(tbl->head.partition, v4l2_vp9_kf_partition_probs,
+	       sizeof(tbl->head.partition));
+	vdpu381_vp9_put_seg_probs(&tbl->head, dec_params);
+
+	/* Rows of 27 probabilities, padded to 32 bytes */
 	for (i = 0; i < ARRAY_SIZE(v4l2_vp9_kf_y_mode_prob); i++) {
-		unsigned int byte_count = 0;
-		int idx = 0;
+		const u8 *p = &v4l2_vp9_kf_y_mode_prob[i][0][0];
 
-		/* vp9_kf_y_mode_prob */
-		for (j = 0; j < ARRAY_SIZE(v4l2_vp9_kf_y_mode_prob[0]); j++) {
-			for (k = 0; k < ARRAY_SIZE(v4l2_vp9_kf_y_mode_prob[0][0]);
-			     k++) {
-				u8 val = v4l2_vp9_kf_y_mode_prob[i][j][k];
-
-				rkprobs->intra_mode[i].y_mode[idx++] = val;
-				byte_count++;
-				if (byte_count == 27) {
-					byte_count = 0;
-					idx += 5;
-				}
-			}
+		for (j = 0, idx = 0; j < sizeof(v4l2_vp9_kf_y_mode_prob[0]); j++) {
+			tbl->intra_mode[i].y_mode[idx++] = p[j];
+			if (!((j + 1) % VDPU381_VP9_COEF_ROW_LEN))
+				idx += VDPU381_VP9_COEF_ROW_SIZE - VDPU381_VP9_COEF_ROW_LEN;
 		}
 	}
 
-	for (i = 0; i < sizeof(v4l2_vp9_kf_uv_mode_prob); ++i) {
-		const u8 *ptr = (const u8 *)v4l2_vp9_kf_uv_mode_prob;
+	/* 23 bytes in each of the first entries */
+	for (k = 0; k < sizeof(v4l2_vp9_kf_uv_mode_prob); k++) {
+		const u8 *p = &v4l2_vp9_kf_uv_mode_prob[0][0];
 
-		rkprobs->intra_mode[i / 23].uv_mode[i % 23] = ptr[i];
+		tbl->intra_mode[k / 23].uv_mode[k % 23] = p[k];
 	}
 }
 
-static void init_inter_probs(struct rkvdec_ctx *ctx,
-			     const struct rkvdec_vp9_run *run)
+static void vdpu381_vp9_write_inter_updates(struct vdpu381_vp9_inter_updates *tbl,
+					    const struct v4l2_ctrl_vp9_frame *dec_params,
+					    const struct v4l2_ctrl_vp9_compressed_hdr *hdr)
 {
-	struct rkvdec_vp9_ctx *vp9_ctx = ctx->priv;
-	struct rkvdec_vp9_priv_tbl *tbl = vp9_ctx->priv_tbl.cpu;
-	struct rkvdec_vp9_inter_frame_probs *rkprobs;
-	const struct v4l2_vp9_frame_context *probs;
-	unsigned int i, j, k;
+	struct vdpu381_vp9_flag_writer fw = { .flags = tbl->flags };
+	struct vdpu381_vp9_frame_probs *delta = &tbl->delta;
+	struct v4l2_vp9_frame_mv_context *dmv = &delta->mv;
+	const struct v4l2_vp9_mv_probs *mv = &hdr->mv;
+	u8 ref_mode = dec_params->reference_mode;
+	bool hp = dec_params->flags & V4L2_VP9_FRAME_FLAG_ALLOW_HIGH_PREC_MV;
+	bool filter = dec_params->interpolation_filter ==
+		      V4L2_VP9_INTERP_FILTER_SWITCHABLE;
 
-	rkprobs = &tbl->probs.inter;
-	probs = &vp9_ctx->probability_tables;
+	/* Same conditions as v4l2_vp9_fw_update_probs() */
+	vdpu381_vp9_put_updates(&fw, &delta->head.partition[0][0],
+				&hdr->partition[0][0], 48, false);
+	vdpu381_vp9_skip_flags(&fw, 3 + 7);
+	vdpu381_vp9_put_tx_skip(&fw, &delta->head, hdr);
+	vdpu381_vp9_put_updates(&fw, delta->head.is_inter, hdr->is_inter, 4, false);
+	vdpu381_vp9_skip_flags(&fw, 3);
 
-	/*
-	 * inter probs
-	 * 151 x 128 bits, aligned to 152 x 128 bits
-	 * inter only
-	 * intra_y_mode & inter_block info 6 x 128 bits
-	 */
+	vdpu381_vp9_put_updates(&fw, &delta->y_mode[0][0], &hdr->y_mode[0][0],
+				36, false);
+	vdpu381_vp9_put_updates(&fw, delta->comp_mode,
+				ref_mode == V4L2_VP9_REFERENCE_MODE_SELECT ?
+				hdr->comp_mode : NULL, 5, false);
+	vdpu381_vp9_put_updates(&fw, delta->comp_ref,
+				ref_mode != V4L2_VP9_REFERENCE_MODE_SINGLE_REFERENCE ?
+				hdr->comp_ref : NULL, 5, false);
+	vdpu381_vp9_put_updates(&fw, &delta->single_ref[0][0],
+				ref_mode != V4L2_VP9_REFERENCE_MODE_COMPOUND_REFERENCE ?
+				&hdr->single_ref[0][0] : NULL, 10, false);
+	vdpu381_vp9_put_updates(&fw, &delta->inter_mode[0][0],
+				&hdr->inter_mode[0][0], 21, false);
+	vdpu381_vp9_put_updates(&fw, &delta->interp_filter[0][0],
+				filter ? &hdr->interp_filter[0][0] : NULL, 8, false);
+	vdpu381_vp9_skip_flags(&fw, 11);
 
-	memcpy(rkprobs->y_mode, probs->y_mode, sizeof(rkprobs->y_mode));
-	memcpy(rkprobs->comp_mode, probs->comp_mode,
-	       sizeof(rkprobs->comp_mode));
-	memcpy(rkprobs->comp_ref, probs->comp_ref,
-	       sizeof(rkprobs->comp_ref));
-	memcpy(rkprobs->single_ref, probs->single_ref,
-	       sizeof(rkprobs->single_ref));
-	memcpy(rkprobs->inter_mode, probs->inter_mode,
-	       sizeof(rkprobs->inter_mode));
-	memcpy(rkprobs->interp_filter, probs->interp_filter,
-	       sizeof(rkprobs->interp_filter));
+	vdpu381_vp9_put_coefs(&fw, delta->coef[0], hdr, 0);
+	vdpu381_vp9_put_coefs(&fw, delta->coef[1], hdr, 1);
 
-	/* 128 x 128 bits coeff related */
-	for (i = 0; i < ARRAY_SIZE(probs->coef); i++) {
-		for (j = 0; j < ARRAY_SIZE(probs->coef[0]); j++) {
-			for (k = 0; k < ARRAY_SIZE(probs->coef[0][0]); k++)
-				write_coeff_plane(probs->coef[i][j][k],
-						  rkprobs->coef[k][i][j]);
-		}
-	}
+	/* The compressed header has no UV mode updates */
+	vdpu381_vp9_skip_flags(&fw, 4 * 32);
 
-	/* intra uv mode 6 x 128 */
-	memcpy(rkprobs->uv_mode_0_2, &probs->uv_mode[0],
-	       sizeof(rkprobs->uv_mode_0_2));
-	memcpy(rkprobs->uv_mode_3_5, &probs->uv_mode[3],
-	       sizeof(rkprobs->uv_mode_3_5));
-	memcpy(rkprobs->uv_mode_6_8, &probs->uv_mode[6],
-	       sizeof(rkprobs->uv_mode_6_8));
-	memcpy(rkprobs->uv_mode_9, &probs->uv_mode[9],
-	       sizeof(rkprobs->uv_mode_9));
+	vdpu381_vp9_put_updates(&fw, dmv->joint, mv->joint, 3, true);
+	vdpu381_vp9_put_updates(&fw, dmv->sign, mv->sign, 2, true);
+	vdpu381_vp9_put_updates(&fw, &dmv->classes[0][0], &mv->classes[0][0],
+				20, true);
+	vdpu381_vp9_put_updates(&fw, dmv->class0_bit, mv->class0_bit, 2, true);
+	vdpu381_vp9_put_updates(&fw, &dmv->bits[0][0], &mv->bits[0][0], 20, true);
+	vdpu381_vp9_put_updates(&fw, &dmv->class0_fr[0][0][0],
+				&mv->class0_fr[0][0][0], 12, true);
+	vdpu381_vp9_put_updates(&fw, &dmv->fr[0][0], &mv->fr[0][0], 6, true);
+	vdpu381_vp9_put_updates(&fw, dmv->class0_hp, hp ? mv->class0_hp : NULL,
+				2, true);
+	vdpu381_vp9_put_updates(&fw, dmv->hp, hp ? mv->hp : NULL, 2, true);
+	WARN_ON(fw.pos > sizeof(tbl->flags) * 8);
 
-	/* mv related 6 x 128 */
-	memcpy(rkprobs->mv.joint, probs->mv.joint,
-	       sizeof(rkprobs->mv.joint));
-	memcpy(rkprobs->mv.sign, probs->mv.sign,
-	       sizeof(rkprobs->mv.sign));
-	memcpy(rkprobs->mv.classes, probs->mv.classes,
-	       sizeof(rkprobs->mv.classes));
-	memcpy(rkprobs->mv.class0_bit, probs->mv.class0_bit,
-	       sizeof(rkprobs->mv.class0_bit));
-	memcpy(rkprobs->mv.bits, probs->mv.bits,
-	       sizeof(rkprobs->mv.bits));
-	memcpy(rkprobs->mv.class0_fr, probs->mv.class0_fr,
-	       sizeof(rkprobs->mv.class0_fr));
-	memcpy(rkprobs->mv.fr, probs->mv.fr,
-	       sizeof(rkprobs->mv.fr));
-	memcpy(rkprobs->mv.class0_hp, probs->mv.class0_hp,
-	       sizeof(rkprobs->mv.class0_hp));
-	memcpy(rkprobs->mv.hp, probs->mv.hp,
-	       sizeof(rkprobs->mv.hp));
+	vdpu381_vp9_put_seg_probs(&delta->head, dec_params);
+	/* The Rockchip MPP fills the unused part of the last UV mode row so */
+	memset(&delta->uv_mode[3][9], 0xff, sizeof(delta->uv_mode[3]) - 9);
 }
 
-static void init_probs(struct rkvdec_ctx *ctx,
-		       const struct rkvdec_vp9_run *run)
+/* Writes the update table of the frame to the table of the job. */
+static void vdpu381_vp9_write_updates(struct rkvdec_ctx *ctx,
+				      const struct rkvdec_vp9_run *run,
+				      bool intra_only)
 {
-	const struct v4l2_ctrl_vp9_frame *dec_params;
 	struct rkvdec_vp9_ctx *vp9_ctx = ctx->priv;
-	struct rkvdec_vp9_priv_tbl *tbl = vp9_ctx->priv_tbl.cpu;
-	struct rkvdec_vp9_probs *rkprobs = &tbl->probs;
-	const struct v4l2_vp9_segmentation *seg;
-	const struct v4l2_vp9_frame_context *probs;
-	bool intra_only;
+	struct vdpu381_vp9_job_tbl *tbl = vp9_ctx->job_tbl[ctx->job->slot].cpu;
 
-	dec_params = run->decode_params;
-	probs = &vp9_ctx->probability_tables;
-	seg = &dec_params->seg;
-
-	memset(rkprobs, 0, sizeof(*rkprobs));
-
-	intra_only = !!(dec_params->flags &
-			(V4L2_VP9_FRAME_FLAG_KEY_FRAME |
-			 V4L2_VP9_FRAME_FLAG_INTRA_ONLY));
-
-	/* sb info  5 x 128 bit */
-	memcpy(rkprobs->partition,
-	       intra_only ? v4l2_vp9_kf_partition_probs : probs->partition,
-	       sizeof(rkprobs->partition));
-
-	memcpy(rkprobs->pred, seg->pred_probs, sizeof(rkprobs->pred));
-	memcpy(rkprobs->tree, seg->tree_probs, sizeof(rkprobs->tree));
-	memcpy(rkprobs->skip, probs->skip, sizeof(rkprobs->skip));
-	memcpy(rkprobs->tx32, probs->tx32, sizeof(rkprobs->tx32));
-	memcpy(rkprobs->tx16, probs->tx16, sizeof(rkprobs->tx16));
-	memcpy(rkprobs->tx8, probs->tx8, sizeof(rkprobs->tx8));
-	memcpy(rkprobs->is_inter, probs->is_inter, sizeof(rkprobs->is_inter));
+	memset(&tbl->updates, 0, VDPU381_VP9_PROB_TBL_SIZE);
 
 	if (intra_only)
-		init_intra_only_probs(ctx, run);
+		vdpu381_vp9_write_intra_updates(&tbl->updates.intra,
+						run->decode_params, run->prob_updates);
 	else
-		init_inter_probs(ctx, run);
+		vdpu381_vp9_write_inter_updates(&tbl->updates.inter,
+						run->decode_params, run->prob_updates);
+}
+
+/* The probabilities of a frame context that was reset (spec 10.5). */
+static void vdpu381_vp9_write_default_probs(struct vdpu381_vp9_frame_probs *probs)
+{
+	const struct v4l2_vp9_frame_context *def = &v4l2_vp9_default_probs;
+	unsigned int i, j, k;
+
+	memcpy(probs->head.partition, def->partition, sizeof(probs->head.partition));
+	memcpy(probs->head.skip, def->skip, sizeof(probs->head.skip));
+	memcpy(probs->head.tx32, def->tx32, sizeof(probs->head.tx32));
+	memcpy(probs->head.tx16, def->tx16, sizeof(probs->head.tx16));
+	memcpy(probs->head.tx8, def->tx8, sizeof(probs->head.tx8));
+	memcpy(probs->head.is_inter, def->is_inter, sizeof(probs->head.is_inter));
+
+	memcpy(probs->y_mode, def->y_mode, sizeof(probs->y_mode));
+	memcpy(probs->comp_mode, def->comp_mode, sizeof(probs->comp_mode));
+	memcpy(probs->comp_ref, def->comp_ref, sizeof(probs->comp_ref));
+	memcpy(probs->single_ref, def->single_ref, sizeof(probs->single_ref));
+	memcpy(probs->inter_mode, def->inter_mode, sizeof(probs->inter_mode));
+	memcpy(probs->interp_filter, def->interp_filter,
+	       sizeof(probs->interp_filter));
+
+	for (i = 0; i < ARRAY_SIZE(def->coef); i++)
+		for (j = 0; j < ARRAY_SIZE(def->coef[0]); j++)
+			for (k = 0; k < ARRAY_SIZE(def->coef[0][0]); k++)
+				write_coeff_plane(def->coef[i][j][k],
+						  probs->coef[k][i][j]);
+
+	for (i = 0; i < ARRAY_SIZE(def->uv_mode); i++)
+		memcpy(&probs->uv_mode[i / 3][(i % 3) * 9], def->uv_mode[i],
+		       sizeof(def->uv_mode[0]));
+
+	probs->mv = def->mv;
 }
 
 static void config_ref_registers(struct rkvdec_ctx *ctx,
@@ -404,11 +564,6 @@ static void update_ctx_cur_info(struct rkvdec_vp9_ctx *vp9_ctx,
 	vp9_ctx->cur.lf = dec_params->lf;
 }
 
-static void update_ctx_last_info(struct rkvdec_vp9_ctx *vp9_ctx)
-{
-	vp9_ctx->last = vp9_ctx->cur;
-}
-
 static void rkvdec_write_regs(struct rkvdec_ctx *ctx)
 {
 	struct rkvdec_core *core = ctx->core;
@@ -441,6 +596,95 @@ static dma_addr_t get_mv_base_addr(struct rkvdec_ctx *ctx, struct rkvdec_decoded
 	       yuv_len;
 }
 
+/*
+ * Selects the frame context the hardware reads the probabilities from and
+ * saves them to, see 6.1.2 refresh_probs() and the frame context handling of
+ * 6.2 uncompressed_header() (setup_past_independence()) in the spec.
+ */
+static void config_prob_registers(struct rkvdec_ctx *ctx,
+				  const struct rkvdec_vp9_run *run,
+				  bool intra_only)
+{
+	const struct v4l2_ctrl_vp9_frame *dec_params = run->decode_params;
+	struct rkvdec_vp9_ctx *vp9_ctx = ctx->priv;
+	struct rkvdec_vdpu381_regs_vp9 *regs = &vp9_ctx->regs;
+	dma_addr_t ctx_probs = vp9_ctx->stream_tbl.dma +
+			       offsetof(struct vdpu381_vp9_stream_tbl, ctx_probs);
+	struct rkvdec_aux_buf *job_buf = &vp9_ctx->job_tbl[ctx->job->slot];
+	bool error_resilient = dec_params->flags & V4L2_VP9_FRAME_FLAG_ERROR_RESILIENT;
+	bool parallel = dec_params->flags & V4L2_VP9_FRAME_FLAG_PARALLEL_DEC_MODE;
+	bool refresh = dec_params->flags & V4L2_VP9_FRAME_FLAG_REFRESH_FRAME_CTX;
+	unsigned int fctx_idx = dec_params->frame_context_idx;
+	unsigned int i;
+
+	/*
+	 * setup_past_independence(): the reset contexts hold the default
+	 * probabilities until the hardware saves new ones to them. The
+	 * frame then uses context 0, which isn't reset by an intra-only
+	 * frame with reset_frame_context 0 or 1.
+	 */
+	if (intra_only || error_resilient) {
+		if (dec_params->flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME ||
+		    error_resilient ||
+		    dec_params->reset_frame_context == V4L2_VP9_RESET_FRAME_CTX_ALL) {
+			for (i = 0; i < VDPU381_VP9_NUM_FRAME_CTXS; i++)
+				vp9_ctx->ctx_saved[i] = false;
+		} else if (dec_params->reset_frame_context ==
+			   V4L2_VP9_RESET_FRAME_CTX_SPEC) {
+			vp9_ctx->ctx_saved[fctx_idx] = false;
+		}
+		fctx_idx = 0;
+	}
+	vp9_ctx->cur.frame_context_idx = fctx_idx;
+
+	/*
+	 * The probability buffers are told apart by index + 1 in the
+	 * multi-core control register, 0 for the default table.
+	 */
+	if (vp9_ctx->ctx_saved[fctx_idx]) {
+		regs->vp9_addr.vp9_last_prob_base = ctx_probs +
+			fctx_idx * sizeof(union vdpu381_vp9_prob_tbl);
+		regs->common.reg028_multiply_core_ctrl.vp9_rd_prob_idx = fctx_idx + 1;
+	} else {
+		regs->vp9_addr.vp9_last_prob_base = vp9_ctx->stream_tbl.dma +
+			offsetof(struct vdpu381_vp9_stream_tbl, default_probs);
+		regs->common.reg028_multiply_core_ctrl.vp9_rd_prob_idx = 0;
+	}
+
+	regs->vp9_addr.vp9_update_prob_wr_bas = ctx_probs +
+		fctx_idx * sizeof(union vdpu381_vp9_prob_tbl);
+	regs->common.reg028_multiply_core_ctrl.vp9_wr_prob_idx = fctx_idx + 1;
+	if (refresh)
+		vp9_ctx->ctx_saved[fctx_idx] = true;
+
+	regs->vp9_addr.vp9_delta_prob_base = job_buf->dma +
+		offsetof(struct vdpu381_vp9_job_tbl, updates);
+	regs->vp9_addr.vp9_count_base = job_buf->dma +
+		offsetof(struct vdpu381_vp9_job_tbl, counts);
+
+	regs->vp9_param.reg103.vp9_prob_update_en = 1;
+	regs->vp9_param.reg103.vp9_intra_only_flag = intra_only;
+	if (!intra_only) {
+		regs->vp9_param.reg103.vp9_txfmmode_rfsh_en =
+			vp9_ctx->cur.tx_mode == V4L2_VP9_TX_MODE_SELECT;
+		regs->vp9_param.reg103.vp9_interp_filter_switch_en =
+			dec_params->interpolation_filter ==
+			V4L2_VP9_INTERP_FILTER_SWITCHABLE;
+	}
+	regs->vp9_param.reg103.vp9_ref_mode_rfsh_en = 1;
+	regs->vp9_param.reg103.vp9_single_ref_rfsh_en = 1;
+	regs->vp9_param.reg103.vp9_comp_ref_rfsh_en = 1;
+	/* Backward adaptation, then save_probs() of the adapted probabilities */
+	regs->vp9_param.reg103.vp9_refresh_en = !error_resilient && !parallel;
+	regs->vp9_param.reg103.vp9_prob_save_en = refresh;
+	regs->vp9_param.reg103.vp9_allow_high_precision_mv =
+		!!(dec_params->flags & V4L2_VP9_FRAME_FLAG_ALLOW_HIGH_PREC_MV);
+	/* Selects the coefficient update factor (spec 8.4.3) */
+	regs->vp9_param.reg103.vp9_last_key_frame_flag =
+		vp9_ctx->last.valid &&
+		(vp9_ctx->last.flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME);
+}
+
 static void config_registers(struct rkvdec_ctx *ctx,
 			     const struct rkvdec_vp9_run *run)
 {
@@ -450,6 +694,8 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	struct rkvdec_decoded_buffer *dst, *last, *mv_ref;
 	struct rkvdec_vp9_ctx *vp9_ctx = ctx->priv;
 	struct rkvdec_vdpu381_regs_vp9 *regs = &vp9_ctx->regs;
+	dma_addr_t segmap_base = vp9_ctx->stream_tbl.dma +
+				 offsetof(struct vdpu381_vp9_stream_tbl, segmap);
 	const struct v4l2_vp9_segmentation *seg;
 	u32 pixels;
 
@@ -487,7 +733,7 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	regs->common.reg009_dec_mode.dec_mode = VDPU381_MODE_VP9;
 	rkvdec_vdpu381_set_ccu_regs(ctx, &regs->common);
 
-	regs->vp9_param.reg103.vp9_intra_only_flag = intra_only;
+	config_prob_registers(ctx, run, intra_only);
 
 	/* Set config */
 	regs->common.reg011_important_en.buf_empty_en = 1;
@@ -533,18 +779,6 @@ static void config_registers(struct rkvdec_ctx *ctx,
 		regs->common.reg032_timeout_threshold = RKVDEC_TIMEOUT_8K;
 	else
 		regs->common.reg032_timeout_threshold = RKVDEC_TIMEOUT_MAX;
-
-	/*
-	 * Reset count buffer, because decoder only output intra related syntax
-	 * counts when decoding intra frame, but update entropy need to update
-	 * all the probabilities.
-	 */
-	if (intra_only)
-		memset(vp9_ctx->count_tbl.cpu, 0, vp9_ctx->count_tbl.size);
-
-	/* Write back the CPU's view of the count table before the decoder updates it. */
-	dma_sync_single_for_device(ctx->dev->main_core->dev, vp9_ctx->count_tbl.dma,
-				   vp9_ctx->count_tbl.size, DMA_BIDIRECTIONAL);
 
 	/*
 	 * Two segmentation maps are used in turn: the hardware reads the
@@ -658,18 +892,10 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	for (i = 0; i < rkvdec_rcb_buf_count(ctx); i++)
 		regs->common_addr.rcb_base[i] = rkvdec_rcb_buf_dma_addr(ctx, i);
 
-	regs->vp9_addr.cabactbl_base = vp9_ctx->priv_tbl.dma +
-		offsetof(struct rkvdec_vp9_priv_tbl, probs);
-
-	regs->vp9_addr.vp9_count_base = vp9_ctx->count_tbl.dma;
-
-	regs->vp9_addr.vp9_segidlast_base = vp9_ctx->priv_tbl.dma +
-		offsetof(struct rkvdec_vp9_priv_tbl, segmap) +
-		(RKVDEC_VP9_MAX_SEGMAP_SIZE * vp9_ctx->last.segmapid);
-
-	regs->vp9_addr.avp9_segidcur_base = vp9_ctx->priv_tbl.dma +
-		offsetof(struct rkvdec_vp9_priv_tbl, segmap) +
-		(RKVDEC_VP9_MAX_SEGMAP_SIZE * !vp9_ctx->last.segmapid);
+	regs->vp9_addr.vp9_segidlast_base = segmap_base +
+		RKVDEC_VP9_MAX_SEGMAP_SIZE * vp9_ctx->last.segmapid;
+	regs->vp9_addr.avp9_segidcur_base = segmap_base +
+		RKVDEC_VP9_MAX_SEGMAP_SIZE * !vp9_ctx->last.segmapid;
 
 	if (!intra_only &&
 	    !(dec_params->flags & V4L2_VP9_FRAME_FLAG_ERROR_RESILIENT) &&
@@ -713,10 +939,8 @@ static int rkvdec_vp9_run_preamble(struct rkvdec_ctx *ctx,
 				   struct rkvdec_vp9_run *run)
 {
 	const struct v4l2_ctrl_vp9_frame *dec_params;
-	const struct v4l2_ctrl_vp9_compressed_hdr *prob_updates;
 	struct rkvdec_vp9_ctx *vp9_ctx = ctx->priv;
 	struct v4l2_ctrl *ctrl;
-	unsigned int fctx_idx;
 	int ret;
 
 	/* v4l2-specific stuff */
@@ -734,51 +958,15 @@ static int rkvdec_vp9_run_preamble(struct rkvdec_ctx *ctx,
 
 	run->decode_params = dec_params;
 
+	/*
+	 * Userspace parsed the compressed header (spec 6.3): the hardware
+	 * applies the probability updates itself.
+	 */
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_VP9_COMPRESSED_HDR);
 	if (WARN_ON(!ctrl))
 		return -EINVAL;
-	prob_updates = ctrl->p_cur.p;
-	vp9_ctx->cur.tx_mode = prob_updates->tx_mode;
-
-	/*
-	 * vp9 stuff
-	 *
-	 * by this point the userspace has done all parts of 6.2 uncompressed_header()
-	 * except this fragment:
-	 * if ( FrameIsIntra || error_resilient_mode ) {
-	 *	setup_past_independence ( )
-	 *	if ( frame_type == KEY_FRAME || error_resilient_mode == 1 ||
-	 *	     reset_frame_context == 3 ) {
-	 *		for ( i = 0; i < 4; i ++ ) {
-	 *			save_probs( i )
-	 *		}
-	 *	} else if ( reset_frame_context == 2 ) {
-	 *		save_probs( frame_context_idx )
-	 *	}
-	 *	frame_context_idx = 0
-	 * }
-	 */
-	fctx_idx = v4l2_vp9_reset_frame_ctx(dec_params, vp9_ctx->frame_context);
-	vp9_ctx->cur.frame_context_idx = fctx_idx;
-
-	/* 6.1 frame(sz): load_probs() and load_probs2() */
-	vp9_ctx->probability_tables = vp9_ctx->frame_context[fctx_idx];
-
-	/*
-	 * The userspace has also performed 6.3 compressed_header(), but handling the
-	 * probs in a special way. All probs which need updating, except MV-related,
-	 * have been read from the bitstream and translated through inv_map_table[],
-	 * but no 6.3.6 inv_recenter_nonneg(v, m) has been performed. The values passed
-	 * by userspace are either translated values (there are no 0 values in
-	 * inv_map_table[]), or zero to indicate no update. All MV-related probs which need
-	 * updating have been read from the bitstream and (mv_prob << 1) | 1 has been
-	 * performed. The values passed by userspace are either new values
-	 * to replace old ones (the above mentioned shift and bitwise or never result in
-	 * a zero) or zero to indicate no update.
-	 * fw_update_probs() performs actual probs updates or leaves probs as-is
-	 * for values for which a zero was passed from userspace.
-	 */
-	v4l2_vp9_fw_update_probs(&vp9_ctx->probability_tables, prob_updates, dec_params);
+	run->prob_updates = ctrl->p_cur.p;
+	vp9_ctx->cur.tx_mode = run->prob_updates->tx_mode;
 
 	return 0;
 }
@@ -788,6 +976,7 @@ static int rkvdec_vp9_run(struct rkvdec_ctx *ctx)
 	struct rkvdec_core *core = ctx->core;
 	struct rkvdec_vp9_ctx *vp9_ctx = ctx->priv;
 	struct rkvdec_vp9_run run = { };
+	bool intra_only;
 	int ret;
 
 	ret = rkvdec_vp9_run_preamble(ctx, &run);
@@ -798,11 +987,21 @@ static int rkvdec_vp9_run(struct rkvdec_ctx *ctx)
 		return ret;
 	}
 
-	/* Prepare probs. */
-	init_probs(ctx, &run);
+	intra_only = !!(run.decode_params->flags &
+			(V4L2_VP9_FRAME_FLAG_KEY_FRAME |
+			 V4L2_VP9_FRAME_FLAG_INTRA_ONLY));
+
+	/* Prepare the probability updates. */
+	vdpu381_vp9_write_updates(ctx, &run, intra_only);
 
 	/* Configure hardware registers. */
 	config_registers(ctx, &run);
+
+	/*
+	 * Everything the next frame needs from this one is known now, the
+	 * hardware keeps the probabilities and segment IDs.
+	 */
+	vp9_ctx->last = vp9_ctx->cur;
 
 	rkvdec_run_postamble(ctx, &run.base);
 
@@ -812,171 +1011,6 @@ static int rkvdec_vp9_run(struct rkvdec_ctx *ctx)
 	writel(VDPU381_DEC_E_BIT, core->regs + VDPU381_REG_DEC_E);
 
 	return 0;
-}
-
-#define copy_tx_and_skip(p1, p2)				\
-do {								\
-	memcpy((p1)->tx8, (p2)->tx8, sizeof((p1)->tx8));	\
-	memcpy((p1)->tx16, (p2)->tx16, sizeof((p1)->tx16));	\
-	memcpy((p1)->tx32, (p2)->tx32, sizeof((p1)->tx32));	\
-	memcpy((p1)->skip, (p2)->skip, sizeof((p1)->skip));	\
-} while (0)
-
-static void rkvdec_vp9_done(struct rkvdec_ctx *ctx,
-			    struct vb2_v4l2_buffer *src_buf,
-			    struct vb2_v4l2_buffer *dst_buf,
-			    enum vb2_buffer_state result)
-{
-	struct rkvdec_vp9_ctx *vp9_ctx = ctx->priv;
-	unsigned int fctx_idx;
-
-	/* v4l2-specific stuff */
-	if (result == VB2_BUF_STATE_ERROR)
-		goto out_update_last;
-
-	/*
-	 * vp9 stuff
-	 *
-	 * 6.1.2 refresh_probs()
-	 *
-	 * In the spec a complementary condition goes last in 6.1.2 refresh_probs(),
-	 * but it makes no sense to perform all the activities from the first "if"
-	 * there if we actually are not refreshing the frame context. On top of that,
-	 * because of 6.2 uncompressed_header() whenever error_resilient_mode == 1,
-	 * refresh_frame_context == 0. Consequently, if we don't jump to out_update_last
-	 * it means error_resilient_mode must be 0.
-	 */
-	if (!(vp9_ctx->cur.flags & V4L2_VP9_FRAME_FLAG_REFRESH_FRAME_CTX))
-		goto out_update_last;
-
-	fctx_idx = vp9_ctx->cur.frame_context_idx;
-
-	if (!(vp9_ctx->cur.flags & V4L2_VP9_FRAME_FLAG_PARALLEL_DEC_MODE)) {
-		/* error_resilient_mode == 0 && frame_parallel_decoding_mode == 0 */
-		struct v4l2_vp9_frame_context *probs = &vp9_ctx->probability_tables;
-		bool frame_is_intra = vp9_ctx->cur.flags &
-		    (V4L2_VP9_FRAME_FLAG_KEY_FRAME | V4L2_VP9_FRAME_FLAG_INTRA_ONLY);
-		struct tx_and_skip {
-			u8 tx8[2][1];
-			u8 tx16[2][2];
-			u8 tx32[2][3];
-			u8 skip[3];
-		} _tx_skip, *tx_skip = &_tx_skip;
-		struct v4l2_vp9_frame_symbol_counts *counts;
-
-		/* buffer the forward-updated TX and skip probs */
-		if (frame_is_intra)
-			copy_tx_and_skip(tx_skip, probs);
-
-		/* 6.1.2 refresh_probs(): load_probs() and load_probs2() */
-		*probs = vp9_ctx->frame_context[fctx_idx];
-
-		/* if FrameIsIntra then undo the effect of load_probs2() */
-		if (frame_is_intra)
-			copy_tx_and_skip(probs, tx_skip);
-
-		/* make the symbol counts written by the decoder visible to the CPU */
-		dma_sync_single_for_cpu(ctx->dev->main_core->dev, vp9_ctx->count_tbl.dma,
-					vp9_ctx->count_tbl.size, DMA_BIDIRECTIONAL);
-
-		counts = frame_is_intra ? &vp9_ctx->intra_cnts : &vp9_ctx->inter_cnts;
-		v4l2_vp9_adapt_coef_probs(probs, counts,
-					  !vp9_ctx->last.valid ||
-					  vp9_ctx->last.flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME,
-					  frame_is_intra);
-		if (!frame_is_intra) {
-			const struct rkvdec_vp9_inter_frame_symbol_counts *inter_cnts;
-			u32 classes[2][11];
-			int i;
-
-			inter_cnts = vp9_ctx->count_tbl.cpu;
-			for (i = 0; i < ARRAY_SIZE(classes); ++i)
-				memcpy(classes[i], inter_cnts->classes[i], sizeof(classes[0]));
-			counts->classes = &classes;
-
-			/* load_probs2() already done */
-			v4l2_vp9_adapt_noncoef_probs(&vp9_ctx->probability_tables, counts,
-						     vp9_ctx->cur.reference_mode,
-						     vp9_ctx->cur.interpolation_filter,
-						     vp9_ctx->cur.tx_mode, vp9_ctx->cur.flags);
-		}
-	}
-
-	/* 6.1.2 refresh_probs(): save_probs(fctx_idx) */
-	vp9_ctx->frame_context[fctx_idx] = vp9_ctx->probability_tables;
-
-out_update_last:
-	update_ctx_last_info(vp9_ctx);
-}
-
-static void rkvdec_init_v4l2_vp9_count_tbl(struct rkvdec_ctx *ctx)
-{
-	struct rkvdec_vp9_ctx *vp9_ctx = ctx->priv;
-	struct rkvdec_vp9_intra_frame_symbol_counts *intra_cnts = vp9_ctx->count_tbl.cpu;
-	struct rkvdec_vp9_inter_frame_symbol_counts *inter_cnts = vp9_ctx->count_tbl.cpu;
-	int i, j, k, l, m;
-
-	vp9_ctx->inter_cnts.partition = &inter_cnts->partition;
-	vp9_ctx->inter_cnts.skip = &inter_cnts->skip;
-	vp9_ctx->inter_cnts.intra_inter = &inter_cnts->inter;
-	vp9_ctx->inter_cnts.tx32p = &inter_cnts->tx32p;
-	vp9_ctx->inter_cnts.tx16p = &inter_cnts->tx16p;
-	vp9_ctx->inter_cnts.tx8p = &inter_cnts->tx8p;
-
-	vp9_ctx->intra_cnts.partition = (u32 (*)[16][4])(&intra_cnts->partition);
-	vp9_ctx->intra_cnts.skip = &intra_cnts->skip;
-	vp9_ctx->intra_cnts.intra_inter = &intra_cnts->intra;
-	vp9_ctx->intra_cnts.tx32p = &intra_cnts->tx32p;
-	vp9_ctx->intra_cnts.tx16p = &intra_cnts->tx16p;
-	vp9_ctx->intra_cnts.tx8p = &intra_cnts->tx8p;
-
-	vp9_ctx->inter_cnts.y_mode = &inter_cnts->y_mode;
-	vp9_ctx->inter_cnts.uv_mode = &inter_cnts->uv_mode;
-	vp9_ctx->inter_cnts.comp = &inter_cnts->comp;
-	vp9_ctx->inter_cnts.comp_ref = &inter_cnts->comp_ref;
-	vp9_ctx->inter_cnts.single_ref = &inter_cnts->single_ref;
-	vp9_ctx->inter_cnts.mv_mode = &inter_cnts->mv_mode;
-	vp9_ctx->inter_cnts.filter = &inter_cnts->filter;
-	vp9_ctx->inter_cnts.mv_joint = &inter_cnts->mv_joint;
-	vp9_ctx->inter_cnts.sign = &inter_cnts->sign;
-	/*
-	 * rk hardware actually uses "u32 classes[2][11 + 1];"
-	 * instead of "u32 classes[2][11];", so this must be explicitly
-	 * copied into vp9_ctx->classes when passing the data to the
-	 * vp9 library function
-	 */
-	vp9_ctx->inter_cnts.class0 = &inter_cnts->class0;
-	vp9_ctx->inter_cnts.bits = &inter_cnts->bits;
-	vp9_ctx->inter_cnts.class0_fp = &inter_cnts->class0_fp;
-	vp9_ctx->inter_cnts.fp = &inter_cnts->fp;
-	vp9_ctx->inter_cnts.class0_hp = &inter_cnts->class0_hp;
-	vp9_ctx->inter_cnts.hp = &inter_cnts->hp;
-
-#define INNERMOST_LOOP \
-	do {										\
-		for (m = 0; m < ARRAY_SIZE(vp9_ctx->inter_cnts.coeff[0][0][0][0]); ++m) {\
-			vp9_ctx->inter_cnts.coeff[i][j][k][l][m] =			\
-				&inter_cnts->ref_cnt[k][i][j][l][m].coeff;		\
-			vp9_ctx->inter_cnts.eob[i][j][k][l][m][0] =			\
-				&inter_cnts->ref_cnt[k][i][j][l][m].eob[0];		\
-			vp9_ctx->inter_cnts.eob[i][j][k][l][m][1] =			\
-				&inter_cnts->ref_cnt[k][i][j][l][m].eob[1];		\
-											\
-			vp9_ctx->intra_cnts.coeff[i][j][k][l][m] =			\
-				&intra_cnts->ref_cnt[k][i][j][l][m].coeff;		\
-			vp9_ctx->intra_cnts.eob[i][j][k][l][m][0] =			\
-				&intra_cnts->ref_cnt[k][i][j][l][m].eob[0];		\
-			vp9_ctx->intra_cnts.eob[i][j][k][l][m][1] =			\
-				&intra_cnts->ref_cnt[k][i][j][l][m].eob[1];		\
-		}									\
-	} while (0)
-
-	for (i = 0; i < ARRAY_SIZE(vp9_ctx->inter_cnts.coeff); ++i)
-		for (j = 0; j < ARRAY_SIZE(vp9_ctx->inter_cnts.coeff[0]); ++j)
-			for (k = 0; k < ARRAY_SIZE(vp9_ctx->inter_cnts.coeff[0][0]); ++k)
-				for (l = 0; l < ARRAY_SIZE(vp9_ctx->inter_cnts.coeff[0][0][0]); ++l)
-					INNERMOST_LOOP;
-#undef INNERMOST_LOOP
 }
 
 static int rkvdec_vp9_validate_frame(const struct v4l2_ctrl_vp9_frame *frame)
@@ -998,14 +1032,48 @@ static int rkvdec_vp9_try_ctrl(struct rkvdec_ctx *ctx, struct v4l2_ctrl *ctrl)
 	return 0;
 }
 
+static void rkvdec_vp9_free_tbls(struct rkvdec_ctx *ctx)
+{
+	struct rkvdec_vp9_ctx *vp9_ctx = ctx->priv;
+	struct device *dev = ctx->dev->main_core->dev;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(vp9_ctx->job_tbl); i++) {
+		struct rkvdec_aux_buf *buf = &vp9_ctx->job_tbl[i];
+
+		if (buf->cpu)
+			dma_free_coherent(dev, buf->size, buf->cpu, buf->dma);
+	}
+
+	if (vp9_ctx->stream_tbl.cpu)
+		dma_free_coherent(dev, vp9_ctx->stream_tbl.size,
+				  vp9_ctx->stream_tbl.cpu, vp9_ctx->stream_tbl.dma);
+}
+
+static int rkvdec_vp9_alloc_tbl(struct rkvdec_ctx *ctx,
+				struct rkvdec_aux_buf *buf, size_t size)
+{
+	buf->cpu = dma_alloc_coherent(ctx->dev->main_core->dev, size, &buf->dma,
+				      GFP_KERNEL);
+	if (!buf->cpu)
+		return -ENOMEM;
+
+	buf->size = size;
+	return 0;
+}
+
 static int rkvdec_vp9_start(struct rkvdec_ctx *ctx)
 {
-	struct rkvdec_dev *rkvdec = ctx->dev;
-	struct rkvdec_vp9_priv_tbl *priv_tbl;
+	struct vdpu381_vp9_stream_tbl *stream_tbl;
 	struct rkvdec_vp9_ctx *vp9_ctx;
-	unsigned char *count_tbl;
 	struct v4l2_ctrl *ctrl;
+	unsigned int i;
 	int ret;
+
+	BUILD_BUG_ON(sizeof(struct vdpu381_vp9_probs_head) != 5 * 16);
+	BUILD_BUG_ON(sizeof(struct vdpu381_vp9_frame_probs) != 153 * 16);
+	BUILD_BUG_ON(sizeof(struct vdpu381_vp9_inter_updates) > VDPU381_VP9_PROB_TBL_SIZE);
+	BUILD_BUG_ON(sizeof(struct vdpu381_vp9_intra_updates) > VDPU381_VP9_PROB_TBL_SIZE);
 
 	/* frame header */
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_VP9_FRAME);
@@ -1022,58 +1090,32 @@ static int rkvdec_vp9_start(struct rkvdec_ctx *ctx)
 
 	ctx->priv = vp9_ctx;
 
-	BUILD_BUG_ON(sizeof(priv_tbl->probs) % 16); /* ensure probs size is 128-bit aligned */
-	priv_tbl = dma_alloc_coherent(rkvdec->main_core->dev, sizeof(*priv_tbl),
-				      &vp9_ctx->priv_tbl.dma, GFP_KERNEL);
-	if (!priv_tbl) {
-		ret = -ENOMEM;
-		goto err_free_ctx;
+	ret = rkvdec_vp9_alloc_tbl(ctx, &vp9_ctx->stream_tbl, sizeof(*stream_tbl));
+	if (ret)
+		goto err_free;
+
+	stream_tbl = vp9_ctx->stream_tbl.cpu;
+	vdpu381_vp9_write_default_probs(&stream_tbl->default_probs.probs);
+
+	for (i = 0; i < ctx->num_job_slots; i++) {
+		ret = rkvdec_vp9_alloc_tbl(ctx, &vp9_ctx->job_tbl[i],
+					   sizeof(struct vdpu381_vp9_job_tbl));
+		if (ret)
+			goto err_free;
 	}
-
-	vp9_ctx->priv_tbl.size = sizeof(*priv_tbl);
-	vp9_ctx->priv_tbl.cpu = priv_tbl;
-
-	/*
-	 * The CPU reads every symbol count back for the backward adaptation,
-	 * one 32-bit word at a time, so keep the table cacheable and
-	 * maintain it explicitly instead of using an uncached mapping.
-	 */
-	count_tbl = dma_alloc_noncoherent(rkvdec->main_core->dev, RKVDEC_VP9_COUNT_SIZE,
-					  &vp9_ctx->count_tbl.dma, DMA_BIDIRECTIONAL,
-					  GFP_KERNEL);
-	if (!count_tbl) {
-		ret = -ENOMEM;
-		goto err_free_priv_tbl;
-	}
-
-	vp9_ctx->count_tbl.size = RKVDEC_VP9_COUNT_SIZE;
-	vp9_ctx->count_tbl.cpu = count_tbl;
-	rkvdec_init_v4l2_vp9_count_tbl(ctx);
 
 	return 0;
 
-err_free_priv_tbl:
-	dma_free_coherent(rkvdec->main_core->dev, vp9_ctx->priv_tbl.size,
-			  vp9_ctx->priv_tbl.cpu, vp9_ctx->priv_tbl.dma);
-
-err_free_ctx:
+err_free:
+	rkvdec_vp9_free_tbls(ctx);
 	kfree(vp9_ctx);
 	return ret;
 }
 
 static void rkvdec_vp9_stop(struct rkvdec_ctx *ctx)
 {
-	struct rkvdec_vp9_ctx *vp9_ctx = ctx->priv;
-	struct rkvdec_dev *rkvdec = ctx->dev;
-
-	dma_free_noncoherent(rkvdec->main_core->dev, vp9_ctx->count_tbl.size,
-			     vp9_ctx->count_tbl.cpu, vp9_ctx->count_tbl.dma,
-			     DMA_BIDIRECTIONAL);
-
-	dma_free_coherent(rkvdec->main_core->dev, vp9_ctx->priv_tbl.size,
-			  vp9_ctx->priv_tbl.cpu, vp9_ctx->priv_tbl.dma);
-
-	kfree(vp9_ctx);
+	rkvdec_vp9_free_tbls(ctx);
+	kfree(ctx->priv);
 }
 
 static int rkvdec_vp9_adjust_fmt(struct rkvdec_ctx *ctx,
@@ -1110,7 +1152,6 @@ const struct rkvdec_coded_fmt_ops rkvdec_vdpu381_vp9_fmt_ops = {
 	.start = rkvdec_vp9_start,
 	.stop = rkvdec_vp9_stop,
 	.run = rkvdec_vp9_run,
-	.done = rkvdec_vp9_done,
 	.try_ctrl = rkvdec_vp9_try_ctrl,
 	.get_image_fmt = rkvdec_vp9_get_image_fmt,
 };
