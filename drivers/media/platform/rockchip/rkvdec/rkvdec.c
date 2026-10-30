@@ -1544,6 +1544,15 @@ static int rkvdec_job_poc_alias(struct rkvdec_ctx *ctx)
 		/* It failed: this frame predicts from it, or waits for it. */
 		if (prev->core && prev->core->needs_reset)
 			return -EIO;
+		/*
+		 * A core writing a field picture is known to the CCU by the POC
+		 * and parity of that field, a core writing a frame picture by its
+		 * POCs with parity 0: a frame picture reading the bottom field
+		 * of a field pair, or a field picture reading the bottom field of
+		 * a frame, isn't held back. Don't overlap the two kinds.
+		 */
+		if (prev->field_pic != job->field_pic)
+			return 1;
 		for (i = 0; i < prev->num_ref_pocs; i++)
 			for (j = 0; j < job->num_pocs; j++)
 				if (prev->ref_pocs[i] == job->pocs[j])
