@@ -1064,9 +1064,20 @@ static void rkvdec_buf_request_complete(struct vb2_buffer *vb)
 	v4l2_ctrl_request_complete(vb->req_obj.req, &ctx->ctrl_hdl);
 }
 
+static bool rkvdec_ctx_idle(struct rkvdec_ctx *ctx)
+{
+	guard(spinlock_irqsave)(&ctx->dev->cores_lock);
+
+	return !ctx->num_jobs && !ctx->num_completers;
+}
+
+/*
+ * Waits until no job of @ctx is in flight and no completion path uses @ctx
+ * anymore: the caller may free it once this returns.
+ */
 static void rkvdec_ctx_wait_jobs(struct rkvdec_ctx *ctx)
 {
-	wait_event(ctx->jobs_wq, !READ_ONCE(ctx->num_jobs));
+	wait_event(ctx->jobs_wq, rkvdec_ctx_idle(ctx));
 }
 
 static int rkvdec_start_streaming(struct vb2_queue *q, unsigned int count)
@@ -1199,6 +1210,17 @@ static struct rkvdec_job *rkvdec_job_start(struct rkvdec_ctx *ctx)
 	lockdep_assert_held(&ctx->done_lock);
 	guard(spinlock_irqsave)(&rkvdec->cores_lock);
 
+	/*
+	 * No new job while the cores wait to be reset, see rkvdec_core_failed():
+	 * the reset work runs this m2m job once it is done. Checked with the
+	 * core taken under the same lock, so that the reset never sees a core
+	 * idle that is being set up.
+	 */
+	if (rkvdec->ccu_reset_pending) {
+		rkvdec->deferred_ctx = ctx;
+		return ERR_PTR(-EAGAIN);
+	}
+
 	slot = find_first_zero_bit(&ctx->busy_slots, ctx->num_job_slots);
 	if (!rkvdec->available_core_count || slot >= ctx->num_job_slots)
 		return NULL;
@@ -1291,7 +1313,15 @@ static struct rkvdec_job *rkvdec_ctx_next_dst_user(struct rkvdec_ctx *ctx,
 static void rkvdec_ctx_complete_jobs(struct rkvdec_ctx *ctx)
 {
 	struct rkvdec_dev *rkvdec = ctx->dev;
-	bool completed = false, schedule = false;
+	bool schedule = false;
+
+	/*
+	 * Once the last job is completed, a context being closed may be freed
+	 * as soon as rkvdec_ctx_wait_jobs() sees it idle: pin it until this
+	 * function doesn't use it anymore.
+	 */
+	scoped_guard(spinlock_irqsave, &rkvdec->cores_lock)
+		ctx->num_completers++;
 
 	mutex_lock(&ctx->done_lock);
 	while (true) {
@@ -1332,14 +1362,17 @@ static void rkvdec_ctx_complete_jobs(struct rkvdec_ctx *ctx)
 		 * rkvdec_job_ready() again.
 		 */
 		schedule |= detached;
-		completed = true;
 	}
 	mutex_unlock(&ctx->done_lock);
 
-	if (completed)
-		wake_up(&ctx->jobs_wq);
 	if (schedule)
 		v4l2_m2m_try_schedule(ctx->fh.m2m_ctx);
+
+	/* @ctx may be freed as soon as the lock is released: don't touch it after. */
+	scoped_guard(spinlock_irqsave, &rkvdec->cores_lock) {
+		ctx->num_completers--;
+		wake_up(&ctx->jobs_wq);
+	}
 }
 
 /*
@@ -1685,19 +1718,10 @@ static void rkvdec_device_run(void *priv)
 	struct rkvdec_job *job;
 	int ret;
 
-	/*
-	 * No new job while the cores wait to be reset, see rkvdec_core_failed():
-	 * the reset work runs this m2m job once it is done.
-	 */
-	scoped_guard(spinlock_irqsave, &ctx->dev->cores_lock) {
-		if (ctx->dev->ccu_reset_pending) {
-			ctx->dev->deferred_ctx = ctx;
-			return;
-		}
-	}
-
 	scoped_guard(mutex, &ctx->done_lock)
 		job = rkvdec_job_start(ctx);
+	if (IS_ERR(job))
+		return;
 	if (WARN_ON(!job)) {
 		v4l2_m2m_buf_done_and_job_finish(m2m_ctx->m2m_dev, m2m_ctx,
 						 VB2_BUF_STATE_ERROR);
