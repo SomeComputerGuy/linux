@@ -173,6 +173,7 @@ struct rk_udphy {
 
 	/* PHY status management */
 	bool flip;
+	bool attached; /* the Type-C orientation is known */
 	bool phy_needs_reinit; /* lane mux changed */
 	u8 hw_mode; /* modes currently supported by hardware */
 	u8 sw_mode; /* modes currently requested */
@@ -583,6 +584,40 @@ static void rk_udphy_dp_lane_enable(struct rk_udphy *udphy, int dp_lanes)
 				   CMN_DP_CMN_RSTN, FIELD_PREP(CMN_DP_CMN_RSTN, 0x0));
 }
 
+/*
+ * Start or stop the DP half of an initialized PHY. The DP side has no reset
+ * line of its own: it is held in reset by CMN_DP_INIT_RSTN and its PLL by
+ * CMN_DP_CMN_RSTN, which rk_udphy_dp_phy_configure() releases when the link
+ * rate is set. The USB3 lanes, LCPLL and their resets are not affected.
+ */
+static void rk_udphy_dp_enable(struct rk_udphy *udphy, bool enable)
+{
+	if (!enable)
+		rk_udphy_dp_lane_enable(udphy, 0);
+
+	regmap_update_bits(udphy->pma_regmap, CMN_DP_RSTN_OFFSET, CMN_DP_INIT_RSTN,
+			   FIELD_PREP(CMN_DP_INIT_RSTN, enable));
+
+	if (enable)
+		udelay(1);
+}
+
+/*
+ * The DP PHY may already be powered on when the DP side is (re-)initialized
+ * underneath it, e.g. when the Type-C mux changes the pin assignment while DP
+ * is in use. Enable the lanes of the new configuration again, as
+ * rk_udphy_dp_phy_power_on() does, so that the DP controller can retrain.
+ */
+static void rk_udphy_dp_restore_lanes(struct rk_udphy *udphy, u8 target_mode)
+{
+	if (!(udphy->sw_mode & UDPHY_MODE_DP) || !(target_mode & UDPHY_MODE_DP))
+		return;
+
+	phy_set_bus_width(udphy->phy_dp, udphy->dp_lanes);
+	rk_udphy_dp_lane_enable(udphy, udphy->dp_lanes);
+	rk_udphy_dp_lane_select(udphy);
+}
+
 static void rk_udphy_set_lane_mux(struct rk_udphy *udphy)
 {
 	if (udphy->dp_lanes == 4) {
@@ -610,7 +645,19 @@ static void rk_udphy_mode_set(struct rk_udphy *udphy, u8 hw_mode, u8 dp_lanes)
 	if (udphy->hw_mode == hw_mode && udphy->dp_lanes == dp_lanes)
 		return;
 
-	udphy->phy_needs_reinit = true;
+	/*
+	 * USB-only mode and USB3 + 2 lane DP (pin assignment D) use the same
+	 * lane mux (see rk_udphy_set_lane_mux()): the USB3 lanes stay where
+	 * they are and only the DP half of the PHY has to be started or
+	 * stopped, which rk_udphy_update_power_state() does without touching
+	 * the USB3 side. Only request a full re-init, which resets the USB3
+	 * lanes and disconnects any SuperSpeed device, if the USB3 part is
+	 * switched on or off or the lane routing changes (4 lane DP).
+	 */
+	if (((udphy->hw_mode ^ hw_mode) & UDPHY_MODE_USB) ||
+	    udphy->dp_lanes == 4 || dp_lanes == 4)
+		udphy->phy_needs_reinit = true;
+
 	udphy->hw_mode = hw_mode;
 	udphy->dp_lanes = dp_lanes;
 }
@@ -676,14 +723,25 @@ static int rk_udphy_orien_sw_set(struct typec_switch_dev *sw,
 		gpiod_set_value_cansleep(udphy->sbu2_dc_gpio, 0);
 		/* unattached */
 		rk_udphy_usb_bvalid_enable(udphy, false);
+		udphy->attached = false;
 
 		return 0;
 	}
 
-	if (udphy->flip != flipped) {
-		dev_dbg(udphy->dev, "cable orientation changed, PHY re-init required.\n");
+	/*
+	 * The DP AUX channel only works if the PHY is initialized after the
+	 * SBU lines are biased and the AUX polarity is set for the cable
+	 * orientation (rk_udphy_set_typec_default_mapping()), so re-init on
+	 * attach too, not only when the orientation changes. This happens
+	 * before the partner's USB devices enumerate.
+	 */
+	if (udphy->flip != flipped || !udphy->attached) {
+		dev_dbg(udphy->dev, "cable %s, PHY re-init required.\n",
+			udphy->attached ? "orientation changed" : "attached");
 		udphy->phy_needs_reinit = true;
 	}
+
+	udphy->attached = true;
 
 	udphy->flip = flipped;
 	rk_udphy_set_typec_default_mapping(udphy);
@@ -1071,6 +1129,28 @@ static int rk_udphy_update_power_state(struct rk_udphy *udphy)
 		return 0;
 
 	/*
+	 * Only the DP half changes (USB-only <-> USB3 + DP, same lane mux):
+	 * start or stop it without resetting the PHY, so that the USB3 link
+	 * of a device using the other two lanes (e.g. a USB-C dock with a hub)
+	 * survives DP AltMode entry and exit.
+	 */
+	if (!udphy->phy_needs_reinit && udphy->status != UDPHY_MODE_NONE &&
+	    target_mode != UDPHY_MODE_NONE) {
+		dev_dbg(udphy->dev, "%s DP (%u lanes), keeping USB3=%s\n",
+			str_enable_disable(target_mode & UDPHY_MODE_DP),
+			udphy->dp_lanes, str_on_off(target_mode & UDPHY_MODE_USB));
+
+		rk_udphy_dp_enable(udphy, target_mode & UDPHY_MODE_DP);
+		rk_udphy_dp_restore_lanes(udphy, target_mode);
+
+		if (udphy->sw_mode & UDPHY_MODE_USB)
+			rk_udphy_u3_port_disable(udphy, !usb3_port_enable);
+
+		udphy->status = target_mode;
+		return 0;
+	}
+
+	/*
 	 * Inform DWC3 driver, that we are about to reset the PHY, so that it can
 	 * assert its PIPE reset lines and avoid DWC3 getting into a buggy state.
 	 * This is intentionally done for a PHY disable, since that also changes
@@ -1107,18 +1187,8 @@ static int rk_udphy_update_power_state(struct rk_udphy *udphy)
 			return ret;
 		}
 
-		/*
-		 * rk_udphy_init() leaves all DP lanes disabled. If the DP PHY
-		 * is powered on (the Type-C mux changed the pin assignment
-		 * while DP is in use), enable the lanes of the new
-		 * configuration again, as rk_udphy_dp_phy_power_on() does, so
-		 * that the DP controller can retrain the link.
-		 */
-		if ((udphy->sw_mode & UDPHY_MODE_DP) && (target_mode & UDPHY_MODE_DP)) {
-			phy_set_bus_width(udphy->phy_dp, udphy->dp_lanes);
-			rk_udphy_dp_lane_enable(udphy, udphy->dp_lanes);
-			rk_udphy_dp_lane_select(udphy);
-		}
+		/* rk_udphy_init() leaves all DP lanes disabled */
+		rk_udphy_dp_restore_lanes(udphy, target_mode);
 	}
 
 	/* Ensure USB3 support is enabled when supported */
