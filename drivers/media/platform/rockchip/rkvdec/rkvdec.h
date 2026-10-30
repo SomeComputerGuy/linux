@@ -266,6 +266,7 @@ struct rkvdec_ctx {
 	unsigned long busy_slots;
 	struct list_head jobs;
 	unsigned int num_jobs;
+	unsigned int num_completers; /* pin the context while completing jobs */
 	wait_queue_head_t jobs_wq;
 	/* completes the jobs in decoding order, serializes it with new jobs */
 	struct mutex done_lock;
