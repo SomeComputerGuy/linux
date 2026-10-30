@@ -1176,14 +1176,26 @@ static const struct media_device_ops rkvdec_media_ops = {
  * The jobs of a context complete in decoding order. Whether the next frame of
  * a context may start before the previous one is done is decided by
  * rkvdec_job_ready().
+ *
+ * The two fields of an interlaced frame are two jobs that write the same
+ * CAPTURE buffer, which the first one holds for the second one
+ * (V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF). Detaching the first job keeps the
+ * buffer held on the m2m queue, so the second field can start while the first
+ * one is being decoded. The CAPTURE buffer is returned by the last of the
+ * jobs that write it to complete (or kept held by m2m if the hold isn't
+ * released yet), see rkvdec_ctx_complete_jobs(). Jobs are registered under
+ * ctx->done_lock, so that a completing job sees every other job that uses its
+ * CAPTURE buffer.
  */
 static struct rkvdec_job *rkvdec_job_start(struct rkvdec_ctx *ctx)
 {
+	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
 	struct rkvdec_dev *rkvdec = ctx->dev;
 	struct rkvdec_core *core;
 	struct rkvdec_job *job;
 	unsigned int slot;
 
+	lockdep_assert_held(&ctx->done_lock);
 	guard(spinlock_irqsave)(&rkvdec->cores_lock);
 
 	slot = find_first_zero_bit(&ctx->busy_slots, ctx->num_job_slots);
@@ -1200,6 +1212,8 @@ static struct rkvdec_job *rkvdec_job_start(struct rkvdec_ctx *ctx)
 	job->slot = slot;
 	job->state = VB2_BUF_STATE_ERROR;
 	job->busy = true;
+	job->src = v4l2_m2m_next_src_buf(m2m_ctx);
+	job->dst = v4l2_m2m_next_dst_buf(m2m_ctx);
 	core->job = job;
 
 	__set_bit(slot, &ctx->busy_slots);
@@ -1227,22 +1241,49 @@ static void rkvdec_job_detach(struct rkvdec_job *job)
 	}
 }
 
-static void rkvdec_job_complete(struct rkvdec_job *job)
+/*
+ * Returns the buffers of @job. @dst_in_use: a later job writes the CAPTURE
+ * buffer too, and returns it.
+ */
+static void rkvdec_job_complete(struct rkvdec_job *job, bool dst_in_use)
 {
 	struct rkvdec_ctx *ctx = job->ctx;
 	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
+	enum vb2_buffer_state dst_state = job->state;
+
+	if (job->dst_error)
+		dst_state = VB2_BUF_STATE_ERROR;
 
 	if (ctx->coded_fmt_desc->ops->done)
 		ctx->coded_fmt_desc->ops->done(ctx, job->src, job->dst, job->state);
 
 	if (job->detached) {
 		/* Return the CAPTURE buffer first, see v4l2_m2m_buf_done_and_job_finish() */
-		v4l2_m2m_buf_done(job->dst, job->state);
+		if (!dst_in_use)
+			v4l2_m2m_detached_buf_done(m2m_ctx, job->dst, dst_state);
 		v4l2_m2m_buf_done(job->src, job->state);
 	} else {
 		v4l2_m2m_buf_done_and_job_finish(m2m_ctx->m2m_dev, m2m_ctx,
 						 job->state);
+		/* m2m hands a held buffer that detached jobs wrote over to us. */
+		if (job->dst_shared)
+			v4l2_m2m_detached_buf_done(m2m_ctx, job->dst, dst_state);
 	}
+}
+
+/* Returns the next job of @ctx that writes the CAPTURE buffer of @job. */
+static struct rkvdec_job *rkvdec_ctx_next_dst_user(struct rkvdec_ctx *ctx,
+						   struct rkvdec_job *job)
+{
+	struct rkvdec_job *next;
+
+	lockdep_assert_held(&ctx->dev->cores_lock);
+
+	list_for_each_entry(next, &ctx->jobs, node)
+		if (next->dst == job->dst)
+			return next;
+
+	return NULL;
 }
 
 /* Completes the finished jobs at the head of the job list of @ctx. */
@@ -1253,22 +1294,32 @@ static void rkvdec_ctx_complete_jobs(struct rkvdec_ctx *ctx)
 
 	mutex_lock(&ctx->done_lock);
 	while (true) {
-		struct rkvdec_job *job;
-		bool detached;
+		struct rkvdec_job *job, *next = NULL;
+		bool detached, dst_in_use = false;
 
 		scoped_guard(spinlock_irqsave, &rkvdec->cores_lock) {
 			job = list_first_entry_or_null(&ctx->jobs,
 						       struct rkvdec_job, node);
 			if (job && (!job->hw_done || job->busy))
 				job = NULL;
-			if (job)
+			if (job) {
 				list_del(&job->node);
+				next = rkvdec_ctx_next_dst_user(ctx, job);
+			}
 		}
 		if (!job)
 			break;
 
+		/* The other field of the frame is still being decoded. */
+		if (next) {
+			next->dst_shared = true;
+			if (job->dst_error || job->state == VB2_BUF_STATE_ERROR)
+				next->dst_error = true;
+			dst_in_use = true;
+		}
+
 		detached = job->detached;
-		rkvdec_job_complete(job);
+		rkvdec_job_complete(job, dst_in_use);
 
 		scoped_guard(spinlock_irqsave, &rkvdec->cores_lock) {
 			__clear_bit(job->slot, &ctx->busy_slots);
@@ -1390,10 +1441,7 @@ static void rkvdec_job_started(struct rkvdec_job *job)
 	bool detach = false;
 
 	scoped_guard(spinlock_irqsave, &rkvdec->cores_lock) {
-		if (job->src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF) {
-			/* Keeps the CAPTURE buffer: complete it the usual way. */
-			job->busy = false;
-		} else if (rkvdec->available_core_count) {
+		if (rkvdec->available_core_count) {
 			detach = true;
 		} else {
 			rkvdec->held_job = job;
@@ -1509,10 +1557,17 @@ static int rkvdec_job_ready(void *priv)
 	if (ctx->num_jobs >= ctx->num_job_slots || !rkvdec_ctx_uses_ccu(ctx))
 		return 0;
 
-	/* A CAPTURE buffer shared by two jobs (two fields): one at a time. */
-	if (!src || !dst || dst->is_held ||
-	    (src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF))
+	if (!src || !dst)
 		return 0;
+
+	/*
+	 * A held CAPTURE buffer is written by the job of the first field of
+	 * the frame: the second field may start while the first one is being
+	 * decoded, the CCU makes it wait for the first field's lines it
+	 * predicts from (the fields are told apart by their POC high bits).
+	 */
+	if (dst->is_held)
+		return 1;
 
 	/*
 	 * Userspace may queue a CAPTURE buffer again as soon as no future frame
@@ -1616,7 +1671,8 @@ static void rkvdec_device_run(void *priv)
 	struct rkvdec_job *job;
 	int ret;
 
-	job = rkvdec_job_start(ctx);
+	scoped_guard(mutex, &ctx->done_lock)
+		job = rkvdec_job_start(ctx);
 	if (WARN_ON(!job)) {
 		v4l2_m2m_buf_done_and_job_finish(m2m_ctx->m2m_dev, m2m_ctx,
 						 VB2_BUF_STATE_ERROR);
@@ -1624,8 +1680,6 @@ static void rkvdec_device_run(void *priv)
 	}
 
 	core = job->core;
-	job->src = v4l2_m2m_next_src_buf(m2m_ctx);
-	job->dst = v4l2_m2m_next_dst_buf(m2m_ctx);
 	ctx->core = core;
 	ctx->job = job;
 
