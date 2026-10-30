@@ -627,6 +627,7 @@ static const struct rkvdec_coded_fmt_desc vdpu381_coded_fmts[] = {
 		.ops = &rkvdec_vdpu381_vp9_fmt_ops,
 		.num_decoded_fmts = ARRAY_SIZE(rkvdec_vdpu381_vp9_decoded_fmts),
 		.decoded_fmts = rkvdec_vdpu381_vp9_decoded_fmts,
+		.flags = RKVDEC_FMT_FLAG_PIPELINE,
 	}
 };
 
