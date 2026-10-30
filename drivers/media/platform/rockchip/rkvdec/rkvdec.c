@@ -2756,7 +2756,10 @@ static int rkvdec_core_probe(struct platform_device *pdev)
 		}
 	}
 
-	ret = devm_clk_bulk_get_all_enabled(&pdev->dev, &core->clocks);
+	if (IS_ENABLED(CONFIG_PM))
+		ret = devm_clk_bulk_get_all(&pdev->dev, &core->clocks);
+	else
+		ret = devm_clk_bulk_get_all_enabled(&pdev->dev, &core->clocks);
 	if (ret < 0)
 		return ret;
 	core->num_clocks = ret;
