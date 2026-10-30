@@ -59,6 +59,8 @@ struct rkvdec_vp9_decoded_buffer_info {
 	unsigned short width;
 	unsigned short height;
 	unsigned int bit_depth : 4;
+	/* Tells the frame apart from the other frames of the stream in the CCU */
+	u16 poc;
 };
 
 struct rkvdec_decoded_buffer {
