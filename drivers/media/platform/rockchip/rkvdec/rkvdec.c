@@ -1259,6 +1259,9 @@ void rkvdec_schedule_watchdog(struct rkvdec_core *core, u32 timeout_threshold)
 	u32 watchdog_time;
 	unsigned long axi_rate = clk_get_rate(core->axi_clk);
 
+	/* The core starts its job right after this. */
+	WRITE_ONCE(core->stopped, false);
+
 	if (axi_rate)
 		watchdog_time = 2 * div_u64(1000 * (u64)timeout_threshold, axi_rate);
 	else
@@ -1622,6 +1625,15 @@ static bool vdpu381_reset(struct rkvdec_core *core)
 				   status & VDPU381_DEBUG_INT_BUS_IDLE, 1, 1000);
 }
 
+/* Waits for a core that is still decoding to report the end of its job. */
+static bool vdpu381_wait_stopped(struct rkvdec_core *core)
+{
+	u32 status;
+
+	return !readl_poll_timeout(core->regs + VDPU381_REG_STA_INT, status,
+				   status, 100, 100 * USEC_PER_MSEC);
+}
+
 static bool vdpu383_reset(struct rkvdec_core *core)
 {
 	writel(FIELD_PREP_WM16(VDPU383_INT_EN_IRQ | VDPU383_INT_EN_LINE_IRQ, 0),
@@ -1643,7 +1655,10 @@ static bool vdpu383_reset(struct rkvdec_core *core)
  * bus transactions, then pulse its reset lines. On RK3588, both the soft
  * reset and the AXI reset line reset the IOMMU of the core too, leaving it
  * in bypass (the core also soft resets itself when its hardware timeout
- * fires). Reprogram the IOMMU last, before the core can be started again.
+ * fires). A core whose watchdog fired while it was still decoding would go
+ * on accessing memory untranslated: as the BSP only resets cores that
+ * reported the end of their job, give it time to do so first. Reprogram the
+ * IOMMU last, before the core can be started again.
  *
  * Must be called with the interrupt of the core masked. Returns false if
  * the core couldn't be stopped or its IOMMU couldn't be programmed: it is
@@ -1654,6 +1669,11 @@ static bool rkvdec_core_recover(struct rkvdec_core *core)
 {
 	bool idle;
 	int ret;
+
+	if (!READ_ONCE(core->stopped) && core->variant->ops->wait_stopped &&
+	    !core->variant->ops->wait_stopped(core))
+		dev_warn(core->dev, "the core is still busy, resetting it anyway\n");
+	WRITE_ONCE(core->stopped, true);
 
 	idle = core->variant->ops->reset(core);
 	if (core->resets) {
@@ -1692,6 +1712,9 @@ static void rkvdec_irq_job_done(struct rkvdec_core *core,
 				enum vb2_buffer_state state)
 {
 	struct rkvdec_ctx *ctx;
+
+	/* Whatever the job and its state, the core is done with it. */
+	WRITE_ONCE(core->stopped, true);
 
 	/*
 	 * The watchdog is pending only while the core has a job, and whoever
@@ -1897,6 +1920,7 @@ static const struct rcb_size_info vdpu381_rcb_sizes[] = {
 static const struct rkvdec_variant_ops vdpu381_variant_ops = {
 	.irq_handler = vdpu381_irq_handler,
 	.reset = vdpu381_reset,
+	.wait_stopped = vdpu381_wait_stopped,
 	.colmv_size = vdpu381_colmv_size,
 	.flatten_matrices = transpose_and_flatten_matrices,
 };
@@ -2024,6 +2048,7 @@ static int rkvdec_core_probe(struct platform_device *pdev)
 
 	core->dev = &pdev->dev;
 	core->variant = variant;
+	core->stopped = true;
 	INIT_DELAYED_WORK(&core->watchdog_work, rkvdec_watchdog_func);
 
 	ret = devm_clk_bulk_get_all_enabled(&pdev->dev, &core->clocks);
