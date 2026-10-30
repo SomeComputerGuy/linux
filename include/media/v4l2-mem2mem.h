@@ -95,7 +95,8 @@ struct v4l2_m2m_queue_ctx {
  * @out_q_ctx: Output (input from memory) queue context
  * @queue: List of memory to memory contexts
  * @job_flags: Job queue flags, used internally by v4l2-mem2mem.c:
- *		%TRANS_QUEUED, %TRANS_RUNNING and %TRANS_ABORT.
+ *		%TRANS_QUEUED, %TRANS_RUNNING, %TRANS_ABORT and
+ *		%TRANS_HELD_DETACHED.
  * @finished: Wait queue used to signalize when a job queue finished.
  * @priv: Instance private data
  *
@@ -226,6 +227,10 @@ void v4l2_m2m_job_finish(struct v4l2_m2m_dev *m2m_dev,
  * This allows for multiple output buffers to be used to fill in a single
  * capture buffer. This is typically used by stateless decoders where
  * multiple e.g. H.264 slices contribute to a single decoded frame.
+ *
+ * If jobs detached with v4l2_m2m_buf_detach_and_job_finish() still write the
+ * held destination buffer, it isn't returned but handed over to the driver,
+ * which returns it with v4l2_m2m_detached_buf_done().
  */
 void v4l2_m2m_buf_done_and_job_finish(struct v4l2_m2m_dev *m2m_dev,
 				      struct v4l2_m2m_ctx *m2m_ctx,
@@ -242,16 +247,28 @@ void v4l2_m2m_buf_done_and_job_finish(struct v4l2_m2m_dev *m2m_dev,
  *
  * For drivers that keep processing a job after the next one may start, e.g.
  * on hardware with several cores that can work on consecutive jobs of the
- * same context. The source and destination buffers of the job are removed
- * from the ready lists without being returned, and the job is finished, so
- * that the next job can be scheduled while the hardware still processes
- * this one. The driver then owns both buffers and must return them with
- * v4l2_m2m_buf_done(), the destination buffer first.
+ * same context. The source buffer of the job is removed from the ready list
+ * without being returned, and the job is finished, so that the next job can
+ * be scheduled while the hardware still processes this one. The driver then
+ * owns the source buffer and returns it with v4l2_m2m_buf_done().
  *
- * A job whose source buffer has %V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF set keeps
- * its destination buffer for the next job, so it can't be detached: nothing
- * is done and the job has to be finished with
- * v4l2_m2m_buf_done_and_job_finish() as usual.
+ * The destination buffer is removed from the ready list as well and owned by
+ * the driver, unless the source buffer has %V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF
+ * set: then it stays on the ready list, held for the next job exactly as if
+ * the job had been finished with v4l2_m2m_buf_done_and_job_finish(), and is
+ * shared by the detached jobs and the framework. While detached jobs use it,
+ * the framework doesn't return it when the hold is released (a source buffer
+ * with another timestamp, %V4L2_DEC_CMD_FLUSH, or a job without
+ * %V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF that ends with
+ * v4l2_m2m_buf_done_and_job_finish()), but only takes it off the ready list.
+ *
+ * In both cases, once the driver is done with all the detached jobs that use
+ * the destination buffer, it must call v4l2_m2m_detached_buf_done() for it
+ * before returning the source buffer of the last one, so that the capture
+ * buffer completes before the request of the source buffer.
+ *
+ * The behaviour seen by userspace is the same as if the jobs had been
+ * finished with v4l2_m2m_buf_done_and_job_finish() when the hardware is done.
  *
  * Return: true if the buffers were detached and the job finished.
  */
@@ -259,6 +276,27 @@ bool v4l2_m2m_buf_detach_and_job_finish(struct v4l2_m2m_dev *m2m_dev,
 					struct v4l2_m2m_ctx *m2m_ctx,
 					struct vb2_v4l2_buffer **src_buf,
 					struct vb2_v4l2_buffer **dst_buf);
+
+/**
+ * v4l2_m2m_detached_buf_done() - the driver is done with the destination
+ * buffer of detached jobs
+ *
+ * @m2m_ctx: m2m context assigned to the instance given by struct &v4l2_m2m_ctx
+ * @vbuf: the destination buffer of jobs detached with
+ *	  v4l2_m2m_buf_detach_and_job_finish()
+ * @state: vb2 buffer state passed to v4l2_m2m_buf_done()
+ *
+ * Called by the driver when all the detached jobs that write @vbuf are done.
+ * If @vbuf is still held for the next job, it stays on the ready list and is
+ * returned by the framework when the hold is released, with
+ * %VB2_BUF_STATE_DONE, as for a held buffer of a job finished with
+ * v4l2_m2m_buf_done_and_job_finish(). Otherwise it is returned with @state.
+ *
+ * Return: true if @vbuf was returned.
+ */
+bool v4l2_m2m_detached_buf_done(struct v4l2_m2m_ctx *m2m_ctx,
+				struct vb2_v4l2_buffer *vbuf,
+				enum vb2_buffer_state state);
 
 static inline void
 v4l2_m2m_buf_done(struct vb2_v4l2_buffer *buf, enum vb2_buffer_state state)
