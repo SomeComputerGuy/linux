@@ -212,7 +212,7 @@ static int rkvdec_s_ctrl(struct v4l2_ctrl *ctrl)
 	if (rkvdec_image_fmt_changed(ctx, image_fmt)) {
 		vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
 				     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
-		if (vb2_is_busy(vq))
+		if (vb2_is_streaming(vq))
 			return -EBUSY;
 
 		ctx->image_fmt = image_fmt;
@@ -732,7 +732,7 @@ static const struct rkvdec_coded_fmt_desc vdpu381_coded_fmts[] = {
 		.ops = &rkvdec_vdpu381_vp9_fmt_ops,
 		.num_decoded_fmts = ARRAY_SIZE(rkvdec_vdpu381_vp9_decoded_fmts),
 		.decoded_fmts = rkvdec_vdpu381_vp9_decoded_fmts,
-		.flags = RKVDEC_FMT_FLAG_PIPELINE,
+		.flags = RKVDEC_FMT_FLAG_PIPELINE | RKVDEC_FMT_FLAG_RES_CHANGE,
 	},
 	{
 		.fourcc = V4L2_PIX_FMT_AVS2_FRAME,
@@ -938,15 +938,22 @@ static int rkvdec_s_capture_fmt(struct file *file, void *priv,
 	struct vb2_queue *vq;
 	int ret;
 
-	/* Change not allowed if queue is busy */
-	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
-			     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
-	if (vb2_is_busy(vq))
-		return -EBUSY;
-
 	ret = rkvdec_try_capture_fmt(file, priv, f);
 	if (ret)
 		return ret;
+
+	/*
+	 * Change not allowed while streaming, except for a new frame size
+	 * when the codec supports it. Buffers allocated with another format
+	 * keep their layout: they can be removed with VIDIOC_REMOVE_BUFS, and
+	 * one too small for the new format isn't decoded into.
+	 */
+	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
+			     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+	if (vb2_is_streaming(vq) &&
+	    (!(ctx->coded_fmt_desc->flags & RKVDEC_FMT_FLAG_RES_CHANGE) ||
+	     f->fmt.pix_mp.pixelformat != ctx->decoded_fmt.fmt.pix_mp.pixelformat))
+		return -EBUSY;
 
 	ctx->decoded_fmt = *f;
 	rkvdec_update_colmv_offset(ctx);
@@ -961,26 +968,29 @@ static int rkvdec_s_output_fmt(struct file *file, void *priv,
 	const struct rkvdec_coded_fmt_desc *desc;
 	struct v4l2_format *cap_fmt;
 	struct vb2_queue *peer_vq, *vq;
+	bool res_change;
 	int ret;
 
 	/*
 	 * In order to support dynamic resolution change, the decoder admits
 	 * a resolution change, as long as the pixelformat remains. Can't be
-	 * done if streaming.
+	 * done if streaming, unless the codec supports changing the frame
+	 * size of a running stream.
 	 */
 	vq = v4l2_m2m_get_vq(m2m_ctx, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
-	if (vb2_is_streaming(vq) ||
-	    (vb2_is_busy(vq) &&
-	     f->fmt.pix_mp.pixelformat != ctx->coded_fmt.fmt.pix_mp.pixelformat))
+	peer_vq = v4l2_m2m_get_vq(m2m_ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+	if (vb2_is_busy(vq) &&
+	    f->fmt.pix_mp.pixelformat != ctx->coded_fmt.fmt.pix_mp.pixelformat)
 		return -EBUSY;
 
 	/*
-	 * Since format change on the OUTPUT queue will reset the CAPTURE
-	 * queue, we can't allow doing so when the CAPTURE queue has buffers
-	 * allocated.
+	 * A format change on the OUTPUT queue resets the CAPTURE format:
+	 * not allowed while streaming, unless the codec supports a new frame
+	 * size in a running stream. CAPTURE buffers that are only allocated
+	 * keep their layout (see rkvdec_s_capture_fmt()).
 	 */
-	peer_vq = v4l2_m2m_get_vq(m2m_ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
-	if (vb2_is_busy(peer_vq))
+	res_change = vb2_is_streaming(vq) || vb2_is_streaming(peer_vq);
+	if (res_change && !(ctx->coded_fmt_desc->flags & RKVDEC_FMT_FLAG_RES_CHANGE))
 		return -EBUSY;
 
 	ret = rkvdec_try_output_fmt(file, priv, f);
@@ -1002,14 +1012,20 @@ static int rkvdec_s_output_fmt(struct file *file, void *priv,
 	 *
 	 * Note that this will propagates any size changes to the decoded format.
 	 */
-	ctx->image_fmt = RKVDEC_IMG_FMT_ANY;
+	if (!res_change) {
+		ctx->image_fmt = RKVDEC_IMG_FMT_ANY;
 
-	/* VP9 bit depth is per-frame, not up-front like HEVC's SPS;
-	 * default to 8-bit/NV12 until get_image_fmt() switches it.
+		/* VP9 bit depth is per-frame, not up-front like HEVC's SPS;
+		 * default to 8-bit/NV12 until get_image_fmt() switches it.
+		 */
+		if (desc->fourcc == V4L2_PIX_FMT_VP9_FRAME)
+			ctx->image_fmt = RKVDEC_IMG_FMT_420_8BIT;
+	}
+
+	/*
+	 * A frame size change of a running stream keeps the image format
+	 * (bit depth, chroma subsampling) of the stream.
 	 */
-	if (desc->fourcc == V4L2_PIX_FMT_VP9_FRAME)
-		ctx->image_fmt = RKVDEC_IMG_FMT_420_8BIT;
-
 	rkvdec_reset_decoded_fmt(ctx);
 
 	/* Propagate colorspace information to capture. */
@@ -1090,6 +1106,7 @@ static const struct v4l2_ioctl_ops rkvdec_ioctl_ops = {
 	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
 	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
 	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
+	.vidioc_remove_bufs = v4l2_m2m_ioctl_remove_bufs,
 	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
 
 	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
@@ -1891,6 +1908,18 @@ static void rkvdec_device_run(void *priv)
 		rkvdec_ccu_prepare(ctx);
 
 	rkvdec_core_reset_cache(core);
+
+	/*
+	 * CAPTURE buffers allocated for an earlier format stay in the queue
+	 * until they are removed: don't decode into one that is too small.
+	 */
+	if (vb2_plane_size(&job->dst->vb2_buf, 0) <
+	    ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].sizeimage) {
+		dev_err_ratelimited(core->dev, "CAPTURE buffer too small for %ux%u\n",
+				    ctx->decoded_fmt.fmt.pix_mp.width,
+				    ctx->decoded_fmt.fmt.pix_mp.height);
+		goto err;
+	}
 
 	if (!rkvdec_rcb_buf_validate_size(ctx)) {
 		rkvdec_free_rcb(ctx->dev, core);

@@ -984,9 +984,17 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	regs->vp9_addr.avp9_segidcur_base = segmap_base +
 		RKVDEC_VP9_MAX_SEGMAP_SIZE * !vp9_ctx->last.segmapid;
 
+	/*
+	 * The previous frame's motion vectors are only used by a frame of the
+	 * same size (use_prev_frame_mvs, see reg75). Don't point the decoder
+	 * at the motion vectors of a frame of another size: they live in a
+	 * buffer laid out (and possibly allocated) for that size.
+	 */
 	if (!intra_only &&
 	    !(dec_params->flags & V4L2_VP9_FRAME_FLAG_ERROR_RESILIENT) &&
-	    vp9_ctx->last.valid)
+	    vp9_ctx->last.valid &&
+	    vp9_ctx->last.width == vp9_ctx->cur.width &&
+	    vp9_ctx->last.height == vp9_ctx->cur.height)
 		mv_ref = last;
 	else
 		mv_ref = dst;
