@@ -582,6 +582,16 @@ static void dw_hdmi_qp_tx_disable(struct dw_hdmi_qp *hdmi)
 		       AVP_DATAPATH_VIDEO_SWDISABLE, GLOBAL_SWDISABLE);
 }
 
+/*
+ * Leave FRL operation: TMDS mode needs both FRL bits cleared, and no link
+ * training pattern must be left programmed.
+ */
+static void dw_hdmi_qp_frl_link_clear(struct dw_hdmi_qp *hdmi)
+{
+	dw_hdmi_qp_mod(hdmi, 0, OPMODE_FRL | OPMODE_FRL_4LANES, LINK_CONFIG0);
+	dw_hdmi_qp_write(hdmi, 0, FLT_CONFIG1);
+}
+
 static void dw_hdmi_qp_bridge_atomic_enable(struct drm_bridge *bridge,
 					    struct drm_atomic_commit *state)
 {
@@ -664,6 +674,7 @@ static void dw_hdmi_qp_bridge_atomic_disable(struct drm_bridge *bridge,
 	connector = drm_atomic_get_old_connector_for_encoder(state, bridge->encoder);
 	drm_connector_hdmi_disable_scrambling(connector);
 	drm_connector_hdmi_disable_frl(connector);
+	dw_hdmi_qp_frl_link_clear(hdmi);
 
 	hdmi->phy.ops->disable(hdmi, hdmi->phy.data);
 }
@@ -779,8 +790,9 @@ static int dw_hdmi_qp_bridge_frl_fallback_tmds(struct drm_bridge *bridge)
 	if (!conn)
 		return 0;
 
+	dw_hdmi_qp_frl_link_clear(hdmi);
 	dw_hdmi_qp_mod(hdmi, conn->display_info.is_hdmi ? 0 : OPMODE_DVI,
-		       OPMODE_DVI | OPMODE_FRL, LINK_CONFIG0);
+		       OPMODE_DVI, LINK_CONFIG0);
 
 	dw_hdmi_qp_tx_enable(hdmi);
 
