@@ -303,8 +303,24 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 	return 0;
 }
 
+static void
+dw_hdmi_qp_rockchip_encoder_atomic_mode_set(struct drm_encoder *encoder,
+					    struct drm_crtc_state *crtc_state,
+					    struct drm_connector_state *conn_state)
+{
+	struct rockchip_hdmi_qp *hdmi = to_rockchip_hdmi_qp(encoder);
+
+	/*
+	 * This runs after the VOP has been disabled and before it is enabled
+	 * again. Keep DCLK stopped until the controller has noticed, so that
+	 * its video input starts afresh with the new mode.
+	 */
+	dw_hdmi_qp_wait_input_clk_off(hdmi->hdmi);
+}
+
 static const struct
 drm_encoder_helper_funcs dw_hdmi_qp_rockchip_encoder_helper_funcs = {
+	.atomic_mode_set = dw_hdmi_qp_rockchip_encoder_atomic_mode_set,
 	.atomic_enable	= dw_hdmi_qp_rockchip_encoder_atomic_enable,
 	.atomic_check	= dw_hdmi_qp_rockchip_encoder_atomic_check,
 };
