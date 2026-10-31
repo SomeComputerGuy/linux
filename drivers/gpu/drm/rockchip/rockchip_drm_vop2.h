@@ -272,6 +272,9 @@ struct vop2_video_port {
  */
 struct vop2_ops {
 	unsigned long (*setup_intf_mux)(struct vop2_video_port *vp, int ep_id, u32 polflags);
+	/* DCLK rate setup_intf_mux() will return for this state, 0 if invalid */
+	unsigned long (*dclk_rate)(struct vop2_video_port *vp, int ep_id,
+				   const struct drm_crtc_state *crtc_state);
 	void (*setup_bg_dly)(struct vop2_video_port *vp);
 	void (*setup_overlay)(struct vop2_video_port *vp);
 };
