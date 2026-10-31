@@ -2511,6 +2511,29 @@ static int dw_dp_link_retrain(struct dw_dp *dp)
 	return ret;
 }
 
+/*
+ * A branch device signals a change on its downstream side (e.g. a monitor
+ * plugged into or unplugged from a dock) with a short HPD pulse, setting
+ * DOWNSTREAM_PORT_STATUS_CHANGED and updating SINK_COUNT.
+ */
+static bool dw_dp_downstream_changed(struct dw_dp *dp)
+{
+	struct dw_dp_link *link = &dp->link;
+	u8 status;
+	int ret;
+
+	if (!drm_dp_is_branch(link->dpcd))
+		return false;
+
+	ret = drm_dp_dpcd_read_byte(&dp->aux, DP_LANE_ALIGN_STATUS_UPDATED, &status);
+	if (ret == 0 && (status & DP_DOWNSTREAM_PORT_STATUS_CHANGED))
+		return true;
+
+	ret = drm_dp_read_sink_count(&dp->aux);
+
+	return ret >= 0 && ret != link->sink_count;
+}
+
 static void dw_dp_hpd_work(struct work_struct *work)
 {
 	struct dw_dp *dp = container_of(work, struct dw_dp, hpd_work);
@@ -2527,6 +2550,11 @@ static void dw_dp_hpd_work(struct work_struct *work)
 	mutex_unlock(&dp->irq_lock);
 
 	dev_dbg(dp->dev, "[drm] Get hpd irq - %s\n", long_hpd ? "long" : "short");
+
+	if (!long_hpd && dw_dp_downstream_changed(dp)) {
+		dev_dbg(dp->dev, "Downstream port status changed\n");
+		long_hpd = true;
+	}
 
 	if (!long_hpd) {
 		if (dw_dp_needs_link_retrain(dp)) {
