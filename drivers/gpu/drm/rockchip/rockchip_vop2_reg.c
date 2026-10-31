@@ -1574,13 +1574,13 @@ static unsigned long rk3588_calc_dclk(unsigned long child_clk, unsigned long max
  * DSI: mipi_pixclk <= dclk_out <= dclk_core
  */
 static unsigned long rk3588_calc_cru_cfg(struct vop2_video_port *vp, int id,
+					 const struct drm_crtc_state *crtc_state,
 					 int *dclk_core_div, int *dclk_out_div,
 					 int *if_pixclk_div, int *if_dclk_div)
 {
 	struct vop2 *vop2 = vp->vop2;
-	struct drm_crtc *crtc = &vp->crtc;
-	struct drm_display_mode *adjusted_mode = &crtc->state->adjusted_mode;
-	struct rockchip_crtc_state *vcstate = to_rockchip_crtc_state(crtc->state);
+	const struct drm_display_mode *adjusted_mode = &crtc_state->adjusted_mode;
+	struct rockchip_crtc_state *vcstate = to_rockchip_crtc_state(crtc_state);
 	int output_mode = vcstate->output_mode;
 	unsigned long v_pixclk = adjusted_mode->crtc_clock * 1000LL; /* video timing pixclk */
 	unsigned long dclk_core_rate = v_pixclk >> 2;
@@ -1687,6 +1687,15 @@ static unsigned long rk3588_calc_cru_cfg(struct vop2_video_port *vp, int id,
  * 1: Video Port3
  * 3: Video Port 1(MIPI1 only)
  */
+static unsigned long rk3588_dclk_rate(struct vop2_video_port *vp, int id,
+				      const struct drm_crtc_state *crtc_state)
+{
+	int dclk_core_div, dclk_out_div, if_pixclk_div, if_dclk_div;
+
+	return rk3588_calc_cru_cfg(vp, id, crtc_state, &dclk_core_div,
+				   &dclk_out_div, &if_pixclk_div, &if_dclk_div);
+}
+
 static u32 rk3588_get_mipi_port_mux(int vp_id)
 {
 	if (vp_id == 1)
@@ -1718,8 +1727,8 @@ static unsigned long rk3588_set_intf_mux(struct vop2_video_port *vp, int id, u32
 	unsigned long clock;
 	u32 die, dip, div, vp_clk_div, val;
 
-	clock = rk3588_calc_cru_cfg(vp, id, &dclk_core_div, &dclk_out_div,
-				    &if_pixclk_div, &if_dclk_div);
+	clock = rk3588_calc_cru_cfg(vp, id, vp->crtc.state, &dclk_core_div,
+				    &dclk_out_div, &if_pixclk_div, &if_dclk_div);
 	if (!clock)
 		return 0;
 
@@ -2523,6 +2532,7 @@ static const struct vop2_ops rk3576_vop_ops = {
 
 static const struct vop2_ops rk3588_vop_ops = {
 	.setup_intf_mux = rk3588_set_intf_mux,
+	.dclk_rate = rk3588_dclk_rate,
 	.setup_bg_dly = rk3568_vop2_setup_bg_dly,
 	.setup_overlay = rk3568_vop2_setup_overlay,
 };
