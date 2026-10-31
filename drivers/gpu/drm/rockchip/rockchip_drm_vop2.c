@@ -2090,6 +2090,68 @@ static int vop2_crtc_atomic_check_gamma(struct vop2_video_port *vp,
 	return 0;
 }
 
+/*
+ * HDMI needs the exact pixel clock. The HDMI PHY PLL can generate any rate
+ * the PHY supports, but when the DCLK has to come from the system CRU (FRL
+ * mode, or rates beyond the PHY PLL), it is derived by integer division
+ * from a few fixed PLLs, and the clock framework silently picks the closest
+ * lower rate: e.g. 3840x2160@59.94Hz (593.407 MHz) would run at 500 MHz.
+ * Refuse such a configuration instead of scanning out at a wrong rate.
+ */
+static int vop2_crtc_atomic_check_dclk(struct vop2_video_port *vp,
+				       struct drm_crtc_state *crtc_state)
+{
+	const struct drm_display_mode *mode = &crtc_state->adjusted_mode;
+	struct vop2 *vop2 = vp->vop2;
+	struct drm_encoder *encoder;
+	unsigned long clock = 0;
+	struct clk *cru_clk;
+	long rate;
+
+	if (!vop2->ops->dclk_rate || !crtc_state->active ||
+	    !drm_atomic_crtc_needs_modeset(crtc_state))
+		return 0;
+
+	/* Without an HDMI PHY PLL the CRU is the only DCLK source anyway */
+	if (!vop2->pll_hdmiphy0 && !vop2->pll_hdmiphy1)
+		return 0;
+
+	drm_for_each_encoder_mask(encoder, vop2->drm, crtc_state->encoder_mask) {
+		struct rockchip_encoder *rkencoder = to_rockchip_encoder(encoder);
+		int id = rkencoder->crtc_endpoint_id;
+
+		if (id != ROCKCHIP_VOP2_EP_HDMI0 && id != ROCKCHIP_VOP2_EP_HDMI1)
+			return 0;
+
+		clock = vop2->ops->dclk_rate(vp, id, crtc_state);
+	}
+
+	if (!clock)
+		return 0;
+
+	if (mode->flags & DRM_MODE_FLAG_DBLCLK)
+		clock *= 2;
+
+	if (vop2_crtc_dclk_hdmiphy_pll(vp, crtc_state, clock))
+		return 0;
+
+	/* The CRU source vop2_crtc_atomic_disable() restores */
+	cru_clk = vp->dclk_src ?: clk_get_parent(vp->dclk);
+	if (!cru_clk || clk_is_match(cru_clk, vop2->pll_hdmiphy0) ||
+	    clk_is_match(cru_clk, vop2->pll_hdmiphy1))
+		return 0;
+
+	rate = clk_round_rate(cru_clk, clock);
+	if (rate <= 0 || DIV_ROUND_CLOSEST(rate, 1000) != DIV_ROUND_CLOSEST(clock, 1000)) {
+		drm_dbg_kms(vop2->drm,
+			    "vp%d: DCLK %lu Hz not available from the CRU (closest %ld Hz)\n",
+			    vp->id, clock, rate);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int vop2_crtc_atomic_check(struct drm_crtc *crtc,
 				  struct drm_atomic_commit *state)
 {
@@ -2100,6 +2162,10 @@ static int vop2_crtc_atomic_check(struct drm_crtc *crtc,
 	int ret;
 
 	ret = vop2_crtc_atomic_check_gamma(vp, crtc, state, crtc_state);
+	if (ret)
+		return ret;
+
+	ret = vop2_crtc_atomic_check_dclk(vp, crtc_state);
 	if (ret)
 		return ret;
 
