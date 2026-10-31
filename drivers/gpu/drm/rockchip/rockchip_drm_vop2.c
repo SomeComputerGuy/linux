@@ -1816,6 +1816,55 @@ static int us_to_vertical_line(struct drm_display_mode *mode, int us)
 	return us * mode->clock / mode->htotal / 1000;
 }
 
+/*
+ * Return the HDMI PHY PLL to use as DCLK source for display modes up to
+ * 4K@60Hz, or NULL to keep using the system CRU.
+ *
+ * The PHY PLL can only provide the DCLK while the PHY runs in TMDS mode:
+ * in FRL mode it is the link PLL.
+ */
+static struct clk *vop2_crtc_dclk_hdmiphy_pll(struct vop2_video_port *vp,
+					      const struct drm_crtc_state *crtc_state,
+					      unsigned long clock)
+{
+	struct rockchip_crtc_state *vcstate = to_rockchip_crtc_state(crtc_state);
+	struct vop2 *vop2 = vp->vop2;
+	struct drm_encoder *encoder;
+	unsigned long max_dclk;
+	unsigned int bpc;
+
+	if (!vop2->pll_hdmiphy0 && !vop2->pll_hdmiphy1)
+		return NULL;
+
+	if (vcstate->frl_enabled)
+		return NULL;
+
+	/*
+	 * YUV422 always transmits two 12-bit components per clock
+	 * cycle, regardless of the color depth, which from a rate
+	 * perspective is equivalent to three 8-bit RGB components.
+	 * Force 8 bpc here so the bandwidth check reflects the actual
+	 * TMDS rate and avoids an unnecessary DCLK source switch.
+	 */
+	bpc = vcstate->output_mode == ROCKCHIP_OUT_MODE_YUV422 ?
+		8 : (vcstate->output_bpc ?: 8);
+	max_dclk = DIV_ROUND_CLOSEST_ULL(VOP2_MAX_DCLK_RATE * 8, bpc);
+	if (clock > max_dclk)
+		return NULL;
+
+	drm_for_each_encoder_mask(encoder, vop2->drm, crtc_state->encoder_mask) {
+		struct rockchip_encoder *rkencoder = to_rockchip_encoder(encoder);
+
+		if (rkencoder->crtc_endpoint_id == ROCKCHIP_VOP2_EP_HDMI0)
+			return vop2->pll_hdmiphy0;
+
+		if (rkencoder->crtc_endpoint_id == ROCKCHIP_VOP2_EP_HDMI1)
+			return vop2->pll_hdmiphy1;
+	}
+
+	return NULL;
+}
+
 static void vop2_crtc_atomic_enable(struct drm_crtc *crtc,
 				    struct drm_atomic_commit *state)
 {
@@ -1844,6 +1893,7 @@ static void vop2_crtc_atomic_enable(struct drm_crtc *crtc,
 	u32 val, polflags;
 	int ret;
 	struct drm_encoder *encoder;
+	struct clk *pll_hdmiphy;
 
 	drm_dbg(vop2->drm, "Update mode to %dx%d%s%d, type: %d for vp%d\n",
 		hdisplay, vdisplay, mode->flags & DRM_MODE_FLAG_INTERLACE ? "i" : "p",
@@ -1972,49 +2022,16 @@ static void vop2_crtc_atomic_enable(struct drm_crtc *crtc,
 
 	vop2_vp_write(vp, RK3568_VP_MIPI_CTRL, 0);
 
-	/*
-	 * Switch to HDMI PHY PLL as DCLK source for display modes up
-	 * to 4K@60Hz, if available, otherwise keep using the system CRU.
-	 */
-	if (vop2->pll_hdmiphy0 || vop2->pll_hdmiphy1) {
-		/*
-		 * YUV422 always transmits two 12-bit components per clock
-		 * cycle, regardless of the color depth, which from a rate
-		 * perspective is equivalent to three 8-bit RGB components.
-		 * Force 8 bpc here so the bandwidth check reflects the actual
-		 * TMDS rate and avoids an unnecessary DCLK source switch.
-		 */
-		unsigned int bpc = vcstate->output_mode == ROCKCHIP_OUT_MODE_YUV422 ?
-					8 : (vcstate->output_bpc ?: 8);
-		unsigned long max_dclk = DIV_ROUND_CLOSEST_ULL(VOP2_MAX_DCLK_RATE * 8, bpc);
-		struct clk *pll_hdmiphy = NULL;
+	pll_hdmiphy = vop2_crtc_dclk_hdmiphy_pll(vp, crtc_state, clock);
+	if (pll_hdmiphy) {
+		if (!vp->dclk_src)
+			vp->dclk_src = clk_get_parent(vp->dclk);
 
-		if (clock <= max_dclk) {
-			drm_for_each_encoder_mask(encoder, crtc->dev, crtc_state->encoder_mask) {
-				struct rockchip_encoder *rkencoder = to_rockchip_encoder(encoder);
-
-				if (rkencoder->crtc_endpoint_id == ROCKCHIP_VOP2_EP_HDMI0) {
-					pll_hdmiphy = vop2->pll_hdmiphy0;
-					break;
-				}
-
-				if (rkencoder->crtc_endpoint_id == ROCKCHIP_VOP2_EP_HDMI1) {
-					pll_hdmiphy = vop2->pll_hdmiphy1;
-					break;
-				}
-			}
-		}
-
-		if (pll_hdmiphy) {
-			if (!vp->dclk_src)
-				vp->dclk_src = clk_get_parent(vp->dclk);
-
-			ret = clk_set_parent(vp->dclk, pll_hdmiphy);
-			if (ret < 0)
-				drm_warn(vop2->drm,
-					 "Failed to switch DCLK to HDMI PHY PLL: %d\n",
-					 ret);
-		}
+		ret = clk_set_parent(vp->dclk, pll_hdmiphy);
+		if (ret < 0)
+			drm_warn(vop2->drm,
+				 "Failed to switch DCLK to HDMI PHY PLL: %d\n",
+				 ret);
 	}
 
 	clk_set_rate(vp->dclk, clock);
