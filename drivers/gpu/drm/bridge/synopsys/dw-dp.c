@@ -299,6 +299,16 @@ struct dw_dp_link {
 	struct drm_dp_desc desc;
 };
 
+/* Limits of the downstream facing port of a branch device */
+struct dw_dp_dfp {
+	int max_bpc;
+	int max_dotclock;
+	int min_tmds_clock;
+	int max_tmds_clock;
+	bool tmds;
+	bool ycbcr_420_passthrough;
+};
+
 struct dw_dp_bridge_state {
 	struct drm_bridge_state base;
 	struct drm_display_mode mode;
@@ -361,6 +371,7 @@ struct dw_dp {
 	struct drm_dp_aux aux;
 
 	struct dw_dp_link link;
+	struct dw_dp_dfp dfp;
 	struct dw_dp_plat_data plat_data;
 	u8 pixel_mode;
 	bool usbc_mode;
@@ -507,6 +518,60 @@ static bool dw_dp_bandwidth_ok(struct dw_dp *dp,
 	req_bw = mode->clock * bpp / 8;
 	max_bw = lanes * rate;
 	if (req_bw > max_bw)
+		return false;
+
+	return true;
+}
+
+static void dw_dp_update_dfp(struct dw_dp *dp, const struct drm_edid *drm_edid)
+{
+	const u8 *dpcd = dp->link.dpcd;
+	const u8 *port = dp->link.downstream_ports;
+	struct dw_dp_dfp *dfp = &dp->dfp;
+
+	dfp->max_bpc = drm_dp_downstream_max_bpc(dpcd, port, drm_edid);
+	dfp->max_dotclock = drm_dp_downstream_max_dotclock(dpcd, port);
+	dfp->min_tmds_clock = drm_dp_downstream_min_tmds_clock(dpcd, port, drm_edid);
+	dfp->max_tmds_clock = drm_dp_downstream_max_tmds_clock(dpcd, port, drm_edid);
+	dfp->tmds = drm_dp_downstream_is_tmds(dpcd, port, drm_edid);
+	dfp->ycbcr_420_passthrough = drm_dp_downstream_420_passthrough(dpcd, port);
+
+	dev_dbg(dp->dev, "DFP max bpc %d, max dotclock %d, TMDS clock %d-%d\n",
+		dfp->max_bpc, dfp->max_dotclock, dfp->min_tmds_clock,
+		dfp->max_tmds_clock);
+}
+
+/* YCbCr 4:2:0 needs the VSC SDP, and a TMDS converter must pass it through */
+static bool dw_dp_ycbcr_420_ok(struct dw_dp *dp)
+{
+	return dp->link.vsc_sdp_supported &&
+	       (!dp->dfp.tmds || dp->dfp.ycbcr_420_passthrough);
+}
+
+static bool dw_dp_dfp_tmds_clock_ok(struct dw_dp *dp, int clock, int bpc,
+				    enum drm_output_color_format color_format)
+{
+	const struct dw_dp_dfp *dfp = &dp->dfp;
+	int tmds_clock;
+
+	if (!dfp->tmds)
+		return true;
+
+	switch (color_format) {
+	case DRM_OUTPUT_COLOR_FORMAT_YCBCR422:
+		tmds_clock = clock;
+		break;
+	case DRM_OUTPUT_COLOR_FORMAT_YCBCR420:
+		tmds_clock = clock / 2 * bpc / 8;
+		break;
+	default:
+		tmds_clock = clock * bpc / 8;
+		break;
+	}
+
+	if (dfp->min_tmds_clock && tmds_clock < dfp->min_tmds_clock)
+		return false;
+	if (dfp->max_tmds_clock && tmds_clock > dfp->max_tmds_clock)
 		return false;
 
 	return true;
@@ -1650,10 +1715,19 @@ static enum drm_mode_status dw_dp_bridge_mode_valid(struct drm_bridge *bridge,
 	struct dw_dp *dp = bridge_to_dp(bridge);
 	struct dw_dp_link *link = &dp->link;
 	u32 min_bpp;
+	bool ycbcr_420 = info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR420) &&
+			 dw_dp_ycbcr_420_ok(dp) &&
+			 (drm_mode_is_420_only(info, mode) || drm_mode_is_420_also(info, mode));
 
-	if (info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR420) &&
-	    link->vsc_sdp_supported &&
-	    (drm_mode_is_420_only(info, mode) || drm_mode_is_420_also(info, mode)))
+	if (dp->dfp.max_dotclock && mode->clock > dp->dfp.max_dotclock)
+		return MODE_CLOCK_HIGH;
+
+	if (!dw_dp_dfp_tmds_clock_ok(dp, mode->clock, 8,
+				     ycbcr_420 ? DRM_OUTPUT_COLOR_FORMAT_YCBCR420 :
+						 DRM_OUTPUT_COLOR_FORMAT_RGB444))
+		return MODE_CLOCK_RANGE;
+
+	if (ycbcr_420)
 		min_bpp = 12;
 	else if (info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR422))
 		min_bpp = 16;
@@ -1662,8 +1736,7 @@ static enum drm_mode_status dw_dp_bridge_mode_valid(struct drm_bridge *bridge,
 	else
 		min_bpp = 24;
 
-	if (!link->vsc_sdp_supported &&
-	    drm_mode_is_420_only(info, mode))
+	if (!dw_dp_ycbcr_420_ok(dp) && drm_mode_is_420_only(info, mode))
 		return MODE_NO_420;
 
 	if (!dw_dp_bandwidth_ok(dp, mode, min_bpp, link->lanes, link->rate))
@@ -2164,6 +2237,8 @@ static const struct drm_edid *dw_dp_bridge_edid_read(struct drm_bridge *bridge,
 
 	phy_power_off(dp->phy);
 
+	dw_dp_update_dfp(dp, edid);
+
 	return edid;
 }
 
@@ -2193,11 +2268,14 @@ static u32 *dw_dp_bridge_atomic_get_output_bus_fmts(struct drm_bridge *bridge,
 		if (fmt->bpc > conn_state->max_bpc)
 			continue;
 
+		if (dp->dfp.max_bpc && fmt->bpc > dp->dfp.max_bpc)
+			continue;
+
 		if (!(BIT(fmt->color_format) & di->color_formats))
 			continue;
 
 		if (fmt->color_format == DRM_OUTPUT_COLOR_FORMAT_YCBCR420 &&
-		    !link->vsc_sdp_supported)
+		    !dw_dp_ycbcr_420_ok(dp))
 			continue;
 
 		if (fmt->color_format != DRM_OUTPUT_COLOR_FORMAT_YCBCR420 &&
@@ -2205,6 +2283,9 @@ static u32 *dw_dp_bridge_atomic_get_output_bus_fmts(struct drm_bridge *bridge,
 			continue;
 
 		if (!dw_dp_bandwidth_ok(dp, &mode, fmt->bpp, link->lanes, link->rate))
+			continue;
+
+		if (!dw_dp_dfp_tmds_clock_ok(dp, mode.clock, fmt->bpc, fmt->color_format))
 			continue;
 
 		output_fmts[j++] = fmt->bus_format;
