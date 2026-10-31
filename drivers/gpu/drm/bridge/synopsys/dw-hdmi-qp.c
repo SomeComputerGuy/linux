@@ -1397,6 +1397,39 @@ struct dw_hdmi_qp *dw_hdmi_qp_bind(struct platform_device *pdev,
 EXPORT_SYMBOL_GPL(dw_hdmi_qp_bind);
 
 /**
+ * dw_hdmi_qp_wait_input_clk_off() - Wait until the controller sees its video
+ * input clock stopped
+ * @hdmi: pointer to the DW HDMI QP controller
+ *
+ * The clock monitor of the controller reinitializes the input pixel interface
+ * (IPI) only once it has detected that the IPI clock stopped, which takes
+ * about 2 ms. There is no software reset for it: neither stopping the video
+ * datapath nor a datapath reset brings the IPI back to its initial state.
+ *
+ * When a modeset disables and re-enables the display controller feeding the
+ * IPI within the same commit, the pixel clock is usually restarted much faster
+ * than that. The IPI then keeps the state of the previous mode, e.g. of a
+ * YCbCr 4:2:0 input, and may never lock onto the new video stream, leaving the
+ * sink without a signal until the clock is stopped long enough again.
+ *
+ * Platform drivers gating the pixel clock between disabling and enabling the
+ * display controller should call this after the clock has been stopped and
+ * before it is restarted, e.g. from their encoder's .atomic_mode_set().
+ */
+void dw_hdmi_qp_wait_input_clk_off(struct dw_hdmi_qp *hdmi)
+{
+	u32 val;
+	int ret;
+
+	ret = regmap_read_poll_timeout(hdmi->regm, CMU_STATUS, val,
+				       val & IPI_CLK_OFF, 100,
+				       20 * USEC_PER_MSEC);
+	if (ret)
+		dev_dbg(hdmi->dev, "video input clock still running\n");
+}
+EXPORT_SYMBOL_GPL(dw_hdmi_qp_wait_input_clk_off);
+
+/**
  * dw_hdmi_qp_hpd_notify() - Notify a hot-plug detection event
  * @hdmi: pointer to the DW HDMI QP controller
  *
