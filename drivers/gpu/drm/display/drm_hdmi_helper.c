@@ -792,14 +792,29 @@ int drm_connector_hdmi_sync_scdc(struct drm_connector *connector, bool plugged,
 	    !try_wait_for_completion(&conn_state->commit->hw_done))
 		return 0;
 
-	ret = drm_scdc_readb(connector->ddc, SCDC_TMDS_CONFIG, &config);
-	if (ret) {
-		drm_dbg_kms(dev, "Failed to read TMDS config: %d\n", ret);
-		return ret;
-	}
+	/*
+	 * In FRL mode scrambling is not used, the sink is configured through
+	 * the FRL rate in SCDC Config_1 instead, which it clears upon reset.
+	 */
+	if (READ_ONCE(hdmi->frl_enabled)) {
+		ret = drm_scdc_readb(connector->ddc, SCDC_CONFIG_1, &config);
+		if (ret) {
+			drm_dbg_kms(dev, "Failed to read SCDC config: %d\n", ret);
+			return ret;
+		}
 
-	if (config & SCDC_SCRAMBLING_ENABLE)
-		return 0;
+		if (config & SCDC_FRL_RATE_MASK)
+			return 0;
+	} else {
+		ret = drm_scdc_readb(connector->ddc, SCDC_TMDS_CONFIG, &config);
+		if (ret) {
+			drm_dbg_kms(dev, "Failed to read TMDS config: %d\n", ret);
+			return ret;
+		}
+
+		if (config & SCDC_SCRAMBLING_ENABLE)
+			return 0;
+	}
 
 	/*
 	 * HDMI 2.0 requires that one should not send scrambled data prior
