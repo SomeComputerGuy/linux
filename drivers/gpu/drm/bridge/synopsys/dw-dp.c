@@ -287,6 +287,7 @@ struct dw_dp_link_train {
 
 struct dw_dp_link {
 	u8 dpcd[DP_RECEIVER_CAP_SIZE];
+	u8 downstream_ports[DP_MAX_DOWNSTREAM_PORTS];
 	unsigned char revision;
 	unsigned int rate;
 	unsigned int lanes;
@@ -539,6 +540,7 @@ static void dw_dp_link_reset(struct dw_dp_link *link)
 
 	dw_dp_link_caps_reset(&link->caps);
 	memset(link->dpcd, 0, sizeof(link->dpcd));
+	memset(link->downstream_ports, 0, sizeof(link->downstream_ports));
 }
 
 static int dw_dp_link_parse(struct dw_dp *dp, struct drm_connector *connector)
@@ -565,6 +567,11 @@ static int dw_dp_link_parse(struct dw_dp *dp, struct drm_connector *connector)
 		if (!link->sink_count)
 			return -ENODEV;
 	}
+
+	ret = drm_dp_read_downstream_info(&dp->aux, link->dpcd,
+					  link->downstream_ports);
+	if (ret < 0)
+		return ret;
 
 	link->vsc_sdp_supported = drm_dp_vsc_sdp_supported(&dp->aux, link->dpcd);
 
@@ -1988,6 +1995,40 @@ static int dw_dp_audio_mute_stream(struct drm_bridge *bridge,
 	return 0;
 }
 
+/*
+ * Program a DP 1.3+ protocol converter (branch device) the way
+ * intel_dp_configure_protocol_converter() does: select HDMI rather than DVI
+ * output when it drives an HDMI sink, so that the converter sends the AVI
+ * InfoFrame and audio, and turn off the colour space conversions, since the
+ * stream is always sent in the format the sink is to receive.
+ */
+static void dw_dp_configure_protocol_converter(struct dw_dp *dp,
+					       struct drm_connector *connector)
+{
+	struct dw_dp_link *link = &dp->link;
+	bool hdmi;
+	u8 val;
+
+	if (link->dpcd[DP_DPCD_REV] < 0x13 || !drm_dp_is_branch(link->dpcd))
+		return;
+
+	hdmi = connector->display_info.is_hdmi &&
+	       drm_dp_downstream_is_type(link->dpcd, link->downstream_ports,
+					 DP_DS_PORT_TYPE_HDMI);
+	val = hdmi ? DP_HDMI_DVI_OUTPUT_CONFIG : 0;
+	if (drm_dp_dpcd_write_byte(&dp->aux, DP_PROTOCOL_CONVERTER_CONTROL_0,
+				   val) < 0)
+		dev_dbg(dp->dev, "failed to set protocol converter %s mode\n",
+			hdmi ? "HDMI" : "DVI");
+
+	if (drm_dp_dpcd_write_byte(&dp->aux, DP_PROTOCOL_CONVERTER_CONTROL_1,
+				   0) < 0)
+		dev_dbg(dp->dev, "failed to disable protocol converter YCbCr 4:2:0 conversion\n");
+
+	if (drm_dp_pcon_convert_rgb_to_ycbcr(&dp->aux, 0) < 0)
+		dev_dbg(dp->dev, "failed to disable protocol converter RGB->YCbCr conversion\n");
+}
+
 static void dw_dp_bridge_atomic_enable(struct drm_bridge *bridge,
 				       struct drm_atomic_commit *state)
 {
@@ -2020,6 +2061,8 @@ static void dw_dp_bridge_atomic_enable(struct drm_bridge *bridge,
 		dev_err(dp->dev, "failed to enable link: %d\n", ret);
 		return;
 	}
+
+	dw_dp_configure_protocol_converter(dp, connector);
 
 	ret = dw_dp_video_enable(dp);
 	if (ret < 0) {
