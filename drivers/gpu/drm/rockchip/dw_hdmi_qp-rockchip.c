@@ -110,6 +110,7 @@ struct rockchip_hdmi_qp {
 	int port_id;
 	const struct rockchip_hdmi_qp_ctrl_ops *ctrl_ops;
 	unsigned long long tmds_char_rate;
+	unsigned int phy_bpc;
 };
 
 struct rockchip_hdmi_qp_ctrl_ops {
@@ -257,6 +258,18 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 		return -EINVAL;
 	}
 
+	/*
+	 * YUV422 always transmits two 12-bit components per clock cycle,
+	 * regardless of the color depth, which from a rate perspective is
+	 * equivalent to three 8-bit RGB components.  Force 8 bpc here to
+	 * keep the PHY pixel clock aligned with the character rate.
+	 *
+	 * The color depth is needed in FRL mode as well: the PHY derives
+	 * the pixel clock from the link PLL using a bpc dependent divider.
+	 */
+	phy_cfg.hdmi.bpc = (s->output_mode == ROCKCHIP_OUT_MODE_YUV422 ?
+				8 : conn_state->hdmi.output_bpc);
+
 	if (conn_state->hdmi.frl_rate_per_lane) {
 		s->frl_enabled = true;
 		mode = PHY_HDMI_MODE_FRL;
@@ -266,14 +279,6 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 		s->frl_enabled = false;
 		mode = PHY_HDMI_MODE_TMDS;
 		phy_cfg.hdmi.tmds_char_rate = conn_state->hdmi.tmds_char_rate;
-		/*
-		 * YUV422 always transmits two 12-bit components per clock cycle,
-		 * regardless of the color depth, which from a rate perspective is
-		 * equivalent to three 8-bit RGB components.  Force 8 bpc here to
-		 * keep the PHY PLL output aligned with the TMDS character rate.
-		 */
-		phy_cfg.hdmi.bpc = (s->output_mode == ROCKCHIP_OUT_MODE_YUV422 ?
-					8 : conn_state->hdmi.output_bpc);
 	}
 
 	ret = phy_set_mode_ext(hdmi->phy, PHY_MODE_HDMI, mode);
@@ -289,6 +294,7 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 	}
 
 	hdmi->tmds_char_rate = conn_state->hdmi.tmds_char_rate;
+	hdmi->phy_bpc = phy_cfg.hdmi.bpc;
 
 	s->output_type = DRM_MODE_CONNECTOR_HDMIA;
 	s->output_bpc = conn_state->hdmi.output_bpc;
@@ -390,6 +396,8 @@ static int dw_hdmi_qp_rk3588_set_frl_rate(struct dw_hdmi_qp *dw_hdmi, void *data
 	if (!rate_per_lane || !lanes)
 		return -EINVAL;
 
+	/* Keep the color depth of the current mode across FRL rate changes */
+	phy_cfg.hdmi.bpc = hdmi->phy_bpc;
 	phy_cfg.hdmi.frl.rate_per_lane = rate_per_lane;
 	phy_cfg.hdmi.frl.lanes = lanes;
 
