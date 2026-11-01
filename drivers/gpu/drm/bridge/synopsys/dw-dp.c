@@ -1579,33 +1579,11 @@ static int dw_dp_aux_read_data(struct dw_dp *dp, u8 *buffer, size_t size)
 	return size;
 }
 
-static ssize_t dw_dp_aux_transfer(struct drm_dp_aux *aux,
-				  struct drm_dp_aux_msg *msg)
+static ssize_t dw_dp_aux_xfer(struct dw_dp *dp, struct drm_dp_aux_msg *msg)
 {
-	struct dw_dp *dp = container_of(aux, struct dw_dp, aux);
 	unsigned long timeout = msecs_to_jiffies(10);
 	u32 status, value;
 	ssize_t ret = 0;
-
-	if (WARN_ON(msg->size > 16))
-		return -E2BIG;
-
-	PM_RUNTIME_ACQUIRE_AUTOSUSPEND(dp->dev, pm);
-	ret = PM_RUNTIME_ACQUIRE_ERR(&pm);
-	if (ret)
-		return ret;
-
-	/*
-	 * The controller does not run an AUX transaction while its HPD state
-	 * machine reports the sink as unplugged: there is no reply event and
-	 * the transfer would only end with the software timeout. A source
-	 * must not start AUX transactions while HPD is deasserted anyway, so
-	 * fail right away. This happens e.g. when a branch device drops HPD
-	 * while a short pulse is being handled, or while the state machine is
-	 * still debouncing HPD after the controller has been (re)initialized.
-	 */
-	if (!dw_dp_hpd_detect(dp))
-		return -ENXIO;
 
 	reinit_completion(&dp->complete);
 
@@ -1662,6 +1640,50 @@ static ssize_t dw_dp_aux_transfer(struct drm_dp_aux *aux,
 				return ret;
 		}
 	}
+
+	return ret;
+}
+
+static ssize_t dw_dp_aux_transfer(struct drm_dp_aux *aux,
+				  struct drm_dp_aux_msg *msg)
+{
+	struct dw_dp *dp = container_of(aux, struct dw_dp, aux);
+	ssize_t ret;
+
+	if (WARN_ON(msg->size > 16))
+		return -E2BIG;
+
+	PM_RUNTIME_ACQUIRE_AUTOSUSPEND(dp->dev, pm);
+	ret = PM_RUNTIME_ACQUIRE_ERR(&pm);
+	if (ret)
+		return ret;
+
+	/*
+	 * The controller does not run an AUX transaction while its HPD state
+	 * machine reports the sink as unplugged: there is no reply event and
+	 * the transfer would only end with the software timeout. A source
+	 * must not start AUX transactions while HPD is deasserted anyway, so
+	 * fail right away. This happens e.g. when a branch device drops HPD
+	 * while a short pulse is being handled, or while the state machine is
+	 * still debouncing HPD after the controller has been (re)initialized.
+	 */
+	if (!dw_dp_hpd_detect(dp))
+		return -ENXIO;
+
+	/*
+	 * The AUX channel goes through the PHY. An enabled link, detection
+	 * and EDID reads keep it powered, but the transfer can be called at
+	 * any other time too (short pulse handling, CEC-Tunneling-over-AUX,
+	 * the AUX character device), so power it up for the transfer. This
+	 * only takes a reference if it is powered already.
+	 */
+	ret = phy_power_on(dp->phy);
+	if (ret)
+		return ret;
+
+	ret = dw_dp_aux_xfer(dp, msg);
+
+	phy_power_off(dp->phy);
 
 	return ret;
 }
@@ -2590,22 +2612,38 @@ static void dw_dp_hpd_work(struct work_struct *work)
 
 	dev_dbg(dp->dev, "[drm] Get hpd irq - %s\n", long_hpd ? "long" : "short");
 
-	if (!long_hpd && dw_dp_downstream_changed(dp)) {
-		dev_dbg(dp->dev, "Downstream port status changed\n");
-		long_hpd = true;
-	}
-
 	if (!long_hpd) {
-		drm_dp_cec_irq(&dp->aux);
+		/* HPD went low since: the unplug event follows */
+		if (!dw_dp_hpd_detect(dp))
+			return;
 
-		if (dw_dp_needs_link_retrain(dp)) {
-			ret = dw_dp_link_retrain(dp);
-			if (ret)
-				dev_warn(dp->dev, "Retrain link failed\n");
+		/*
+		 * Keep the PHY, which carries the AUX channel, powered for
+		 * all the DPCD accesses below rather than for each of them,
+		 * as detection does. The link may be disabled.
+		 */
+		ret = phy_power_on(dp->phy);
+		if (ret)
+			return;
+
+		if (dw_dp_downstream_changed(dp)) {
+			dev_dbg(dp->dev, "Downstream port status changed\n");
+			long_hpd = true;
+		} else {
+			drm_dp_cec_irq(&dp->aux);
+
+			if (dw_dp_needs_link_retrain(dp)) {
+				ret = dw_dp_link_retrain(dp);
+				if (ret)
+					dev_warn(dp->dev, "Retrain link failed\n");
+			}
 		}
-	} else {
-		drm_helper_hpd_irq_event(dp->bridge.dev);
+
+		phy_power_off(dp->phy);
 	}
+
+	if (long_hpd)
+		drm_helper_hpd_irq_event(dp->bridge.dev);
 }
 
 static void dw_dp_handle_hpd_event(struct dw_dp *dp)
