@@ -993,17 +993,121 @@ static int rockchip_rk3588_pll_set_params(struct rockchip_clk_pll *pll,
 	return ret;
 }
 
+#define RK3588_PLL_FVCO_MIN		2250000000ULL
+#define RK3588_PLL_FVCO_MAX		4500000000ULL
+#define RK3588_PLL_M_MIN		64
+#define RK3588_PLL_M_MAX		1023
+#define RK3588_PLL_P_MAX		4
+#define RK3588_PLL_S_MAX		6
+
+/*
+ * Compute p, m, s and k for an arbitrary output rate (ROCKCHIP_PLL_CALC_RATE).
+ * The highest VCO frequency in range is used (lowest jitter), and for each
+ * pre-divider the largest m + k / 65536 not above the rate is taken; the
+ * pre-divider giving the smallest error wins, integer mode (k = 0) and
+ * smaller p preferred on a tie. The returned rate is what
+ * rockchip_rk3588_pll_recalc_rate() will report for the settings, so a later
+ * set_rate() of it gets exactly that rate.
+ */
+static unsigned long rockchip_rk3588_pll_calc(unsigned long fin,
+					      unsigned long fout,
+					      struct rockchip_pll_rate_table *rate)
+{
+	unsigned long best_rate = 0;
+	u64 fvco = 0, best_err = U64_MAX;
+	unsigned int p, s;
+
+	if (!fin || !fout)
+		return 0;
+
+	for (s = RK3588_PLL_S_MAX + 1; s-- > 0;) {
+		fvco = (u64)fout << s;
+		if (fvco >= RK3588_PLL_FVCO_MIN && fvco <= RK3588_PLL_FVCO_MAX)
+			break;
+	}
+	if (fvco < RK3588_PLL_FVCO_MIN || fvco > RK3588_PLL_FVCO_MAX)
+		return 0;
+
+	for (p = 1; p <= RK3588_PLL_P_MAX; p++) {
+		/* x = (m + k / 65536) * 65536, k signed: m = x / 65536 rounded */
+		u64 x = div_u64(fvco * p * 65536, fin) + 1;
+		unsigned int m;
+		u64 r, err;
+		s64 k;
+
+		/*
+		 * Round down like the table lookup does: the dividers below
+		 * the pll then still pick the intended ratio.
+		 */
+		for (;;) {
+			m = (x + 32768) >> 16;
+			k = (s64)x - ((s64)m << 16);
+
+			/* same arithmetic as rockchip_rk3588_pll_recalc_rate() */
+			r = div_u64((u64)fin * m, p);
+			if (k)
+				r += div_s64((s64)fin * k, p * 65536);
+			r >>= s;
+			if (r <= fout)
+				break;
+			x--;
+		}
+
+		if (m < RK3588_PLL_M_MIN || m > RK3588_PLL_M_MAX)
+			continue;
+
+		err = fout - r;
+		if (err < best_err || (err == best_err && !k && rate->k)) {
+			best_err = err;
+			best_rate = r;
+			rate->p = p;
+			rate->m = m;
+			rate->s = s;
+			rate->k = k;
+		}
+	}
+
+	if (best_rate)
+		rate->rate = best_rate;
+
+	return best_rate;
+}
+
+static int rockchip_rk3588_pll_determine_rate(struct clk_hw *hw,
+					      struct clk_rate_request *req)
+{
+	struct rockchip_clk_pll *pll = to_rockchip_clk_pll(hw);
+	struct rockchip_pll_rate_table calc = {};
+	unsigned long rate;
+
+	if (!(pll->flags & ROCKCHIP_PLL_CALC_RATE) ||
+	    rockchip_get_pll_settings(pll, req->rate))
+		return rockchip_pll_determine_rate(hw, req);
+
+	rate = rockchip_rk3588_pll_calc(req->best_parent_rate, req->rate, &calc);
+	if (!rate)
+		return rockchip_pll_determine_rate(hw, req);
+
+	req->rate = rate;
+
+	return 0;
+}
+
 static int rockchip_rk3588_pll_set_rate(struct clk_hw *hw, unsigned long drate,
 					unsigned long prate)
 {
 	struct rockchip_clk_pll *pll = to_rockchip_clk_pll(hw);
 	const struct rockchip_pll_rate_table *rate;
+	struct rockchip_pll_rate_table calc = {};
 
 	pr_debug("%s: changing %s to %lu with a parent rate of %lu\n",
 		 __func__, __clk_get_name(hw->clk), drate, prate);
 
 	/* Get required rate settings from table */
 	rate = rockchip_get_pll_settings(pll, drate);
+	if (!rate && (pll->flags & ROCKCHIP_PLL_CALC_RATE) &&
+	    rockchip_rk3588_pll_calc(prate, drate, &calc))
+		rate = &calc;
 	if (!rate) {
 		pr_err("%s: Invalid rate : %lu for pll clk %s\n", __func__,
 			drate, __clk_get_name(hw->clk));
@@ -1049,7 +1153,7 @@ static const struct clk_ops rockchip_rk3588_pll_clk_norate_ops = {
 
 static const struct clk_ops rockchip_rk3588_pll_clk_ops = {
 	.recalc_rate = rockchip_rk3588_pll_recalc_rate,
-	.determine_rate = rockchip_pll_determine_rate,
+	.determine_rate = rockchip_rk3588_pll_determine_rate,
 	.set_rate = rockchip_rk3588_pll_set_rate,
 	.enable = rockchip_rk3588_pll_enable,
 	.disable = rockchip_rk3588_pll_disable,
