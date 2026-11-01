@@ -265,6 +265,12 @@ struct vop2_video_port {
 	bool enabled;
 
 	/**
+	 * @aclk_boost: this video port holds a reference on the raised ACLK
+	 * rate, see vop2_crtc_needs_aclk_boost().
+	 */
+	bool aclk_boost;
+
+	/**
 	 * @win_mask: Bitmask of windows attached to the video port;
 	 */
 	u32 win_mask;
@@ -358,7 +364,8 @@ struct vop2 {
 	 * we need a ref counter here.
 	 */
 	unsigned int enable_count;
-	unsigned int frl_vp_count;
+	/** @aclk_boost_count: number of video ports that need the raised ACLK rate */
+	unsigned int aclk_boost_count;
 	struct clk *hclk;
 	struct clk *aclk;
 	struct clk *pclk;

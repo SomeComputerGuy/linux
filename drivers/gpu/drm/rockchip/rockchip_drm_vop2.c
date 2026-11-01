@@ -105,7 +105,7 @@ enum vop2_afbc_format {
 
 #define VOP2_MAX_DCLK_RATE		600000000ULL
 #define VOP2_ACLK_RATE_DEFAULT		500000000UL
-#define VOP2_ACLK_RATE_FRL		750000000UL
+#define VOP2_ACLK_RATE_HIGH		750000000UL
 
 /*
  * bus-format types.
@@ -1090,6 +1090,50 @@ static bool vop2_gamma_lut_in_use(struct vop2 *vop2, struct vop2_video_port *vp)
 	return gamma_en_vp_id != nr_vps && gamma_en_vp_id != vp->id;
 }
 
+/*
+ * The default ACLK rate of the RK3588 VOP2 can't sustain the memory traffic
+ * of a video port that processes more than VOP2_MAX_DCLK_RATE pixels per
+ * second (e.g. 3840x2160@120Hz, 1188 MHz): its line buffers run dry and the
+ * port reports POST_BUF_EMPTY. That depends on the pixel rate, not on the
+ * HDMI link: the same mode can be sent with YCbCr 4:2:0 over TMDS (594 MHz
+ * TMDS character rate), and the VOP still fetches and blends 1188 Mpixel/s.
+ * Keep the FRL condition too, FRL modes below that rate have always used the
+ * raised rate.
+ */
+static bool vop2_crtc_needs_aclk_boost(struct drm_crtc_state *crtc_state)
+{
+	struct rockchip_crtc_state *vcstate = to_rockchip_crtc_state(crtc_state);
+
+	return vcstate->frl_enabled ||
+	       crtc_state->adjusted_mode.crtc_clock * 1000ULL > VOP2_MAX_DCLK_RATE;
+}
+
+static void vop2_crtc_get_aclk_boost(struct vop2_video_port *vp)
+{
+	struct vop2 *vop2 = vp->vop2;
+
+	if (vp->aclk_boost)
+		return;
+
+	if (!vop2->aclk_boost_count++)
+		clk_set_rate(vop2->aclk, VOP2_ACLK_RATE_HIGH);
+
+	vp->aclk_boost = true;
+}
+
+static void vop2_crtc_put_aclk_boost(struct vop2_video_port *vp)
+{
+	struct vop2 *vop2 = vp->vop2;
+
+	if (!vp->aclk_boost)
+		return;
+
+	vp->aclk_boost = false;
+
+	if (!--vop2->aclk_boost_count)
+		clk_set_rate(vop2->aclk, VOP2_ACLK_RATE_DEFAULT);
+}
+
 static void vop2_crtc_atomic_disable(struct drm_crtc *crtc,
 				     struct drm_atomic_commit *state)
 {
@@ -1133,16 +1177,7 @@ static void vop2_crtc_atomic_disable(struct drm_crtc *crtc,
 
 	clk_disable_unprepare(vp->dclk);
 
-	if (vop2->version == VOP_VERSION_RK3588) {
-		struct rockchip_crtc_state *vcstate = to_rockchip_crtc_state(old_crtc_state);
-
-		if (vcstate->frl_enabled) {
-			vop2->frl_vp_count--;
-
-			if (!vop2->frl_vp_count)
-				clk_set_rate(vop2->aclk, VOP2_ACLK_RATE_DEFAULT);
-		}
-	}
+	vop2_crtc_put_aclk_boost(vp);
 
 	vp->enabled = false;
 
@@ -2064,12 +2099,9 @@ static void vop2_crtc_atomic_enable(struct drm_crtc *crtc,
 
 	vop2->enable_count++;
 
-	if (vop2->version == VOP_VERSION_RK3588 && vcstate->frl_enabled) {
-		if (!vop2->frl_vp_count)
-			clk_set_rate(vop2->aclk, VOP2_ACLK_RATE_FRL);
-
-		vop2->frl_vp_count++;
-	}
+	if (vop2->version == VOP_VERSION_RK3588 &&
+	    vop2_crtc_needs_aclk_boost(crtc_state))
+		vop2_crtc_get_aclk_boost(vp);
 
 	vcstate->yuv_overlay = is_yuv_output(vcstate->bus_format);
 
@@ -2202,6 +2234,7 @@ static void vop2_crtc_atomic_enable(struct drm_crtc *crtc,
 	return;
 
 err_put_enable_count:
+	vop2_crtc_put_aclk_boost(vp);
 	if (!--vop2->enable_count)
 		vop2_disable(vop2);
 
