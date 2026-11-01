@@ -230,6 +230,17 @@ struct vop2_win {
 	bool axi_active;
 	/** @axi_load: estimated fetch rate in bytes/s, protected by &vop2.axi_lock */
 	u64 axi_load;
+	/**
+	 * @axi_peak: estimated fetch rate in bytes/s while the lines of the
+	 * window are scanned out, protected by &vop2.axi_lock.
+	 */
+	u64 axi_peak;
+	/** @axi_y1: first display line of the window, protected by &vop2.axi_lock */
+	u16 axi_y1;
+	/** @axi_y2: last display line + 1 of the window, protected by &vop2.axi_lock */
+	u16 axi_y2;
+	/** @axi_vp: video port the window is fetching for, protected by &vop2.axi_lock */
+	u8 axi_vp;
 };
 
 struct vop2_video_port_data {

@@ -1355,7 +1355,55 @@ static bool vop2_win_axi_ids_clash(const struct vop2_win *a, const struct vop2_w
  * one, and never a port on which another active window already uses one of
  * its read IDs. A window keeps its port while it stays enabled.
  */
-static u8 vop2_win_get_axi_bus(struct vop2_win *win, u64 load)
+struct vop2_axi_fetch {
+	/* average fetch rate, bytes/s */
+	u64 load;
+	/* fetch rate while the lines of the window are scanned out, bytes/s */
+	u64 peak;
+	/* display lines [y1, y2) of the window on video port vp */
+	u16 y1;
+	u16 y2;
+	u8 vp;
+};
+
+static void vop2_plane_axi_fetch(const struct drm_plane_state *pstate, u8 vp_id,
+				 const struct drm_display_mode *mode,
+				 struct vop2_axi_fetch *f)
+{
+	u32 bpp = vop2_get_bpp(pstate->fb->format);
+	u32 src_w = drm_rect_width(&pstate->src) >> 16;
+	u32 src_h = drm_rect_height(&pstate->src) >> 16;
+	u32 dsp_h = drm_rect_height(&pstate->dst);
+	u64 line;
+
+	f->load = (u64)src_w * src_h * bpp / 8 * drm_mode_vrefresh(mode);
+	f->vp = vp_id;
+	f->y1 = pstate->dst.y1;
+	f->y2 = pstate->dst.y2;
+	f->peak = 0;
+
+	if (!dsp_h || !mode->crtc_htotal)
+		return;
+
+	/*
+	 * Bytes fetched per display line (more than one source line per
+	 * display line when scaling down), at the line rate of the mode.
+	 */
+	line = DIV_ROUND_UP_ULL((u64)src_w * bpp / 8 * src_h, dsp_h);
+	f->peak = div_u64(line * mode->crtc_clock * 1000, mode->crtc_htotal);
+}
+
+static u8 vop2_axi_pick_bus(u8 def, const u64 *bus_load, const bool *clash, u64 load)
+{
+	if (!clash[def ^ 1] &&
+	    (clash[def] || max(bus_load[def ^ 1] + load, bus_load[def]) <
+			   max(bus_load[def] + load, bus_load[def ^ 1])))
+		return def ^ 1;
+
+	return def;
+}
+
+static u8 vop2_win_get_axi_bus(struct vop2_win *win, const struct vop2_axi_fetch *f)
 {
 	struct vop2 *vop2 = win->vop2;
 	u64 bus_load[VOP2_SYS_AXI_BUS_NUM] = { };
@@ -1371,7 +1419,6 @@ static u8 vop2_win_get_axi_bus(struct vop2_win *win, u64 load)
 	spin_lock_irqsave(&vop2->axi_lock, flags);
 
 	if (win->axi_active) {
-		win->axi_load = load;
 		bus = win->axi_bus;
 		goto out;
 	}
@@ -1387,17 +1434,18 @@ static u8 vop2_win_get_axi_bus(struct vop2_win *win, u64 load)
 			clash[w->axi_bus] = true;
 	}
 
-	if (!clash[def ^ 1] &&
-	    (clash[def] || max(bus_load[def ^ 1] + load, bus_load[def]) <
-			   max(bus_load[def] + load, bus_load[def ^ 1])))
-		bus = def ^ 1;
+	bus = vop2_axi_pick_bus(def, bus_load, clash, f->load);
 
 	WARN_ON_ONCE(clash[bus]);
 
 	win->axi_bus = bus;
-	win->axi_load = load;
 	win->axi_active = true;
 out:
+	win->axi_load = f->load;
+	win->axi_peak = f->peak;
+	win->axi_y1 = f->y1;
+	win->axi_y2 = f->y2;
+	win->axi_vp = f->vp;
 	spin_unlock_irqrestore(&vop2->axi_lock, flags);
 
 	return bus;
@@ -1411,7 +1459,165 @@ static void vop2_win_put_axi_bus(struct vop2_win *win)
 	spin_lock_irqsave(&vop2->axi_lock, flags);
 	win->axi_active = false;
 	win->axi_load = 0;
+	win->axi_peak = 0;
 	spin_unlock_irqrestore(&vop2->axi_lock, flags);
+}
+
+/*
+ * Highest fetch rate one AXI read port of the RK3588 VOP2 sustains without
+ * the window line buffers running dry, measured with full screen and
+ * partial layers at 3840x2160@120Hz (ACLK 750 MHz): about 4.4 GB/s of
+ * concurrently scanned out lines are fine, 4.9 GB/s underflow. Raising
+ * ACLK further doesn't change it.
+ */
+#define VOP2_AXI_PORT_MAX_FETCH		4600000000ULL
+
+struct vop2_axi_slot {
+	struct vop2_axi_fetch f;
+	bool active;
+	bool assigned;
+	u8 bus;
+};
+
+/*
+ * Worst case fetch rate of an AXI port: the windows of one video port only
+ * add up where their display lines overlap, windows of different video
+ * ports aren't synchronised and always may.
+ */
+static u64 vop2_axi_port_peak(const struct vop2_axi_slot *s, int n, u8 bus)
+{
+	u64 peak = 0;
+	int i, j;
+
+	for (i = 0; i < n; i++) {
+		u64 sum = 0;
+
+		if (!s[i].active || s[i].bus != bus)
+			continue;
+
+		for (j = 0; j < n; j++) {
+			if (!s[j].active || s[j].bus != bus)
+				continue;
+
+			if (s[j].f.vp != s[i].f.vp ||
+			    (s[j].f.y1 <= s[i].f.y1 && s[i].f.y1 < s[j].f.y2))
+				sum += s[j].f.peak;
+		}
+
+		peak = max(peak, sum);
+	}
+
+	return peak;
+}
+
+/*
+ * Refuse a state that needs more than one AXI read port can fetch. The
+ * ports are assigned at plane update time (see vop2_win_get_axi_bus()), so
+ * predict that assignment: windows that are fetching keep their port,
+ * windows that start fetching get one by the same rule. A state that
+ * doesn't make any port busier than it is now is always accepted.
+ */
+static int vop2_axi_check(struct vop2 *vop2, struct drm_atomic_commit *state)
+{
+	int n = vop2->registered_num_wins;
+	struct vop2_axi_slot *s;
+	u64 old_peak[VOP2_SYS_AXI_BUS_NUM];
+	unsigned long flags;
+	bool changed = false;
+	int i, j, ret = 0;
+	u8 bus;
+
+	if (!(vop2->data->feature & VOP2_FEATURE_AXI_BALANCE))
+		return 0;
+
+	s = kcalloc(n, sizeof(*s), GFP_KERNEL);
+	if (!s)
+		return -ENOMEM;
+
+	spin_lock_irqsave(&vop2->axi_lock, flags);
+	for (i = 0; i < n; i++) {
+		struct vop2_win *w = &vop2->win[i];
+
+		s[i].active = w->axi_active;
+		s[i].assigned = w->axi_active;
+		s[i].bus = w->axi_bus;
+		s[i].f.load = w->axi_load;
+		s[i].f.peak = w->axi_peak;
+		s[i].f.y1 = w->axi_y1;
+		s[i].f.y2 = w->axi_y2;
+		s[i].f.vp = w->axi_vp;
+	}
+	spin_unlock_irqrestore(&vop2->axi_lock, flags);
+
+	for (bus = 0; bus < VOP2_SYS_AXI_BUS_NUM; bus++)
+		old_peak[bus] = vop2_axi_port_peak(s, n, bus);
+
+	for (i = 0; i < n; i++) {
+		struct drm_plane_state *pstate;
+		struct drm_crtc_state *cstate = NULL;
+
+		pstate = drm_atomic_get_new_plane_state(state, &vop2->win[i].base);
+		if (!pstate)
+			continue;
+
+		changed = true;
+
+		if (pstate->crtc && pstate->visible && pstate->fb)
+			cstate = drm_atomic_get_new_crtc_state(state, pstate->crtc);
+
+		if (!cstate || !cstate->active) {
+			s[i].active = false;
+			s[i].assigned = false;
+			continue;
+		}
+
+		vop2_plane_axi_fetch(pstate, to_vop2_video_port(pstate->crtc)->id,
+				     &cstate->adjusted_mode, &s[i].f);
+		s[i].active = true;
+	}
+
+	if (!changed)
+		goto out;
+
+	for (i = 0; i < n; i++) {
+		u64 bus_load[VOP2_SYS_AXI_BUS_NUM] = { };
+		bool clash[VOP2_SYS_AXI_BUS_NUM] = { };
+		struct vop2_win *win = &vop2->win[i];
+
+		if (!s[i].active || s[i].assigned)
+			continue;
+
+		for (j = 0; j < n; j++) {
+			if (j == i || !s[j].active || !s[j].assigned)
+				continue;
+
+			bus_load[s[j].bus] += s[j].f.load;
+			if (vop2_win_axi_ids_clash(win, &vop2->win[j]))
+				clash[s[j].bus] = true;
+		}
+
+		s[i].bus = vop2_axi_pick_bus(win->data->axi_bus_id, bus_load,
+					     clash, s[i].f.load);
+		s[i].assigned = true;
+	}
+
+	for (bus = 0; bus < VOP2_SYS_AXI_BUS_NUM; bus++) {
+		u64 peak = vop2_axi_port_peak(s, n, bus);
+
+		if (peak > VOP2_AXI_PORT_MAX_FETCH && peak > old_peak[bus]) {
+			drm_dbg_kms(vop2->drm,
+				    "AXI port %u would fetch %llu MB/s, more than %llu MB/s\n",
+				    bus, div_u64(peak, 1000000),
+				    div_u64(VOP2_AXI_PORT_MAX_FETCH, 1000000));
+			ret = -EINVAL;
+			break;
+		}
+	}
+
+out:
+	kfree(s);
+
+	return ret;
 }
 
 static void vop2_plane_atomic_disable(struct drm_plane *plane,
@@ -1601,9 +1807,10 @@ static void vop2_plane_atomic_update(struct drm_plane *plane,
 		afbc_en ? "AFBC" : "", &yrgb_mst);
 
 	if (vop2->version > VOP_VERSION_RK3568) {
-		u64 load = (u64)src_w * src_h * bpp / 8 * drm_mode_vrefresh(adjusted_mode);
+		struct vop2_axi_fetch f;
 
-		vop2_win_write(win, VOP2_WIN_AXI_BUS_ID, vop2_win_get_axi_bus(win, load));
+		vop2_plane_axi_fetch(pstate, vp->id, adjusted_mode, &f);
+		vop2_win_write(win, VOP2_WIN_AXI_BUS_ID, vop2_win_get_axi_bus(win, &f));
 		vop2_win_write(win, VOP2_WIN_AXI_YRGB_R_ID, win->data->axi_yrgb_r_id);
 		vop2_win_write(win, VOP2_WIN_AXI_UV_R_ID, win->data->axi_uv_r_id);
 	}
@@ -2367,7 +2574,7 @@ static int vop2_crtc_atomic_check(struct drm_crtc *crtc,
 	if (nplanes > vp->nlayers)
 		return -EINVAL;
 
-	return 0;
+	return vop2_axi_check(vp->vop2, state);
 }
 
 static void vop2_crtc_atomic_begin(struct drm_crtc *crtc,
