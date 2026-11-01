@@ -246,7 +246,7 @@ struct rkvdec_dev {
 	struct ida film_ida;
 	int next_film_idx;
 	bool ccu_reset_pending;
-	struct rkvdec_ctx *deferred_ctx;
+	struct list_head deferred_ctxs;
 	wait_queue_head_t reset_wq;
 	struct work_struct reset_work;
 };
@@ -273,6 +273,9 @@ struct rkvdec_ctx {
 	/* completes the jobs in decoding order, serializes it with new jobs */
 	struct mutex done_lock;
 	int film_idx;
+	/* m2m jobs to run once the cores are reset, see rkvdec_job_start() */
+	struct list_head deferred_node;
+	unsigned int num_deferred;
 	void *priv;
 	u8 has_sps_st_rps: 1;
 	u8 has_sps_lt_rps: 1;
