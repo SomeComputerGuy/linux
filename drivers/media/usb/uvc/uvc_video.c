@@ -1351,8 +1351,12 @@ static void uvc_video_copy_data_work(struct work_struct *work)
 		uvc_queue_buffer_release(op->buf);
 	}
 
+	/*
+	 * -EPERM means the URB has been poisoned by uvc_video_stop_transfer(),
+	 * which is how stopping the stream keeps this work from resubmitting.
+	 */
 	ret = usb_submit_urb(uvc_urb->urb, GFP_KERNEL);
-	if (ret < 0)
+	if (ret < 0 && ret != -EPERM)
 		dev_err(&uvc_urb->stream->intf->dev,
 			"Failed to resubmit video URB (%d).\n", ret);
 }
@@ -1781,7 +1785,8 @@ static void uvc_video_complete(struct urb *urb)
 	/* If no async work is needed, resubmit the URB immediately. */
 	if (!uvc_urb->async_operations) {
 		ret = usb_submit_urb(uvc_urb->urb, GFP_ATOMIC);
-		if (ret < 0)
+		/* -EPERM: poisoned by uvc_video_stop_transfer(), see above. */
+		if (ret < 0 && ret != -EPERM)
 			dev_err(&stream->intf->dev,
 				"Failed to resubmit video URB (%d).\n", ret);
 		return;
