@@ -360,6 +360,7 @@ struct dw_dp {
 	int audio_channel_allocation;
 	int audio_sample_width;
 	bool audio_muted;
+	bool cec_registered;
 	int audio_sdp_nr;
 	/* Serialize hpd status access */
 	struct mutex irq_lock;
@@ -2209,12 +2210,17 @@ static enum drm_connector_status dw_dp_bridge_detect(struct drm_bridge *bridge,
 		return connector_status_disconnected;
 
 	if (!dw_dp_hpd_detect(dp))
-		return connector_status_disconnected;
+		goto disconnected;
 
 	if (!dw_dp_hpd_detect_link(dp, connector))
-		return connector_status_disconnected;
+		goto disconnected;
 
 	return connector_status_connected;
+
+disconnected:
+	drm_dp_cec_unset_edid(&dp->aux);
+
+	return connector_status_disconnected;
 }
 
 static const struct drm_edid *dw_dp_bridge_edid_read(struct drm_bridge *bridge,
@@ -2233,6 +2239,20 @@ static const struct drm_edid *dw_dp_bridge_edid_read(struct drm_bridge *bridge,
 	phy_power_off(dp->phy);
 
 	dw_dp_update_dfp(dp, edid);
+
+	/*
+	 * The CEC adapter needs the connector, which is only known once the
+	 * bridge connector calls into us.
+	 */
+	if (!dp->cec_registered) {
+		drm_dp_cec_register_connector(&dp->aux, connector);
+		dp->cec_registered = true;
+	}
+
+	if (edid)
+		drm_dp_cec_set_edid(&dp->aux, drm_edid_raw(edid));
+	else
+		drm_dp_cec_unset_edid(&dp->aux);
 
 	return edid;
 }
@@ -2411,6 +2431,12 @@ static void dw_dp_bridge_detach(struct drm_bridge *bridge)
 
 	disable_irq(dp->irq);
 	cancel_work_sync(&dp->hpd_work);
+
+	if (dp->cec_registered) {
+		drm_dp_cec_unregister_connector(&dp->aux);
+		dp->cec_registered = false;
+	}
+
 	drm_dp_aux_unregister(&dp->aux);
 
 	if (!dp->usbc_mode)
@@ -2535,6 +2561,8 @@ static void dw_dp_hpd_work(struct work_struct *work)
 	}
 
 	if (!long_hpd) {
+		drm_dp_cec_irq(&dp->aux);
+
 		if (dw_dp_needs_link_retrain(dp)) {
 			ret = dw_dp_link_retrain(dp);
 			if (ret)
