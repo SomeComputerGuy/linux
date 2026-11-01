@@ -827,14 +827,14 @@ static int rockchip_i2s_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = devm_snd_soc_register_component(&pdev->dev,
-					      &rockchip_i2s_component,
-					      dai, 1);
-
+	/* Register the PCM first, a card can bind as soon as the DAI is added */
+	ret = devm_snd_dmaengine_pcm_register(&pdev->dev, NULL, 0);
 	if (ret)
 		return ret;
 
-	ret = devm_snd_dmaengine_pcm_register(&pdev->dev, NULL, 0);
+	ret = devm_snd_soc_register_component(&pdev->dev,
+					      &rockchip_i2s_component,
+					      dai, 1);
 	if (ret)
 		return ret;
 
