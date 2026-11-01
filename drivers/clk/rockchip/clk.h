@@ -662,6 +662,9 @@ struct rockchip_pll_rate_table {
  * ROCKCHIP_PLL_SYNC_RATE - check rate parameters to match against the
  *	rate_table parameters and adjust them if necessary.
  * ROCKCHIP_PLL_FIXED_MODE - the pll operates in normal mode only
+ * ROCKCHIP_PLL_CALC_RATE - compute the pll parameters for rates that are not
+ *	in the rate_table instead of rounding to a table entry. Meant for
+ *	dedicated (e.g. video) plls whose consumers need arbitrary rates.
  */
 struct rockchip_pll_clock {
 	unsigned int		id;
@@ -680,6 +683,7 @@ struct rockchip_pll_clock {
 
 #define ROCKCHIP_PLL_SYNC_RATE		BIT(0)
 #define ROCKCHIP_PLL_FIXED_MODE		BIT(1)
+#define ROCKCHIP_PLL_CALC_RATE		BIT(2)
 
 #define PLL(_type, _id, _name, _pnames, _flags, _con, _mode, _mshift,	\
 		_lshift, _pflags, _rtable)				\
