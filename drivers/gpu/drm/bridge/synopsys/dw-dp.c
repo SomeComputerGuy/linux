@@ -1595,6 +1595,18 @@ static ssize_t dw_dp_aux_transfer(struct drm_dp_aux *aux,
 	if (ret)
 		return ret;
 
+	/*
+	 * The controller does not run an AUX transaction while its HPD state
+	 * machine reports the sink as unplugged: there is no reply event and
+	 * the transfer would only end with the software timeout. A source
+	 * must not start AUX transactions while HPD is deasserted anyway, so
+	 * fail right away. This happens e.g. when a branch device drops HPD
+	 * while a short pulse is being handled, or while the state machine is
+	 * still debouncing HPD after the controller has been (re)initialized.
+	 */
+	if (!dw_dp_hpd_detect(dp))
+		return -ENXIO;
+
 	reinit_completion(&dp->complete);
 
 	switch (msg->request & ~DP_AUX_I2C_MOT) {
