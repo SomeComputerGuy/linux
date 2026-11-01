@@ -682,7 +682,8 @@
 		 <&cru DCLK_VOP3>,
 		 <&cru PCLK_VOP_ROOT>,
 		 <&hdptxphy0>,
-		 <&hdptxphy1>;
+		 <&hdptxphy1>,
+		 <&cru PLL_V0PLL>;
 	clock-names = "aclk",
 		      "hclk",
 		      "dclk_vp0",
@@ -691,5 +692,6 @@
 		      "dclk_vp3",
 		      "pclk_vop",
 		      "pll_hdmiphy0",
-		      "pll_hdmiphy1";
+		      "pll_hdmiphy1",
+		      "pll_v0";
 };
