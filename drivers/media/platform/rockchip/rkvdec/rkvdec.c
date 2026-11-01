@@ -1217,7 +1217,8 @@ static struct rkvdec_job *rkvdec_job_start(struct rkvdec_ctx *ctx)
 	 * idle that is being set up.
 	 */
 	if (rkvdec->ccu_reset_pending) {
-		rkvdec->deferred_ctx = ctx;
+		if (!ctx->num_deferred++)
+			list_add_tail(&ctx->deferred_node, &rkvdec->deferred_ctxs);
 		return ERR_PTR(-EAGAIN);
 	}
 
@@ -1915,6 +1916,7 @@ static int rkvdec_open(struct file *filp)
 
 	ctx->dev = rkvdec;
 	INIT_LIST_HEAD(&ctx->jobs);
+	INIT_LIST_HEAD(&ctx->deferred_node);
 	init_waitqueue_head(&ctx->jobs_wq);
 	mutex_init(&ctx->done_lock);
 	ctx->num_job_slots = 1;
@@ -2257,8 +2259,18 @@ static void rkvdec_ccu_reset_work(struct work_struct *work)
 	struct rkvdec_dev *rkvdec = container_of(work, struct rkvdec_dev,
 						 reset_work);
 	struct rkvdec_ctx *ctx;
+	unsigned int runs;
 	bool powered;
 	int i;
+
+	/*
+	 * Each failure schedules the work, and one reset handles all the
+	 * failures up to it: a run without a reset pending must not touch the
+	 * cores, which run new jobs again.
+	 */
+	scoped_guard(spinlock_irqsave, &rkvdec->cores_lock)
+		if (!rkvdec->ccu_reset_pending)
+			return;
 
 	wait_event(rkvdec->reset_wq, rkvdec_cores_settled(rkvdec));
 
@@ -2297,14 +2309,24 @@ static void rkvdec_ccu_reset_work(struct work_struct *work)
 			rkvdec_job_hw_done(core, VB2_BUF_STATE_ERROR, true);
 	}
 
-	scoped_guard(spinlock_irqsave, &rkvdec->cores_lock) {
-		rkvdec->ccu_reset_pending = false;
-		ctx = rkvdec->deferred_ctx;
-		rkvdec->deferred_ctx = NULL;
+	/*
+	 * Run the m2m jobs that couldn't start meanwhile, of all the contexts:
+	 * each one waits for its job to be run.
+	 */
+	spin_lock_irq(&rkvdec->cores_lock);
+	rkvdec->ccu_reset_pending = false;
+	while (!rkvdec->ccu_reset_pending &&
+	       (ctx = list_first_entry_or_null(&rkvdec->deferred_ctxs,
+					       struct rkvdec_ctx, deferred_node))) {
+		list_del_init(&ctx->deferred_node);
+		runs = ctx->num_deferred;
+		ctx->num_deferred = 0;
+		spin_unlock_irq(&rkvdec->cores_lock);
+		while (runs--)
+			rkvdec_device_run(ctx);
+		spin_lock_irq(&rkvdec->cores_lock);
 	}
-
-	if (ctx)
-		rkvdec_device_run(ctx);
+	spin_unlock_irq(&rkvdec->cores_lock);
 }
 
 /*
@@ -3033,6 +3055,7 @@ static int rkvdec_probe(struct platform_device *pdev)
 	mutex_init(&rkvdec->vdev_lock);
 	spin_lock_init(&rkvdec->cores_lock);
 	init_waitqueue_head(&rkvdec->reset_wq);
+	INIT_LIST_HEAD(&rkvdec->deferred_ctxs);
 	INIT_WORK(&rkvdec->reset_work, rkvdec_ccu_reset_work);
 	ida_init(&rkvdec->film_ida);
 	rkvdec->next_film_idx = 1;
