@@ -161,6 +161,47 @@ void hantro_irq_done(struct hantro_dev *vpu,
 	}
 }
 
+/*
+ * Pulsing the reset lines of a core can also reset its IOMMU, behind the back
+ * of the IOMMU driver. Attach the empty domain and detach it again to return
+ * to the default DMA domain: the IOMMU driver then fully reinitializes the
+ * IOMMU, and the default domain keeps all its mappings. Called after the core
+ * was reset, so the IOMMU can be stalled. A secondary core attached to the
+ * domain of the main core is detached from it first, and attached to it again
+ * at the end.
+ *
+ * If the IOMMU can't be attached to the empty domain, its driver may leave it
+ * without translation. Refuse all later jobs on the core then, rather than let
+ * the core access memory with untranslated addresses.
+ */
+void hantro_iommu_restore(struct hantro_dev *vpu)
+{
+	int ret;
+
+	if (!vpu->empty_domain)
+		return;
+
+	if (vpu->attached_domain)
+		iommu_detach_device(vpu->attached_domain, vpu->dev);
+
+	ret = iommu_attach_device(vpu->empty_domain, vpu->dev);
+	if (ret) {
+		dev_err(vpu->dev, "Failed to reinitialize the IOMMU (%d), refusing further jobs\n",
+			ret);
+		vpu->iommu_lost = true;
+		return;
+	}
+
+	iommu_detach_device(vpu->empty_domain, vpu->dev);
+
+	if (vpu->attached_domain) {
+		ret = iommu_attach_device(vpu->attached_domain, vpu->dev);
+		if (ret)
+			dev_err(vpu->dev, "Failed to attach back to the IOMMU domain of the main core: %d\n",
+				ret);
+	}
+}
+
 void hantro_watchdog(struct work_struct *work)
 {
 	struct hantro_dev *vpu;
@@ -225,6 +266,9 @@ static void device_run(void *priv)
 
 	core = hantro_acquire_core(ctx);
 	if (WARN_ON_ONCE(!core))
+		goto err_cancel_job;
+
+	if (unlikely(core->iommu_lost))
 		goto err_cancel_job;
 
 	ret = pm_runtime_resume_and_get(core->dev);
@@ -1162,6 +1206,40 @@ init_new_m2m_dev:
 	return v4l2_m2m_init(&vpu_m2m_ops);
 }
 
+static void hantro_free_empty_domain(void *data)
+{
+	iommu_domain_free(data);
+}
+
+static int hantro_alloc_empty_domain(struct hantro_dev *vpu)
+{
+	struct iommu_domain *domain;
+
+	/*
+	 * Only needed if the core can be reset, and only possible with a DMA
+	 * domain to return to.
+	 */
+	if (!vpu->resets)
+		return 0;
+
+	domain = iommu_get_domain_for_dev(vpu->dev);
+	if (!domain || !iommu_is_dma_domain(domain))
+		return 0;
+
+	domain = iommu_paging_domain_alloc(vpu->dev);
+	if (IS_ERR(domain)) {
+		/* Not fatal, the IOMMU just won't be restored after a reset. */
+		dev_warn(vpu->dev, "Failed to allocate an empty IOMMU domain: %pe\n",
+			 domain);
+		return 0;
+	}
+
+	vpu->empty_domain = domain;
+
+	return devm_add_action_or_reset(vpu->dev, hantro_free_empty_domain,
+					domain);
+}
+
 /*
  * Acquire and initialize the hardware resources of one VPU instance:
  * clocks, resets, registers, interrupts and runtime PM.
@@ -1200,6 +1278,10 @@ static int hantro_hw_init(struct hantro_dev *vpu)
 	vpu->resets = devm_reset_control_array_get_optional_exclusive(&pdev->dev);
 	if (IS_ERR(vpu->resets))
 		return PTR_ERR(vpu->resets);
+
+	ret = hantro_alloc_empty_domain(vpu);
+	if (ret)
+		return ret;
 
 	num_bases = vpu->variant->num_regs ?: 1;
 	vpu->reg_bases = devm_kcalloc(&pdev->dev, num_bases,
