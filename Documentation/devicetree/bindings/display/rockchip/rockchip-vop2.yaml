@@ -68,6 +68,7 @@ properties:
       - {}
       - {}
       - {}
+      - {}
 
   clock-names:
     minItems: 5
@@ -77,6 +78,7 @@ properties:
       - const: dclk_vp0
       - const: dclk_vp1
       - const: dclk_vp2
+      - {}
       - {}
       - {}
       - {}
@@ -257,7 +259,10 @@ allOf:
             - description: Pixel clock for video port 3.
             - description: Peripheral(vop grf/dsi) clock.
             - description: Alternative pixel clock provided by HDMI0 PHY PLL.
-            - description: Alternative pixel clock provided by HDMI1 PHY PLL.
+            - description: Alternative pixel clock provided by HDMI1 PHY PLL,
+                or the video PLL if there is no HDMI1 PHY.
+            - description: Video PLL (V0PLL) the video ports may retune for
+                pixel clocks the system PLLs cannot divide down exactly.
 
         clock-names:
           minItems: 7
@@ -270,7 +275,8 @@ allOf:
             - const: dclk_vp3
             - const: pclk_vop
             - const: pll_hdmiphy0
-            - const: pll_hdmiphy1
+            - enum: [pll_hdmiphy1, pll_v0]
+            - const: pll_v0
 
         resets:
           minItems: 6
