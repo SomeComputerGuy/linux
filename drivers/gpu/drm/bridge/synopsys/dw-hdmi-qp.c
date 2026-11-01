@@ -94,6 +94,9 @@ struct dw_hdmi_qp {
 	struct mutex audio_lock;
 	/* Sample rate of the active audio stream, 0 when there is none */
 	unsigned int audio_sample_rate;
+	/* Parameters of the active stream, replayed when the link comes up */
+	struct hdmi_codec_daifmt audio_fmt;
+	struct hdmi_codec_params audio_params;
 
 	bool no_hpd;
 };
@@ -271,16 +274,46 @@ static void dw_hdmi_qp_set_sample_rate(struct dw_hdmi_qp *hdmi, unsigned long lo
 }
 
 /*
- * N and CTS depend on the link rate, so an audio stream that stays open across
- * a modeset or an FRL rate change needs them reprogrammed for the new link.
+ * Program the audio path for the stream described by audio_fmt/audio_params.
+ * N and CTS depend on the link rate, so this is also used to reprogram a stream
+ * that stays open across a modeset or an FRL rate change, or that was prepared
+ * while the output was disabled. Caller holds audio_lock.
  */
+static void dw_hdmi_qp_program_audio(struct dw_hdmi_qp *hdmi,
+				     struct drm_connector *connector)
+{
+	bool ref2stream = hdmi->audio_fmt.bit_fmt == SNDRV_PCM_FORMAT_IEC958_SUBFRAME_LE;
+
+	dw_hdmi_qp_set_audio_interface(hdmi, &hdmi->audio_fmt, &hdmi->audio_params);
+	dw_hdmi_qp_set_sample_rate(hdmi, hdmi->tmds_char_rate, hdmi->audio_sample_rate);
+	dw_hdmi_qp_set_channel_status(hdmi, hdmi->audio_params.iec.status, ref2stream);
+	drm_atomic_helper_connector_hdmi_update_audio_infoframe(connector,
+								&hdmi->audio_params.cea);
+}
+
 static void dw_hdmi_qp_update_acr(struct dw_hdmi_qp *hdmi)
 {
-	guard(mutex)(&hdmi->audio_lock);
+	struct drm_connector *connector;
 
-	if (hdmi->audio_sample_rate && hdmi->tmds_char_rate)
-		dw_hdmi_qp_set_sample_rate(hdmi, hdmi->tmds_char_rate,
-					   hdmi->audio_sample_rate);
+	/* Same as dw_hdmi_qp_hpd_notify(): hold a reference while using it */
+	scoped_guard(mutex, &hdmi->mutex) {
+		connector = hdmi->curr_conn;
+		if (connector)
+			drm_connector_get(connector);
+	}
+
+	if (!connector)
+		return;
+
+	scoped_guard(mutex, &hdmi->audio_lock) {
+		if (hdmi->audio_sample_rate && hdmi->tmds_char_rate) {
+			dw_hdmi_qp_program_audio(hdmi, connector);
+			dw_hdmi_qp_mod(hdmi, 0, AVP_DATAPATH_PACKET_AUDIO_SWDISABLE,
+				       GLOBAL_SWDISABLE);
+		}
+	}
+
+	drm_connector_put(connector);
 }
 
 static int dw_hdmi_qp_audio_enable(struct drm_bridge *bridge,
@@ -300,27 +333,25 @@ static int dw_hdmi_qp_audio_prepare(struct drm_bridge *bridge,
 				    struct hdmi_codec_params *hparms)
 {
 	struct dw_hdmi_qp *hdmi = dw_hdmi_qp_from_bridge(bridge);
-	bool ref2stream = false;
-
-	if (!hdmi->tmds_char_rate)
-		return -ENODEV;
 
 	if (fmt->bit_clk_provider | fmt->frame_clk_provider) {
 		dev_err(hdmi->dev, "unsupported clock settings\n");
 		return -EINVAL;
 	}
 
-	if (fmt->bit_fmt == SNDRV_PCM_FORMAT_IEC958_SUBFRAME_LE)
-		ref2stream = true;
+	/*
+	 * A stream may be opened while the output is disabled (e.g. a sink that
+	 * is gone or a modeset in progress). That is not an error: remember the
+	 * parameters and program them when the link is enabled.
+	 */
+	guard(mutex)(&hdmi->audio_lock);
 
-	dw_hdmi_qp_set_audio_interface(hdmi, fmt, hparms);
-	scoped_guard(mutex, &hdmi->audio_lock) {
-		hdmi->audio_sample_rate = hparms->sample_rate;
-		dw_hdmi_qp_set_sample_rate(hdmi, hdmi->tmds_char_rate,
-					   hparms->sample_rate);
-	}
-	dw_hdmi_qp_set_channel_status(hdmi, hparms->iec.status, ref2stream);
-	drm_atomic_helper_connector_hdmi_update_audio_infoframe(connector, &hparms->cea);
+	hdmi->audio_fmt = *fmt;
+	hdmi->audio_params = *hparms;
+	hdmi->audio_sample_rate = hparms->sample_rate;
+
+	if (hdmi->tmds_char_rate)
+		dw_hdmi_qp_program_audio(hdmi, connector);
 
 	return 0;
 }
