@@ -2916,6 +2916,7 @@ EXPORT_SYMBOL_GPL(dw_dp_runtime_suspend);
 
 int dw_dp_runtime_resume(struct dw_dp *dp)
 {
+	u32 value;
 	int ret;
 
 	ret = clk_prepare_enable(dp->apb_clk);
@@ -2938,10 +2939,18 @@ int dw_dp_runtime_resume(struct dw_dp *dp)
 	enable_irq(dp->irq);
 
 	/*
-	 * HPD_HOT_PLUG bit is asserted only after the sink holds HPD
-	 * high for at least 100ms.
+	 * The HPD state machine restarts with the controller, and reports
+	 * the sink as plugged only after it has held HPD high for at least
+	 * 100 ms. Wait for that, so that the AUX transfers, detection or
+	 * short pulse handling that resumed the controller see the sink.
+	 * Nothing to wait for if the Type-C side reports HPD low.
 	 */
-	msleep(110);
+	if (dp->usbc_mode && !dp->usbc_hpd)
+		return 0;
+
+	regmap_read_poll_timeout(dp->regmap, DW_DP_HPD_STATUS, value,
+				 FIELD_GET(HPD_STATE, value) == DW_DP_HPD_STATE_PLUG,
+				 5000, 200000);
 
 	return 0;
 }
