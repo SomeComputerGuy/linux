@@ -589,6 +589,21 @@ static bool dw_dp_hpd_detect(struct dw_dp *dp)
 	return FIELD_GET(HPD_STATE, value) == DW_DP_HPD_STATE_PLUG;
 }
 
+/*
+ * The HPD state machine reports the sink as plugged only after HPD has been
+ * high for at least 100 ms. Wait for it to agree with the HPD level it is
+ * given, so that AUX transfers and detection that follow see the sink (or
+ * its absence).
+ */
+static void dw_dp_wait_hpd_state(struct dw_dp *dp, bool plugged)
+{
+	u32 value;
+
+	regmap_read_poll_timeout(dp->regmap, DW_DP_HPD_STATUS, value,
+				 (FIELD_GET(HPD_STATE, value) == DW_DP_HPD_STATE_PLUG) == plugged,
+				 5000, 200000);
+}
+
 /* Start from the highest rate and lane count both ends support */
 static void dw_dp_link_set_max(struct dw_dp *dp, struct dw_dp_link *link)
 {
@@ -2521,10 +2536,19 @@ static void dw_dp_bridge_oob_notify(struct drm_bridge *bridge,
 	if (ret)
 		return;
 
-	if (dp->plat_data.hpd_sw_cfg)
+	if (dp->plat_data.hpd_sw_cfg) {
 		dp->plat_data.hpd_sw_cfg(dp->plat_data.data, hpd_high);
-	else
+
+		/*
+		 * The connector reports this event once this returns. The
+		 * controller does not report a plug or unplug of its own in
+		 * this mode (see dw_dp_handle_hpd_event()), so let its HPD
+		 * state settle first, for the detection that follows.
+		 */
+		dw_dp_wait_hpd_state(dp, hpd_high);
+	} else {
 		dev_err_once(dp->dev, "Missing platform handler for OOB HPD handling\n");
+	}
 
 	/*
 	 * Forcing the HPD level only lets the controller see plug and unplug
@@ -2672,6 +2696,7 @@ static void dw_dp_hpd_work(struct work_struct *work)
 
 static void dw_dp_handle_hpd_event(struct dw_dp *dp)
 {
+	bool pending = false;
 	u32 value;
 
 	mutex_lock(&dp->irq_lock);
@@ -2681,22 +2706,36 @@ static void dw_dp_handle_hpd_event(struct dw_dp *dp)
 		dev_dbg(dp->dev, "IRQ from the HPD\n");
 		dp->hotplug.long_hpd = false;
 		regmap_write(dp->regmap, DW_DP_HPD_STATUS, HPD_IRQ);
+		pending = true;
 	}
 
 	if (value & HPD_HOT_PLUG) {
 		dev_dbg(dp->dev, "Hot plug detected\n");
-		dp->hotplug.long_hpd = true;
 		regmap_write(dp->regmap, DW_DP_HPD_STATUS, HPD_HOT_PLUG);
 	}
 
 	if (value & HPD_HOT_UNPLUG) {
 		dev_dbg(dp->dev, "Unplug detected\n");
-		dp->hotplug.long_hpd = true;
 		regmap_write(dp->regmap, DW_DP_HPD_STATUS, HPD_HOT_UNPLUG);
+	}
+
+	/*
+	 * With out-of-band HPD (USB-C DP Alt Mode) the controller only sees
+	 * the HPD level that dw_dp_bridge_oob_notify() forces, and the
+	 * connector reports every out-of-band event to DRM itself. A plug or
+	 * unplug the controller reports then only echoes that level, or the
+	 * restart of the HPD state machine after the controller lost its
+	 * state in runtime suspend: don't handle it as a long pulse, which
+	 * would probe every connector of the device.
+	 */
+	if ((value & (HPD_HOT_PLUG | HPD_HOT_UNPLUG)) && !dp->usbc_mode) {
+		dp->hotplug.long_hpd = true;
+		pending = true;
 	}
 	mutex_unlock(&dp->irq_lock);
 
-	schedule_work(&dp->hpd_work);
+	if (pending)
+		schedule_work(&dp->hpd_work);
 }
 
 static irqreturn_t dw_dp_irq(int irq, void *data)
@@ -2982,7 +3021,6 @@ EXPORT_SYMBOL_GPL(dw_dp_runtime_suspend);
 
 int dw_dp_runtime_resume(struct dw_dp *dp)
 {
-	u32 value;
 	int ret;
 
 	ret = clk_prepare_enable(dp->apb_clk);
@@ -3005,18 +3043,15 @@ int dw_dp_runtime_resume(struct dw_dp *dp)
 	enable_irq(dp->irq);
 
 	/*
-	 * The HPD state machine restarts with the controller, and reports
-	 * the sink as plugged only after it has held HPD high for at least
-	 * 100 ms. Wait for that, so that the AUX transfers, detection or
-	 * short pulse handling that resumed the controller see the sink.
-	 * Nothing to wait for if the Type-C side reports HPD low.
+	 * The HPD state machine restarts with the controller. Wait for it to
+	 * report the sink, so that the AUX transfers, detection or short
+	 * pulse handling that resumed the controller see it. Nothing to wait
+	 * for if the Type-C side reports HPD low.
 	 */
 	if (dp->usbc_mode && !dp->usbc_hpd)
 		return 0;
 
-	regmap_read_poll_timeout(dp->regmap, DW_DP_HPD_STATUS, value,
-				 FIELD_GET(HPD_STATE, value) == DW_DP_HPD_STATE_PLUG,
-				 5000, 200000);
+	dw_dp_wait_hpd_state(dp, true);
 
 	return 0;
 }
