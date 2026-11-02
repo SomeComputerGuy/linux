@@ -126,6 +126,8 @@ static void rga_watchdog(struct work_struct *work)
 	else
 		dev_err(core->dev, "job timed out, resetting the core\n");
 
+	if (rga->hw->reset)
+		rga->hw->reset(core);
 	rga_core_reset(core);
 	rga_core_iommu_restore(core);
 
