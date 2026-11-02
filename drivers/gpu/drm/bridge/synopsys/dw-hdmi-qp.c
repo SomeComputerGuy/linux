@@ -755,7 +755,14 @@ static int dw_hdmi_qp_bridge_frl_set_ltp(struct drm_bridge *bridge,
 	struct dw_hdmi_qp *hdmi = bridge->driver_private;
 	u32 flt_cfg;
 
-	flt_cfg = (ln3 << 16) | (ln2 << 12) | (ln1 << 8) | (ln0 << 4) | 0xf;
+	/*
+	 * No LTP requested on any lane means training passed: stop sending
+	 * link training patterns before the link carries FRL data.
+	 */
+	if (!ln0 && !ln1 && !ln2 && !ln3)
+		flt_cfg = 0;
+	else
+		flt_cfg = (ln3 << 16) | (ln2 << 12) | (ln1 << 8) | (ln0 << 4) | 0xf;
 
 	dw_hdmi_qp_write(hdmi, flt_cfg, FLT_CONFIG1);
 
