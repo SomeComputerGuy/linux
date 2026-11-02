@@ -208,6 +208,11 @@ struct rga_hw {
 	void (*start)(struct rga_core *core,
 		      struct rga_vb_buffer *src, struct rga_vb_buffer *dst);
 	enum rga_irq_status (*handle_irq)(struct rga_core *core);
+	/*
+	 * Optional, stops a core that is still busy before its reset lines
+	 * are pulsed.
+	 */
+	void (*reset)(struct rga_core *core);
 	struct rockchip_rga_version (*get_version)(struct rga_core *core);
 	void *(*adjust_and_map_format)(struct rga_ctx *ctx,
 				       struct v4l2_pix_format_mplane *format,
