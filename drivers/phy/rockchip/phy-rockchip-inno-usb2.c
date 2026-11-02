@@ -293,6 +293,24 @@ static inline bool property_enabled(struct regmap *base,
 	return tmp != reg->disable;
 }
 
+/*
+ * Not every register is there on every SoC, and an unused entry of the
+ * register tables is all zeroes. Its offset 0 is a real register though,
+ * so it must not be read or written in place of the missing one.
+ */
+static inline bool property_present(const struct usb2phy_reg *reg)
+{
+	return reg->enable || reg->disable;
+}
+
+/* Whether a port can detect and report changes of its ID pin */
+static bool rockchip_usb2phy_id_det_present(const struct rockchip_usb2phy_port_cfg *cfg)
+{
+	return property_present(&cfg->utmi_id) &&
+	       property_present(&cfg->idfall_det_en) &&
+	       property_present(&cfg->idrise_det_en);
+}
+
 static int rockchip_usb2phy_reset(struct rockchip_usb2phy *rphy)
 {
 	int ret;
@@ -573,30 +591,32 @@ static int rockchip_usb2phy_init(struct phy *phy)
 			if (ret)
 				goto out;
 
-			/* clear id status and enable id detect irqs */
-			ret = property_enable(rphy->grf,
-					      &rport->port_cfg->idfall_det_clr,
-					      true);
-			if (ret)
-				goto out;
+			if (rockchip_usb2phy_id_det_present(rport->port_cfg)) {
+				/* clear id status and enable id detect irqs */
+				ret = property_enable(rphy->grf,
+						      &rport->port_cfg->idfall_det_clr,
+						      true);
+				if (ret)
+					goto out;
 
-			ret = property_enable(rphy->grf,
-					      &rport->port_cfg->idrise_det_clr,
-					      true);
-			if (ret)
-				goto out;
+				ret = property_enable(rphy->grf,
+						      &rport->port_cfg->idrise_det_clr,
+						      true);
+				if (ret)
+					goto out;
 
-			ret = property_enable(rphy->grf,
-					      &rport->port_cfg->idfall_det_en,
-					      true);
-			if (ret)
-				goto out;
+				ret = property_enable(rphy->grf,
+						      &rport->port_cfg->idfall_det_en,
+						      true);
+				if (ret)
+					goto out;
 
-			ret = property_enable(rphy->grf,
-					      &rport->port_cfg->idrise_det_en,
-					      true);
-			if (ret)
-				goto out;
+				ret = property_enable(rphy->grf,
+						      &rport->port_cfg->idrise_det_en,
+						      true);
+				if (ret)
+					goto out;
+			}
 
 			schedule_delayed_work(&rport->otg_sm_work,
 					      OTG_SCHEDULE_DELAY * 3);
@@ -981,7 +1001,8 @@ static void rockchip_chg_detect_stop(struct rockchip_usb2phy *rphy,
 
 	vbus_attach = property_enabled(rphy->grf, &rport->port_cfg->utmi_bvalid);
 	if (rphy->chg_state != USB_CHG_STATE_UNDEFINED &&
-	    rphy->chg_state != USB_CHG_STATE_DETECTED && !vbus_attach)
+	    rphy->chg_state != USB_CHG_STATE_DETECTED && !vbus_attach &&
+	    property_present(&rphy->phy_cfg->chg_det.opmode))
 		property_enable(rphy->grf, &rphy->phy_cfg->chg_det.opmode, true);
 
 	rphy->chg_state = USB_CHG_STATE_UNDEFINED;
@@ -1023,7 +1044,7 @@ static void rockchip_chg_detect_work(struct work_struct *work)
 		if (!rport->suspended && !vbus_attach)
 			rockchip_usb2phy_power_off(rport->phy);
 		/* put the controller in non-driving mode */
-		if (!vbus_attach)
+		if (!vbus_attach && property_present(&rphy->phy_cfg->chg_det.opmode))
 			property_enable(rphy->grf, &rphy->phy_cfg->chg_det.opmode, false);
 		/* Start DCD processing stage 1 */
 		rockchip_chg_enable_dcd(rphy, true);
@@ -1087,7 +1108,7 @@ static void rockchip_chg_detect_work(struct work_struct *work)
 		fallthrough;
 	case USB_CHG_STATE_DETECTED:
 		/* put the controller in normal mode */
-		if (!vbus_attach)
+		if (!vbus_attach && property_present(&rphy->phy_cfg->chg_det.opmode))
 			property_enable(rphy->grf, &rphy->phy_cfg->chg_det.opmode, true);
 		rockchip_usb2phy_otg_sm_work(&rport->otg_sm_work.work);
 		dev_dbg(&rport->phy->dev, "charger = %s\n",
@@ -1255,6 +1276,9 @@ static irqreturn_t rockchip_usb2phy_id_irq(int irq, void *data)
 	struct rockchip_usb2phy_port *rport = data;
 	struct rockchip_usb2phy *rphy = dev_get_drvdata(rport->phy->dev.parent);
 	bool id;
+
+	if (!rockchip_usb2phy_id_det_present(rport->port_cfg))
+		return IRQ_NONE;
 
 	if (!property_enabled(rphy->grf, &rport->port_cfg->idfall_det_st) &&
 	    !property_enabled(rphy->grf, &rport->port_cfg->idrise_det_st))
@@ -1515,7 +1539,8 @@ static int rockchip_usb2phy_otg_port_init(struct rockchip_usb2phy *rphy,
 			goto out;
 		}
 
-		if (!of_property_present(rphy->dev->of_node, "extcon")) {
+		if (!of_property_present(rphy->dev->of_node, "extcon") &&
+		    property_present(&rport->port_cfg->utmi_id)) {
 			/* do initial sync of usb state */
 			id = property_enabled(rphy->grf, &rport->port_cfg->utmi_id);
 			extcon_set_state_sync(rphy->edev, EXTCON_USB_HOST, !id);
