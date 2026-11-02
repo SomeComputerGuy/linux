@@ -301,6 +301,11 @@
 
 &usb_host0_xhci {
 	dr_mode = "otg";
+	/*
+	 * Be the host while the USB-C port is unattached, so that the Type-A
+	 * port on the same USB 2.0 lines works on its own.
+	 */
+	role-switch-default-mode = "host";
 	usb-role-switch;
 
 	ports {
