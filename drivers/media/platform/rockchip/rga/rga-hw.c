@@ -453,15 +453,17 @@ static void rga_hw_start(struct rga_core *core,
 	rga_write(core, RGA_CMD_CTRL, 0x1);
 }
 
-static bool rga_handle_irq(struct rga_core *core)
+static enum rga_irq_status rga_handle_irq(struct rga_core *core)
 {
 	int intr;
 
 	intr = rga_read(core, RGA_INT) & 0xf;
+	if (!intr)
+		return RGA_IRQ_NONE;
 
 	rga_mod(core, RGA_INT, intr << 4, 0xf << 4);
 
-	return intr & RGA_INT_COMMAND_FINISHED;
+	return intr & RGA_INT_COMMAND_FINISHED ? RGA_IRQ_DONE : RGA_IRQ_BUSY;
 }
 
 static struct rockchip_rga_version rga_get_version(struct rga_core *core)

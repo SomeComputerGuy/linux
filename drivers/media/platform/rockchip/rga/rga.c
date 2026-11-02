@@ -34,6 +34,109 @@
 static int debug;
 module_param(debug, int, 0644);
 
+/* Longest time a job may take before its core is reset */
+#define RGA_JOB_TIMEOUT_MS	2000
+
+static void rga_job_finish(struct rga_core *core, struct rga_ctx *ctx,
+			   enum vb2_buffer_state state)
+{
+	struct rockchip_rga *rga = core->rga;
+	struct vb2_v4l2_buffer *src, *dst;
+
+	src = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+	dst = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+
+	WARN_ON(!src);
+	WARN_ON(!dst);
+
+	v4l2_m2m_buf_copy_metadata(src, dst);
+
+	dst->sequence = ctx->csequence++;
+
+	v4l2_m2m_buf_done(src, state);
+	v4l2_m2m_buf_done(dst, state);
+	v4l2_m2m_job_finish(rga->m2m_dev, ctx->fh.m2m_ctx);
+
+	pm_runtime_put_autosuspend(core->dev);
+}
+
+static void rga_core_reset(struct rga_core *core)
+{
+	unsigned int i;
+
+	for (i = 0; i < RGA_NUM_RESETS; i++) {
+		reset_control_assert(core->resets[i].rstc);
+		udelay(1);
+		reset_control_deassert(core->resets[i].rstc);
+	}
+}
+
+/*
+ * Resetting a core also resets its IOMMU, which is then left in bypass while
+ * the IOMMU driver still considers it attached to its domain. Attach the
+ * empty domain and detach it again to return to the default DMA domain: the
+ * IOMMU driver then fully reinitializes the IOMMU, which keeps the mappings
+ * of the domain. A core attached to the domain of the first core is detached
+ * from it first, and attached to it again at the end.
+ */
+static void rga_core_iommu_restore(struct rga_core *core)
+{
+	int ret;
+
+	if (!core->empty_domain)
+		return;
+
+	if (core->attached_domain)
+		iommu_detach_device(core->attached_domain, core->dev);
+
+	ret = iommu_attach_device(core->empty_domain, core->dev);
+	if (ret)
+		dev_warn(core->dev, "Failed to attach the empty IOMMU domain: %d\n",
+			 ret);
+	else
+		iommu_detach_device(core->empty_domain, core->dev);
+
+	if (core->attached_domain) {
+		ret = iommu_attach_device(core->attached_domain, core->dev);
+		if (ret)
+			dev_err(core->dev, "Failed to attach back to the IOMMU domain of the first core: %d\n",
+				ret);
+	}
+}
+
+/*
+ * Runs when the job of a core timed out, or right away when the core reported
+ * an error. Either way the core may still be busy or stuck on the bus: reset
+ * it and its IOMMU before returning the buffers with an error, so that the
+ * next job starts on a clean core.
+ */
+static void rga_watchdog(struct work_struct *work)
+{
+	struct rga_core *core = container_of(to_delayed_work(work),
+					     struct rga_core, watchdog_work);
+	struct rockchip_rga *rga = core->rga;
+	struct rga_ctx *ctx = core->curr;
+	unsigned long flags;
+
+	if (WARN_ON(!ctx))
+		return;
+
+	if (READ_ONCE(core->job_failed))
+		dev_err(core->dev, "job failed, resetting the core\n");
+	else
+		dev_err(core->dev, "job timed out, resetting the core\n");
+
+	rga_core_reset(core);
+	rga_core_iommu_restore(core);
+
+	spin_lock_irqsave(&rga->cores_lock, flags);
+	WRITE_ONCE(core->job_failed, false);
+	core->curr = NULL;
+	spin_unlock_irqrestore(&rga->cores_lock, flags);
+
+	rga_job_finish(core, ctx, VB2_BUF_STATE_ERROR);
+}
+
 static void device_run(void *prv)
 {
 	struct rga_ctx *ctx = prv;
@@ -79,41 +182,45 @@ static void device_run(void *prv)
 
 	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
 
+	schedule_delayed_work(&core->watchdog_work,
+			      msecs_to_jiffies(RGA_JOB_TIMEOUT_MS));
 	rga->hw->start(core, vb_to_rga(src), vb_to_rga(dst));
 }
 
 static irqreturn_t rga_core_irq(struct rga_core *core)
 {
 	struct rockchip_rga *rga = core->rga;
+	enum rga_irq_status status;
+	struct rga_ctx *ctx;
 
 	/* ignore interrupt on an unbound core */
 	if (!rga)
 		return IRQ_HANDLED;
 
-	if (rga->hw->handle_irq(core)) {
-		struct vb2_v4l2_buffer *src, *dst;
-		struct rga_ctx *ctx = core->curr;
+	status = rga->hw->handle_irq(core);
+	if (status == RGA_IRQ_NONE)
+		return IRQ_NONE;
 
-		WARN_ON(!ctx);
+	ctx = core->curr;
+	if (status == RGA_IRQ_BUSY || !ctx || READ_ONCE(core->job_failed))
+		return IRQ_HANDLED;
 
-		core->curr = NULL;
+	/*
+	 * If the watchdog isn't pending anymore, it is already resetting the
+	 * core and finishes the job itself.
+	 */
+	if (!cancel_delayed_work(&core->watchdog_work))
+		return IRQ_HANDLED;
 
-		src = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
-		dst = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
-
-		WARN_ON(!src);
-		WARN_ON(!dst);
-
-		v4l2_m2m_buf_copy_metadata(src, dst);
-
-		dst->sequence = ctx->csequence++;
-
-		v4l2_m2m_buf_done(src, VB2_BUF_STATE_DONE);
-		v4l2_m2m_buf_done(dst, VB2_BUF_STATE_DONE);
-		v4l2_m2m_job_finish(rga->m2m_dev, ctx->fh.m2m_ctx);
-
-		pm_runtime_put_autosuspend(core->dev);
+	if (status == RGA_IRQ_ERROR) {
+		/* The core must be reset, which can't be done from here */
+		WRITE_ONCE(core->job_failed, true);
+		schedule_delayed_work(&core->watchdog_work, 0);
+		return IRQ_HANDLED;
 	}
+
+	core->curr = NULL;
+	rga_job_finish(core, ctx, VB2_BUF_STATE_DONE);
 
 	return IRQ_HANDLED;
 }
@@ -734,38 +841,19 @@ static const struct video_device rga_videodev = {
 
 static int rga_parse_dt(struct rga_core *core)
 {
-	struct reset_control *core_rst, *axi_rst, *ahb_rst;
 	int ret;
 
-	core_rst = devm_reset_control_get(core->dev, "core");
-	if (IS_ERR(core_rst)) {
-		dev_err(core->dev, "failed to get core reset controller\n");
-		return PTR_ERR(core_rst);
+	core->resets[0].id = "core";
+	core->resets[1].id = "axi";
+	core->resets[2].id = "ahb";
+	ret = devm_reset_control_bulk_get_exclusive(core->dev, RGA_NUM_RESETS,
+						    core->resets);
+	if (ret) {
+		dev_err(core->dev, "failed to get reset controllers\n");
+		return ret;
 	}
 
-	axi_rst = devm_reset_control_get(core->dev, "axi");
-	if (IS_ERR(axi_rst)) {
-		dev_err(core->dev, "failed to get axi reset controller\n");
-		return PTR_ERR(axi_rst);
-	}
-
-	ahb_rst = devm_reset_control_get(core->dev, "ahb");
-	if (IS_ERR(ahb_rst)) {
-		dev_err(core->dev, "failed to get ahb reset controller\n");
-		return PTR_ERR(ahb_rst);
-	}
-
-	reset_control_assert(core_rst);
-	udelay(1);
-	reset_control_deassert(core_rst);
-
-	reset_control_assert(axi_rst);
-	udelay(1);
-	reset_control_deassert(axi_rst);
-
-	reset_control_assert(ahb_rst);
-	udelay(1);
-	reset_control_deassert(ahb_rst);
+	rga_core_reset(core);
 
 	ret = devm_clk_bulk_get_all(core->dev, &core->clks);
 	if (ret < 0) {
@@ -809,6 +897,7 @@ static int rga_core_bind(struct device *dev, struct device *master, void *data)
 			dev_err(core->dev, "Couldn't attach to the domain of the first core\n");
 			return ret;
 		}
+		core->attached_domain = domain;
 
 		/* we are not the first core, expect that we have the same version */
 		if (rga->version.major != version.major || rga->version.minor != version.minor) {
@@ -846,6 +935,7 @@ static void rga_core_unbind(struct device *dev, struct device *master,
 
 			if (domain)
 				iommu_detach_device(domain, core->dev);
+			core->attached_domain = NULL;
 		}
 
 		spin_lock_irqsave(&rga->cores_lock, flags);
@@ -854,6 +944,8 @@ static void rga_core_unbind(struct device *dev, struct device *master,
 		spin_unlock_irqrestore(&rga->cores_lock, flags);
 		break;
 	}
+
+	cancel_delayed_work_sync(&core->watchdog_work);
 
 	/* make the ISR ignore this core before the m2m device is released */
 	core->rga = NULL;
@@ -864,6 +956,32 @@ static const struct component_ops rga_core_ops = {
 	.bind = rga_core_bind,
 	.unbind = rga_core_unbind,
 };
+
+static void rga_free_empty_domain(void *data)
+{
+	iommu_domain_free(data);
+}
+
+static int rga_alloc_empty_domain(struct rga_core *core)
+{
+	struct iommu_domain *domain;
+
+	if (!iommu_get_domain_for_dev(core->dev))
+		return 0;
+
+	domain = iommu_paging_domain_alloc(core->dev);
+	if (IS_ERR(domain)) {
+		/* Not fatal, the IOMMU just won't be restored after a reset */
+		dev_warn(core->dev, "Failed to allocate an empty IOMMU domain: %pe\n",
+			 domain);
+		return 0;
+	}
+
+	core->empty_domain = domain;
+
+	return devm_add_action_or_reset(core->dev, rga_free_empty_domain,
+					domain);
+}
 
 static int rga_core_probe(struct platform_device *pdev)
 {
@@ -884,10 +1002,15 @@ static int rga_core_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	core->dev = &pdev->dev;
+	INIT_DELAYED_WORK(&core->watchdog_work, rga_watchdog);
 
 	ret = rga_parse_dt(core);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "Unable to parse OF data\n");
+
+	ret = rga_alloc_empty_domain(core);
+	if (ret)
+		return ret;
 
 	ret = devm_pm_runtime_enable(core->dev);
 	if (ret)
