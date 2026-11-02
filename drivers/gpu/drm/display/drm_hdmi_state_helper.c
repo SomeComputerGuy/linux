@@ -569,8 +569,12 @@ hdmi_clock_valid(const struct drm_connector *connector,
 	    (info->max_tmds_clock && clock > info->max_tmds_clock * 1000)) {
 		unsigned int min_frl_gbps, max_frl_gbps, pref_frl_gbps = 0;
 
-		/* FRL supported by the Source & Sink? */
+		/*
+		 * FRL supported by the Source & Sink, and link training did not
+		 * fail with this sink?
+		 */
 		if (!drm_connector_hdmi_frl_supported(connector) ||
+		    READ_ONCE(hdmi->frl_failed_epoch) == connector->epoch_counter + 1 ||
 		    !hdmi_is_valid_frl_config(info->hdmi.max_frl_rate_per_lane,
 					      info->hdmi.max_lanes))
 			return MODE_CLOCK_HIGH;
