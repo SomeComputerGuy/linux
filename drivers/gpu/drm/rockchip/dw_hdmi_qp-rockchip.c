@@ -217,6 +217,39 @@ static int dw_hdmi_qp_rockchip_get_vop_format(struct drm_encoder *encoder,
 	return bstate->output_bus_cfg.format;
 }
 
+/*
+ * PHY link setup for a connector state, whose output mode the encoder's
+ * atomic_check has stored in the CRTC state.
+ */
+static enum phy_hdmi_mode
+dw_hdmi_qp_rockchip_phy_cfg(struct rockchip_crtc_state *s,
+			    struct drm_connector_state *conn_state,
+			    union phy_configure_opts *phy_cfg)
+{
+	memset(phy_cfg, 0, sizeof(*phy_cfg));
+
+	/*
+	 * YUV422 always transmits two 12-bit components per clock cycle,
+	 * regardless of the color depth, which from a rate perspective is
+	 * equivalent to three 8-bit RGB components.  Force 8 bpc here to
+	 * keep the PHY pixel clock aligned with the character rate.
+	 *
+	 * The color depth is needed in FRL mode as well: the PHY derives
+	 * the pixel clock from the link PLL using a bpc dependent divider.
+	 */
+	phy_cfg->hdmi.bpc = (s->output_mode == ROCKCHIP_OUT_MODE_YUV422 ?
+				8 : conn_state->hdmi.output_bpc);
+
+	if (conn_state->hdmi.frl_rate_per_lane) {
+		phy_cfg->hdmi.frl.rate_per_lane = conn_state->hdmi.frl_rate_per_lane;
+		phy_cfg->hdmi.frl.lanes = conn_state->hdmi.frl_lanes;
+		return PHY_HDMI_MODE_FRL;
+	}
+
+	phy_cfg->hdmi.tmds_char_rate = conn_state->hdmi.tmds_char_rate;
+	return PHY_HDMI_MODE_TMDS;
+}
+
 static int
 dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 					 struct drm_crtc_state *crtc_state,
@@ -224,7 +257,7 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 {
 	struct rockchip_crtc_state *s = to_rockchip_crtc_state(crtc_state);
 	struct rockchip_hdmi_qp *hdmi = to_rockchip_hdmi_qp(encoder);
-	union phy_configure_opts phy_cfg = {};
+	union phy_configure_opts phy_cfg;
 	enum phy_hdmi_mode mode;
 	int ingest_fmt;
 	int ret;
@@ -253,42 +286,18 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 	}
 
 	/*
-	 * YUV422 always transmits two 12-bit components per clock cycle,
-	 * regardless of the color depth, which from a rate perspective is
-	 * equivalent to three 8-bit RGB components.  Force 8 bpc here to
-	 * keep the PHY pixel clock aligned with the character rate.
-	 *
-	 * The color depth is needed in FRL mode as well: the PHY derives
-	 * the pixel clock from the link PLL using a bpc dependent divider.
+	 * Only check the link setup here: the PHY is programmed for it by
+	 * the commit, as this state may be refused, or only be tested.
 	 */
-	phy_cfg.hdmi.bpc = (s->output_mode == ROCKCHIP_OUT_MODE_YUV422 ?
-				8 : conn_state->hdmi.output_bpc);
-
-	if (conn_state->hdmi.frl_rate_per_lane) {
-		s->frl_enabled = true;
-		mode = PHY_HDMI_MODE_FRL;
-		phy_cfg.hdmi.frl.rate_per_lane = conn_state->hdmi.frl_rate_per_lane;
-		phy_cfg.hdmi.frl.lanes = conn_state->hdmi.frl_lanes;
-	} else {
-		s->frl_enabled = false;
-		mode = PHY_HDMI_MODE_TMDS;
-		phy_cfg.hdmi.tmds_char_rate = conn_state->hdmi.tmds_char_rate;
-	}
-
-	ret = phy_set_mode_ext(hdmi->phy, PHY_MODE_HDMI, mode);
+	mode = dw_hdmi_qp_rockchip_phy_cfg(s, conn_state, &phy_cfg);
+	ret = phy_validate(hdmi->phy, PHY_MODE_HDMI, mode, &phy_cfg);
 	if (ret) {
-		dev_err(hdmi->dev, "Failed to switch phy mode: %d\n", ret);
+		dev_dbg(hdmi->dev, "PHY can't do the %s link: %d\n",
+			mode == PHY_HDMI_MODE_FRL ? "FRL" : "TMDS", ret);
 		return ret;
 	}
 
-	ret = phy_configure(hdmi->phy, &phy_cfg);
-	if (ret) {
-		dev_err(hdmi->dev, "Failed to configure phy: %d\n", ret);
-		return ret;
-	}
-
-	hdmi->phy_bpc = phy_cfg.hdmi.bpc;
-
+	s->frl_enabled = mode == PHY_HDMI_MODE_FRL;
 	s->output_type = DRM_MODE_CONNECTOR_HDMIA;
 	s->output_bpc = conn_state->hdmi.output_bpc;
 	s->bus_format = ingest_fmt;
@@ -301,7 +310,11 @@ dw_hdmi_qp_rockchip_encoder_atomic_mode_set(struct drm_encoder *encoder,
 					    struct drm_crtc_state *crtc_state,
 					    struct drm_connector_state *conn_state)
 {
+	struct rockchip_crtc_state *s = to_rockchip_crtc_state(crtc_state);
 	struct rockchip_hdmi_qp *hdmi = to_rockchip_hdmi_qp(encoder);
+	union phy_configure_opts phy_cfg;
+	enum phy_hdmi_mode mode;
+	int ret;
 
 	/*
 	 * This runs after the VOP has been disabled and before it is enabled
@@ -309,6 +322,22 @@ dw_hdmi_qp_rockchip_encoder_atomic_mode_set(struct drm_encoder *encoder,
 	 * its video input starts afresh with the new mode.
 	 */
 	dw_hdmi_qp_wait_input_clk_off(hdmi->hdmi);
+
+	/*
+	 * Set the PHY up for the new link before the VOP takes its DCLK
+	 * from it; atomic_check made sure the PHY accepts the setup.
+	 */
+	mode = dw_hdmi_qp_rockchip_phy_cfg(s, conn_state, &phy_cfg);
+
+	ret = phy_set_mode_ext(hdmi->phy, PHY_MODE_HDMI, mode);
+	if (ret)
+		dev_err(hdmi->dev, "Failed to switch phy mode: %d\n", ret);
+
+	ret = phy_configure(hdmi->phy, &phy_cfg);
+	if (ret)
+		dev_err(hdmi->dev, "Failed to configure phy: %d\n", ret);
+
+	hdmi->phy_bpc = phy_cfg.hdmi.bpc;
 }
 
 static const struct
