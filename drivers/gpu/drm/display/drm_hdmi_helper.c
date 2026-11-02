@@ -948,6 +948,15 @@ static int drm_connector_hdmi_frl_lts2(struct drm_connector *connector)
 }
 
 /*
+ * Whether the sink requests the same LTP value on every active lane: in 3 lane
+ * FRL modes Ln3_LTP_req carries no request.
+ */
+static bool drm_hdmi_frl_ltp_all(u8 lanes, u8 ln0, u8 ln1, u8 ln2, u8 ln3, u8 ltp)
+{
+	return ln0 == ltp && ln1 == ltp && ln2 == ltp && (lanes < 4 || ln3 == ltp);
+}
+
+/*
  * Conduct link training for the specified FRL rate.
  */
 static int drm_connector_hdmi_frl_lts3(struct drm_connector *connector)
@@ -1001,6 +1010,7 @@ static int drm_connector_hdmi_frl_lts3(struct drm_connector *connector)
 		}
 
 		if (val & SCDC_FLT_UPDATE) {
+			u8 lanes = hdmi->scdc_work_data.frl_lanes;
 			u8 ln0, ln1, ln2, ln3;
 
 			ret = drm_scdc_get_frl_ltp_request(connector, &ln0, &ln1,
@@ -1013,7 +1023,10 @@ static int drm_connector_hdmi_frl_lts3(struct drm_connector *connector)
 			drm_dbg_kms(dev, "FRL LTS:3 ln0=0x%x ln1=0x%x ln2=0x%x ln3=0x%x\n",
 				    ln0, ln1, ln2, ln3);
 
-			if (ln0 == 0xf && ln1 == 0xf && ln2 == 0xf && ln3 == 0xf) {
+			if (lanes < 4)
+				ln3 = 0;
+
+			if (drm_hdmi_frl_ltp_all(lanes, ln0, ln1, ln2, ln3, 0xf)) {
 				drm_dbg_kms(dev, "FRL LTS:3 rate change request\n");
 				return DRM_HDMI_FRL_LTS4;
 			}
@@ -1038,8 +1051,8 @@ static int drm_connector_hdmi_frl_lts3(struct drm_connector *connector)
 					drm_err(dev, "FRL LTS:3 set_ffe_level failed: %d\n", ret);
 					return DRM_HDMI_FRL_LTSL;
 				}
-			} else if (ln0 == 0x3 && ln1 == 0x3 && ln2 == 0x3 &&
-				   ln3 == 0x3 && !hdmi->scdc_work_data.flt_no_timeout) {
+			} else if (drm_hdmi_frl_ltp_all(lanes, ln0, ln1, ln2, ln3, 0x3) &&
+				   !hdmi->scdc_work_data.flt_no_timeout) {
 				drm_dbg_kms(dev, "FRL LTS:3 ignore Nyquist clock pattern\n");
 			} else {
 				ret = hdmi->funcs->frl_set_ltp(connector, ln0,
