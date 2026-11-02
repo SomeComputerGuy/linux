@@ -1776,12 +1776,13 @@ static int rk_hdptx_phy_power_off(struct phy *phy)
 }
 
 static int rk_hdptx_phy_verify_hdmi_config(struct rk_hdptx_phy *hdptx,
+					   enum phy_hdmi_mode mode,
 					   struct phy_configure_opts_hdmi *hdmi_in,
 					   struct rk_hdptx_hdmi_cfg *hdmi_out)
 {
 	int i;
 
-	if (hdptx->hdmi_cfg.mode == PHY_HDMI_MODE_FRL) {
+	if (mode == PHY_HDMI_MODE_FRL) {
 		unsigned long long frl_rate = 100000000ULL * hdmi_in->frl.lanes *
 					      hdmi_in->frl.rate_per_lane;
 
@@ -2134,7 +2135,8 @@ static int rk_hdptx_phy_configure(struct phy *phy, union phy_configure_opts *opt
 	int ret;
 
 	if (mode != PHY_MODE_DP) {
-		ret = rk_hdptx_phy_verify_hdmi_config(hdptx, &opts->hdmi, &hdptx->hdmi_cfg);
+		ret = rk_hdptx_phy_verify_hdmi_config(hdptx, hdptx->hdmi_cfg.mode,
+						      &opts->hdmi, &hdptx->hdmi_cfg);
 		if (ret) {
 			dev_err(hdptx->dev, "invalid hdmi params for phy configure\n");
 		} else {
@@ -2194,10 +2196,19 @@ static int rk_hdptx_phy_validate(struct phy *phy, enum phy_mode mode,
 {
 	struct rk_hdptx_phy *hdptx = phy_get_drvdata(phy);
 
-	if (mode != PHY_MODE_DP)
-		return rk_hdptx_phy_verify_hdmi_config(hdptx, &opts->hdmi, NULL);
+	if (mode == PHY_MODE_DP)
+		return rk_hdptx_phy_verify_dp_config(hdptx, &opts->dp);
 
-	return rk_hdptx_phy_verify_dp_config(hdptx, &opts->dp);
+	if (mode != PHY_MODE_HDMI)
+		return -EINVAL;
+
+	switch (submode) {
+	case PHY_HDMI_MODE_TMDS:
+	case PHY_HDMI_MODE_FRL:
+		return rk_hdptx_phy_verify_hdmi_config(hdptx, submode, &opts->hdmi, NULL);
+	default:
+		return -EINVAL;
+	}
 }
 
 static const struct phy_ops rk_hdptx_phy_ops = {
