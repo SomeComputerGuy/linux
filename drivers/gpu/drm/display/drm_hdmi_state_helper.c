@@ -977,7 +977,9 @@ int drm_atomic_helper_connector_hdmi_check(struct drm_connector *connector,
 
 	if (old_conn_state->hdmi.broadcast_rgb != new_conn_state->hdmi.broadcast_rgb ||
 	    old_conn_state->hdmi.output_bpc != new_conn_state->hdmi.output_bpc ||
-	    old_conn_state->hdmi.output_format != new_conn_state->hdmi.output_format) {
+	    old_conn_state->hdmi.output_format != new_conn_state->hdmi.output_format ||
+	    old_conn_state->hdmi.frl_rate_per_lane != new_conn_state->hdmi.frl_rate_per_lane ||
+	    old_conn_state->hdmi.frl_lanes != new_conn_state->hdmi.frl_lanes) {
 		struct drm_crtc *crtc = new_conn_state->crtc;
 		struct drm_crtc_state *crtc_state;
 
