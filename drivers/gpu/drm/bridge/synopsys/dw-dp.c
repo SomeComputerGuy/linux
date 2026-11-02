@@ -368,6 +368,8 @@ struct dw_dp {
 	struct mutex sdp_lock;
 	/* Serialize audio state */
 	struct mutex audio_lock;
+	/* Serialize link state updates against link training */
+	struct mutex link_lock;
 
 	struct drm_dp_aux aux;
 
@@ -587,34 +589,20 @@ static bool dw_dp_hpd_detect(struct dw_dp *dp)
 	return FIELD_GET(HPD_STATE, value) == DW_DP_HPD_STATE_PLUG;
 }
 
-static void dw_dp_link_caps_reset(struct dw_dp_link_caps *caps)
+/* Start from the highest rate and lane count both ends support */
+static void dw_dp_link_set_max(struct dw_dp *dp, struct dw_dp_link *link)
 {
-	caps->enhanced_framing = false;
-	caps->tps3_supported = false;
-	caps->tps4_supported = false;
-	caps->fast_training = false;
-	caps->channel_coding = false;
+	link->rate = min_t(u32, min(dp->plat_data.max_link_rate,
+				    dp->phy->attrs.max_link_rate * 100),
+			   drm_dp_max_link_rate(link->dpcd));
+	link->lanes = min_t(u8, phy_get_bus_width(dp->phy),
+			    drm_dp_max_lane_count(link->dpcd));
 }
 
-static void dw_dp_link_reset(struct dw_dp_link *link)
+static int dw_dp_link_read_caps(struct dw_dp *dp, struct drm_connector *connector,
+				struct dw_dp_link *link)
 {
-	link->vsc_sdp_supported = 0;
-	link->sink_count = 0;
-	link->revision = 0;
-	link->rate = 0;
-	link->lanes = 0;
-
-	dw_dp_link_caps_reset(&link->caps);
-	memset(link->dpcd, 0, sizeof(link->dpcd));
-	memset(link->downstream_ports, 0, sizeof(link->downstream_ports));
-}
-
-static int dw_dp_link_parse(struct dw_dp *dp, struct drm_connector *connector)
-{
-	struct dw_dp_link *link = &dp->link;
 	int ret;
-
-	dw_dp_link_reset(link);
 
 	ret = drm_dp_read_dpcd_caps(&dp->aux, link->dpcd);
 	if (ret < 0)
@@ -642,11 +630,7 @@ static int dw_dp_link_parse(struct dw_dp *dp, struct drm_connector *connector)
 	link->vsc_sdp_supported = drm_dp_vsc_sdp_supported(&dp->aux, link->dpcd);
 
 	link->revision = link->dpcd[DP_DPCD_REV];
-	link->rate = min_t(u32, min(dp->plat_data.max_link_rate,
-				    dp->phy->attrs.max_link_rate * 100),
-			   drm_dp_max_link_rate(link->dpcd));
-	link->lanes = min_t(u8, phy_get_bus_width(dp->phy),
-			    drm_dp_max_lane_count(link->dpcd));
+	dw_dp_link_set_max(dp, link);
 
 	link->caps.enhanced_framing = drm_dp_enhanced_frame_cap(link->dpcd);
 	link->caps.tps3_supported = drm_dp_tps3_supported(link->dpcd);
@@ -656,6 +640,35 @@ static int dw_dp_link_parse(struct dw_dp *dp, struct drm_connector *connector)
 	link->caps.ssc = !!(link->dpcd[DP_MAX_DOWNSPREAD] & DP_MAX_DOWNSPREAD_0_5);
 
 	return 0;
+}
+
+static int dw_dp_link_parse(struct dw_dp *dp, struct drm_connector *connector)
+{
+	struct dw_dp_link *link = &dp->link;
+	struct dw_dp_link new = {};
+	int ret;
+
+	/*
+	 * Detection is not serialized with the commit tail of a nonblocking
+	 * commit, which enables and trains the link from dp->link. Read the
+	 * sink capabilities into a copy and publish it under link_lock, so
+	 * that link training never sees a partly parsed link (with a zero
+	 * rate and lane count). The rate and lane count of an enabled link
+	 * are the ones it was trained at: keep them, and the training state.
+	 */
+	ret = dw_dp_link_read_caps(dp, connector, &new);
+
+	guard(mutex)(&dp->link_lock);
+
+	new.enabled = link->enabled;
+	new.train = link->train;
+	if (link->enabled) {
+		new.rate = link->rate;
+		new.lanes = link->lanes;
+	}
+	*link = new;
+
+	return ret;
 }
 
 static int dw_dp_link_train_update_vs_emph(struct dw_dp *dp)
@@ -1823,6 +1836,11 @@ static int dw_dp_link_enable(struct dw_dp *dp)
 {
 	int ret;
 
+	lockdep_assert_held(&dp->link_lock);
+
+	/* Undo a downgrade from a previous training, as detection would */
+	dw_dp_link_set_max(dp, &dp->link);
+
 	ret = phy_power_on(dp->phy);
 	if (ret)
 		return ret;
@@ -2164,18 +2182,20 @@ static void dw_dp_bridge_atomic_enable(struct drm_bridge *bridge,
 		return;
 	}
 
-	ret = dw_dp_link_enable(dp);
-	if (ret < 0) {
-		dev_err(dp->dev, "failed to enable link: %d\n", ret);
-		return;
-	}
+	scoped_guard(mutex, &dp->link_lock) {
+		ret = dw_dp_link_enable(dp);
+		if (ret < 0) {
+			dev_err(dp->dev, "failed to enable link: %d\n", ret);
+			return;
+		}
 
-	dw_dp_configure_protocol_converter(dp, connector);
+		dw_dp_configure_protocol_converter(dp, connector);
 
-	ret = dw_dp_video_enable(dp);
-	if (ret < 0) {
-		dev_err(dp->dev, "failed to enable video: %d\n", ret);
-		return;
+		ret = dw_dp_video_enable(dp);
+		if (ret < 0) {
+			dev_err(dp->dev, "failed to enable video: %d\n", ret);
+			return;
+		}
 	}
 
 	scoped_guard(mutex, &dp->audio_lock) {
@@ -2214,8 +2234,10 @@ static void dw_dp_bridge_atomic_disable(struct drm_bridge *bridge,
 		return;
 	dp->pm_active = false;
 
-	dw_dp_video_disable(dp);
-	dw_dp_link_disable(dp);
+	scoped_guard(mutex, &dp->link_lock) {
+		dw_dp_video_disable(dp);
+		dw_dp_link_disable(dp);
+	}
 
 	if (dp->vsc_sdp_nr >= 0) {
 		dw_dp_clear_sdp(dp, dp->vsc_sdp_nr);
@@ -2549,11 +2571,6 @@ static int dw_dp_link_retrain(struct dw_dp *dp)
 	struct drm_modeset_acquire_ctx ctx;
 	int ret;
 
-	if (!dw_dp_needs_link_retrain(dp))
-		return 0;
-
-	dev_dbg(dp->dev, "Retraining link\n");
-
 	drm_modeset_acquire_init(&ctx, 0);
 	for (;;) {
 		ret = drm_modeset_lock(&dev->mode_config.connection_mutex, &ctx);
@@ -2563,8 +2580,15 @@ static int dw_dp_link_retrain(struct dw_dp *dp)
 		drm_modeset_backoff(&ctx);
 	}
 
-	if (!ret)
-		ret = dw_dp_link_train(dp);
+	if (!ret) {
+		/* A modeset may have disabled the link or trained it since */
+		scoped_guard(mutex, &dp->link_lock) {
+			if (dw_dp_needs_link_retrain(dp)) {
+				dev_dbg(dp->dev, "Retraining link\n");
+				ret = dw_dp_link_train(dp);
+			}
+		}
+	}
 
 	drm_modeset_drop_locks(&ctx);
 	drm_modeset_acquire_fini(&ctx);
@@ -2802,6 +2826,10 @@ int dw_dp_probe(struct dw_dp *dp)
 		return ret;
 
 	ret = devm_mutex_init(dev, &dp->audio_lock);
+	if (ret)
+		return ret;
+
+	ret = devm_mutex_init(dev, &dp->link_lock);
 	if (ret)
 		return ret;
 
