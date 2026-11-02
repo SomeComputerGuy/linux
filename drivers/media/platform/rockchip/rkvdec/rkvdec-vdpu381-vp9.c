@@ -724,7 +724,7 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	u32 pixels;
 
 	dma_addr_t rlc_addr, dst_addr;
-	bool seg_enabled, segmap_update, last_segmap_valid;
+	bool seg_enabled, segmap_reset, segmap_update, last_segmap_valid;
 	bool intra_only;
 	unsigned int i;
 
@@ -816,13 +816,15 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	 * code a new map (segmentation disabled, or update_map == 0) leaves
 	 * the previous map in place for the following frames, as required by
 	 * the spec. Intra-only, error resilient and resized frames start
-	 * from a reset map.
+	 * from a reset map: setup_past_independence() clears PrevSegmentIds,
+	 * and the map of a frame of another size doesn't apply.
 	 */
 	seg_enabled = seg->flags & V4L2_VP9_SEGMENTATION_FLAG_ENABLED;
-	segmap_update = intra_only || !vp9_ctx->last.valid ||
-			(dec_params->flags & V4L2_VP9_FRAME_FLAG_ERROR_RESILIENT) ||
-			vp9_ctx->last.width != vp9_ctx->cur.width ||
-			vp9_ctx->last.height != vp9_ctx->cur.height ||
+	segmap_reset = intra_only || !vp9_ctx->last.valid ||
+		       (dec_params->flags & V4L2_VP9_FRAME_FLAG_ERROR_RESILIENT) ||
+		       vp9_ctx->last.width != vp9_ctx->cur.width ||
+		       vp9_ctx->last.height != vp9_ctx->cur.height;
+	segmap_update = segmap_reset ||
 			(seg_enabled &&
 			 (seg->flags & V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP));
 	vp9_ctx->cur.segmapid = vp9_ctx->last.segmapid ^ segmap_update;
@@ -839,10 +841,11 @@ static void config_registers(struct rkvdec_ctx *ctx,
 
 	/*
 	 * The map left by the previous frames is only meaningful if
-	 * segmentation was used since the last intra frame.
+	 * segmentation was used since it was last reset. Otherwise the
+	 * hardware must predict segment ID 0 (temporal_update), not read
+	 * the map of the previous frame.
 	 */
-	last_segmap_valid = !intra_only && vp9_ctx->last.valid &&
-			    vp9_ctx->last.segmap_valid;
+	last_segmap_valid = !segmap_reset && vp9_ctx->last.segmap_valid;
 	vp9_ctx->cur.segmap_valid = seg_enabled || last_segmap_valid;
 
 	for (i = 0; i < ARRAY_SIZE(ref_bufs); i++)
