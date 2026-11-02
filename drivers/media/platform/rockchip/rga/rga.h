@@ -9,6 +9,8 @@
 #include <linux/bits.h>
 #include <linux/clk.h>
 #include <linux/platform_device.h>
+#include <linux/reset.h>
+#include <linux/workqueue.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -36,12 +38,37 @@ struct rockchip_rga_version {
 	u32 minor;
 };
 
+#define RGA_NUM_RESETS 3
+
+/**
+ * struct rga_core - one RGA core
+ * @dev:		device of the core
+ * @regs:		registers of the core
+ * @irq:		interrupt of the core
+ * @clks:		clocks of the core
+ * @num_clks:		number of clocks
+ * @resets:		core, AXI and AHB reset lines of the core
+ * @empty_domain:	empty IOMMU domain, used to reinitialize the IOMMU after
+ *			a failed job; NULL if the core isn't behind an IOMMU
+ * @attached_domain:	IOMMU domain of the first core that this core is
+ *			attached to, if any
+ * @watchdog_work:	resets the core when its job times out or fails
+ * @job_failed:		the core reported an error for the current job and
+ *			@watchdog_work is queued to reset it
+ * @rga:		RGA device the core is bound to
+ * @curr:		context of the job running on the core, if any
+ */
 struct rga_core {
 	struct device *dev;
 	void __iomem *regs;
 	int irq;
 	struct clk_bulk_data *clks;
 	int num_clks;
+	struct reset_control_bulk_data resets[RGA_NUM_RESETS];
+	struct iommu_domain *empty_domain;
+	struct iommu_domain *attached_domain;
+	struct delayed_work watchdog_work;
+	bool job_failed;
 
 	struct rockchip_rga *rga;
 	struct rga_ctx *curr;
@@ -146,6 +173,20 @@ static inline void rga_mod(struct rga_core *core, u32 reg, u32 val, u32 mask)
 	rga_write(core, reg, temp);
 };
 
+/**
+ * enum rga_irq_status - what an interrupt of a core reports
+ * @RGA_IRQ_NONE:	the core didn't raise an interrupt
+ * @RGA_IRQ_BUSY:	the job is still running
+ * @RGA_IRQ_DONE:	the job is done
+ * @RGA_IRQ_ERROR:	the job failed and the core must be reset
+ */
+enum rga_irq_status {
+	RGA_IRQ_NONE,
+	RGA_IRQ_BUSY,
+	RGA_IRQ_DONE,
+	RGA_IRQ_ERROR,
+};
+
 #define RGA_FEATURE_FLIP	BIT(0)
 #define RGA_FEATURE_ROTATE	BIT(1)
 #define RGA_FEATURE_BG_COLOR	BIT(2)
@@ -166,7 +207,7 @@ struct rga_hw {
 	void (*setup_cmdbuf)(struct rga_ctx *ctx);
 	void (*start)(struct rga_core *core,
 		      struct rga_vb_buffer *src, struct rga_vb_buffer *dst);
-	bool (*handle_irq)(struct rga_core *core);
+	enum rga_irq_status (*handle_irq)(struct rga_core *core);
 	struct rockchip_rga_version (*get_version)(struct rga_core *core);
 	void *(*adjust_and_map_format)(struct rga_ctx *ctx,
 				       struct v4l2_pix_format_mplane *format,
