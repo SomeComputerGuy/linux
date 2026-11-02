@@ -2178,6 +2178,15 @@ static bool vop2_dclk_rate_exact(long rate, unsigned long clock)
 }
 
 /*
+ * Sinks accept a pixel clock within 0.5 % of the mode's (CTA-861, VESA DMT),
+ * the tolerance DRM itself uses to match modes.
+ */
+static bool vop2_dclk_rate_close(long rate, unsigned long clock)
+{
+	return rate > 0 && abs_diff((unsigned long)rate, clock) * 200 <= clock;
+}
+
+/*
  * The CRU parents of dclk_vopN_src (GPLL, CPLL, V0PLL, AUPLL) only give
  * integer fractions of their current rates. If none of them makes the DCLK
  * exactly, retune the dedicated video PLL (V0PLL) to an integer multiple of
@@ -2241,10 +2250,11 @@ static unsigned long vop2_crtc_dclk_pll_claimed(struct vop2_video_port *vp,
  * the PHY supports, but when the DCLK has to come from the system CRU (FRL
  * mode, or rates beyond the PHY PLL), it is derived by integer division
  * from a few fixed PLLs, and the clock framework silently picks the closest
- * lower rate: e.g. 3840x2160@59.94Hz (593.407 MHz) would run at 500 MHz.
- * Use the video PLL for such a rate when it is available (for any output),
- * and refuse the HDMI configuration otherwise instead of scanning out at a
- * wrong rate.
+ * rate: e.g. 3840x2160@59.94Hz (593.407 MHz) would run at 594 MHz.
+ * Use the video PLL for such a rate when it is available (for any output).
+ * Otherwise refuse the configuration instead of scanning out at a wrong
+ * rate: HDMI unless the CRU rate is exact, the other outputs unless it is
+ * within the pixel clock tolerance.
  */
 static int vop2_crtc_atomic_check_dclk(struct vop2_video_port *vp,
 				       struct drm_crtc_state *crtc_state)
@@ -2331,9 +2341,12 @@ static int vop2_crtc_atomic_check_dclk(struct vop2_video_port *vp,
 		return 0;
 	}
 
-	/* Other outputs keep running at the closest rate, as before */
-	if (!hdmi)
+	if (!hdmi && vop2_dclk_rate_close(rate, clock)) {
+		drm_dbg_kms(vop2->drm,
+			    "vp%d: DCLK %lu Hz from the closest CRU rate %ld Hz\n",
+			    vp->id, clock, rate);
 		return 0;
+	}
 
 	drm_dbg_kms(vop2->drm,
 		    "vp%d: DCLK %lu Hz not available from the CRU (closest %ld Hz)\n",
