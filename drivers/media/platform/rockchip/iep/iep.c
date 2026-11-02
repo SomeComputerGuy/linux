@@ -126,9 +126,10 @@ static enum v4l2_field iep_buf_field(struct iep_ctx *ctx,
 static void iep_iommu_restore(struct iep_dev *iep)
 {
 	/*
-	 * After a CRU reset the IOMMU has lost its state. Attach an empty
-	 * domain and detach it again to reprogram the default domain (same as
-	 * rkvdec).
+	 * Both the soft reset and a CRU reset of the IEP also reset its IOMMU,
+	 * which is then in bypass (DTE_ADDR 0, paging disabled). Attach an
+	 * empty domain and detach it again to reprogram the default domain
+	 * (same as rkvdec).
 	 */
 	if (iep->empty_domain) {
 		iommu_attach_device(iep->empty_domain, iep->dev);
@@ -146,16 +147,15 @@ static void iep_reset(struct iep_dev *iep)
 	iep_write(iep, IEP2_CONFIG0, IEP2_ACLK_SRESET_P);
 	ret = readl_relaxed_poll_timeout(iep->regs + IEP2_STATUS, status,
 					 status & IEP2_ARST_FINISH_DONE, 0, 5);
-	if (!ret)
-		return;
+	if (ret) {
+		dev_warn(iep->dev, "soft reset timeout, using CRU reset\n");
+		if (iep->rstc) {
+			reset_control_assert(iep->rstc);
+			udelay(5);
+			reset_control_deassert(iep->rstc);
+		}
+	}
 
-	dev_warn(iep->dev, "soft reset timeout, using CRU reset\n");
-	if (!iep->rstc)
-		return;
-
-	reset_control_assert(iep->rstc);
-	udelay(5);
-	reset_control_deassert(iep->rstc);
 	iep_iommu_restore(iep);
 }
 
