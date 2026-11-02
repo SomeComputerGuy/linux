@@ -263,6 +263,13 @@ struct vop2_video_port {
 	struct vop2 *vop2;
 	struct clk *dclk;
 	struct clk *dclk_src;
+	/**
+	 * @pll_v0: per-VP handle on the dedicated video PLL (RK3588 V0PLL), so
+	 * that the rate protection one VP holds also applies to the others.
+	 */
+	struct clk *pll_v0;
+	/** @pll_v0_held: @pll_v0 rate protected while the DCLK runs from it */
+	bool pll_v0_held;
 	struct reset_control *dclk_rst;
 	unsigned int id;
 	const struct vop2_video_port_data *data;
