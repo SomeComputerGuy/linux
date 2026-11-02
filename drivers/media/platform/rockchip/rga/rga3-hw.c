@@ -288,15 +288,18 @@ static void rga3_hw_start(struct rga_core *core,
 		  FIELD_PREP(RGA3_CMD_LINE_START_PULSE, 1));
 }
 
-static bool rga3_handle_irq(struct rga_core *core)
+static enum rga_irq_status rga3_handle_irq(struct rga_core *core)
 {
 	u32 intr;
 
 	intr = rga_read(core, RGA3_INT_RAW);
+	if (!intr)
+		return RGA_IRQ_NONE;
+
 	/* clear all interrupts */
 	rga_write(core, RGA3_INT_CLR, intr);
 
-	return FIELD_GET(RGA3_INT_FRM_DONE, intr);
+	return FIELD_GET(RGA3_INT_FRM_DONE, intr) ? RGA_IRQ_DONE : RGA_IRQ_BUSY;
 }
 
 static struct rockchip_rga_version rga3_get_version(struct rga_core *core)
