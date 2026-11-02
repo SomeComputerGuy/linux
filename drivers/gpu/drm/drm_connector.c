@@ -888,8 +888,10 @@ void drm_connector_cleanup(struct drm_connector *connector)
 		    DRM_CONNECTOR_REGISTERED))
 		drm_connector_unregister(connector);
 
-	if (connector->hdmi.scdc_work_initialized)
+	if (connector->hdmi.scdc_work_initialized) {
 		cancel_delayed_work_sync(&connector->hdmi.scdc_work);
+		cancel_work_sync(&connector->hdmi.frl_link_work);
+	}
 
 	platform_device_unregister(connector->hdmi_audio.codec_pdev);
 

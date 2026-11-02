@@ -1633,9 +1633,10 @@ struct drm_connector_hdmi_funcs {
 	 * @frl_fallback_tmds:
 	 *
 	 * This callback is invoked by the FRL helpers when FRL is not supported
-	 * by the sink, not required for the current mode, or when FRL link
-	 * training has failed so that the link operation mode falls back to
-	 * TMDS.
+	 * by the sink or not required for the current mode, so that the link
+	 * operates in TMDS mode. A failed FRL link training does not fall back
+	 * to TMDS in place: the link status is set to bad instead, and the
+	 * next modeset uses TMDS.
 	 *
 	 * The @frl_fallback_tmds callback is mandatory if HDMI 2.1 FRL is to
 	 * be supported.
@@ -2385,6 +2386,21 @@ struct drm_connector_hdmi {
 		 */
 		bool flt_no_timeout;
 	} scdc_work_data;
+
+	/**
+	 * @frl_link_work: Marks the link status bad and sends a hotplug
+	 * event once FRL link training failed on an enabled link, so that
+	 * userspace sets the mode again. Initialized with @scdc_work.
+	 */
+	struct work_struct frl_link_work;
+
+	/**
+	 * @frl_failed_epoch: &drm_connector.epoch_counter plus one when FRL
+	 * link training last failed, 0 if it did not. FRL is not used again
+	 * for the sink until the epoch counter changes, that is until the
+	 * sink is unplugged or its EDID changes.
+	 */
+	u64 frl_failed_epoch;
 
 	/**
 	 * @funcs: HDMI connector Control Functions and controller capabilities
