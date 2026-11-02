@@ -11,6 +11,8 @@
  */
 
 #include <linux/clk.h>
+#include <linux/component.h>
+#include <linux/iommu.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
@@ -59,11 +61,51 @@ static const struct v4l2_event hantro_eos_event = {
 	.type = V4L2_EVENT_EOS
 };
 
+/*
+ * Pick an idle core for the job of @ctx. The mem2mem framework never runs
+ * more jobs in parallel than there are cores, so this only fails if the
+ * core accounting is broken.
+ */
+static struct hantro_dev *hantro_acquire_core(struct hantro_ctx *ctx)
+{
+	struct hantro_dev *vpu = ctx->dev;
+	unsigned int i;
+
+	guard(spinlock_irqsave)(&vpu->cores_lock);
+
+	for (i = 0; i < vpu->num_cores; i++) {
+		struct hantro_dev *core = vpu->cores[i];
+
+		if (!core->curr_ctx) {
+			core->curr_ctx = ctx;
+			ctx->core = core;
+			return core;
+		}
+	}
+
+	return NULL;
+}
+
+static void hantro_release_core(struct hantro_ctx *ctx)
+{
+	struct hantro_dev *vpu = ctx->dev;
+
+	guard(spinlock_irqsave)(&vpu->cores_lock);
+
+	if (ctx->core) {
+		ctx->core->curr_ctx = NULL;
+		ctx->core = NULL;
+	}
+}
+
 static void hantro_job_finish_no_pm(struct hantro_dev *vpu,
 				    struct hantro_ctx *ctx,
 				    enum vb2_buffer_state result)
 {
 	struct vb2_v4l2_buffer *src, *dst;
+
+	/* Make the core available to the next job before scheduling it. */
+	hantro_release_core(ctx);
 
 	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
@@ -97,11 +139,14 @@ static void hantro_job_finish(struct hantro_dev *vpu,
 	hantro_job_finish_no_pm(vpu, ctx, result);
 }
 
+/*
+ * Called from the interrupt handler of the VPU instance @vpu, which is the
+ * core the job was running on.
+ */
 void hantro_irq_done(struct hantro_dev *vpu,
 		     enum vb2_buffer_state result)
 {
-	struct hantro_ctx *ctx =
-		v4l2_m2m_get_curr_priv(vpu->m2m_dev);
+	struct hantro_ctx *ctx;
 
 	/*
 	 * If cancel_delayed_work returns false
@@ -109,9 +154,45 @@ void hantro_irq_done(struct hantro_dev *vpu,
 	 * and will take care of finishing the job.
 	 */
 	if (cancel_delayed_work(&vpu->watchdog_work)) {
+		ctx = vpu->curr_ctx;
 		if (result == VB2_BUF_STATE_DONE && ctx->codec_ops->done)
 			ctx->codec_ops->done(ctx);
 		hantro_job_finish(vpu, ctx, result);
+	}
+}
+
+/*
+ * A job that timed out can leave the IOMMU stalled, for instance on a page
+ * fault the core never recovered from, and a hardware reset of the core can
+ * leave the IOMMU state out of sync with its driver. Attach the empty domain
+ * and detach it again to return to the default DMA domain: the IOMMU driver
+ * then disables and fully reinitializes the IOMMU, which keeps all the
+ * mappings of the default domain. A secondary core attached to the domain of
+ * the main core is detached from it first, and attached to it again at the
+ * end.
+ */
+static void hantro_iommu_restore(struct hantro_dev *vpu)
+{
+	int ret;
+
+	if (!vpu->empty_domain)
+		return;
+
+	if (vpu->attached_domain)
+		iommu_detach_device(vpu->attached_domain, vpu->dev);
+
+	ret = iommu_attach_device(vpu->empty_domain, vpu->dev);
+	if (ret)
+		dev_warn(vpu->dev, "Failed to attach the empty IOMMU domain: %d\n",
+			 ret);
+	else
+		iommu_detach_device(vpu->empty_domain, vpu->dev);
+
+	if (vpu->attached_domain) {
+		ret = iommu_attach_device(vpu->attached_domain, vpu->dev);
+		if (ret)
+			dev_err(vpu->dev, "Failed to attach back to the IOMMU domain of the main core: %d\n",
+				ret);
 	}
 }
 
@@ -122,11 +203,12 @@ void hantro_watchdog(struct work_struct *work)
 
 	vpu = container_of(to_delayed_work(work),
 			   struct hantro_dev, watchdog_work);
-	ctx = v4l2_m2m_get_curr_priv(vpu->m2m_dev);
+	ctx = vpu->curr_ctx;
 	if (ctx) {
 		vpu_err("frame processing timed out!\n");
 		if (ctx->codec_ops->reset)
 			ctx->codec_ops->reset(ctx);
+		hantro_iommu_restore(vpu);
 		hantro_job_finish(vpu, ctx, VB2_BUF_STATE_ERROR);
 	}
 }
@@ -163,7 +245,7 @@ void hantro_end_prepare_run(struct hantro_ctx *ctx)
 				   &ctx->ctrl_handler);
 
 	/* Kick the watchdog. */
-	schedule_delayed_work(&ctx->dev->watchdog_work,
+	schedule_delayed_work(&ctx->core->watchdog_work,
 			      msecs_to_jiffies(2000));
 }
 
@@ -171,27 +253,46 @@ static void device_run(void *priv)
 {
 	struct hantro_ctx *ctx = priv;
 	struct vb2_v4l2_buffer *src, *dst;
+	struct hantro_dev *core;
 	int ret;
 
 	src = hantro_get_src_buf(ctx);
 	dst = hantro_get_dst_buf(ctx);
 
-	ret = pm_runtime_resume_and_get(ctx->dev->dev);
+	/*
+	 * Copy the timestamp before anything can fail: userspace matches a
+	 * CAPTURE buffer returned with an error to its frame by it.
+	 */
+	v4l2_m2m_buf_copy_metadata(src, dst);
+
+	core = hantro_acquire_core(ctx);
+	if (WARN_ON_ONCE(!core))
+		goto err_cancel_job;
+
+	ret = pm_runtime_resume_and_get(core->dev);
 	if (ret < 0)
 		goto err_cancel_job;
 
-	ret = clk_bulk_enable(ctx->dev->variant->num_clocks, ctx->dev->clocks);
+	ret = clk_bulk_enable(core->variant->num_clocks, core->clocks);
 	if (ret)
-		goto err_cancel_job;
-
-	v4l2_m2m_buf_copy_metadata(src, dst);
+		goto err_pm_put;
 
 	if (ctx->codec_ops->run(ctx))
-		goto err_cancel_job;
+		goto err_clk_disable;
 
 	return;
 
+err_clk_disable:
+	clk_bulk_disable(core->variant->num_clocks, core->clocks);
+err_pm_put:
+	pm_runtime_put_autosuspend(core->dev);
 err_cancel_job:
+	/*
+	 * The job is cancelled before the controls of its request were
+	 * completed. Complete them now, or the request would never complete.
+	 */
+	v4l2_ctrl_request_complete(src->vb2_buf.req_obj.req,
+				   &ctx->ctrl_handler);
 	hantro_job_finish_no_pm(ctx->dev, ctx, VB2_BUF_STATE_ERROR);
 }
 
@@ -244,7 +345,10 @@ queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
 	dst_vq->drv_priv = ctx;
 	dst_vq->ops = &hantro_queue_ops;
-	dst_vq->buf_struct_size = sizeof(struct hantro_decoded_buffer);
+	if (ctx->is_encoder)
+		dst_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
+	else
+		dst_vq->buf_struct_size = sizeof(struct hantro_decoded_buffer);
 	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	dst_vq->lock = &ctx->dev->vpu_mutex;
 	dst_vq->dev = ctx->dev->v4l2_dev.dev;
@@ -438,6 +542,118 @@ static const struct hantro_ctrl controls[] = {
 			 * enabled is already the minimum required set.
 			 */
 			.flags = V4L2_CTRL_FLAG_READ_ONLY,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_H264_ENCODE_PARAMS,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_H264_SPS,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_H264_PPS,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_H264_START_CODE,
+			.min = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
+			.max = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
+			.def = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_AU_DELIMITER,
+			.min = 0,
+			.max = 1,
+			.def = 0,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR,
+			.min = 0,
+			.max = 1,
+			.def = 0,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE,
+			.min = 0,
+			.max = 1,
+			.def = 0,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_H264_MIN_QP,
+			.min = 0,
+			.max = 51,
+			.def = 0,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_H264_MAX_QP,
+			.min = 0,
+			.max = 51,
+			.def = 51,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_H264_I_FRAME_QP,
+			.min = 0,
+			.max = 51,
+			.def = 26,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_H264_P_FRAME_QP,
+			.min = 0,
+			.max = 51,
+			.def = 28,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
+			.min = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
+			.max = V4L2_MPEG_VIDEO_BITRATE_MODE_CQ,
+			.def = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_CONSTANT_QUALITY,
+			.min = 0,
+			.max = 100,
+			.def = 80,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_BITRATE,
+			.min = 1000,
+			.max = 100000000,
+			.def = 2000000,
+			.step = 1,
 		},
 	}, {
 		.codec = HANTRO_MPEG2_DECODER,
@@ -720,7 +936,8 @@ static const struct of_device_id of_hantro_match[] = {
 	{ .compatible = "rockchip,rk3399-vpu", .data = &rk3399_vpu_variant, },
 	{ .compatible = "rockchip,rk3568-vepu", .data = &rk3568_vepu_variant, },
 	{ .compatible = "rockchip,rk3568-vpu", .data = &rk3568_vpu_variant, },
-	{ .compatible = "rockchip,rk3588-vepu121", .data = &rk3568_vepu_variant, },
+	{ .compatible = "rockchip,rk3588-vepu121", .data = &rk3588_vepu121_variant, },
+	{ .compatible = "rockchip,rk3588-vpu121", .data = &rk3588_vpu121_variant, },
 	{ .compatible = "rockchip,rk3588-av1-vpu", .data = &rk3588_vpu981_variant, },
 #endif
 #ifdef CONFIG_VIDEO_HANTRO_IMX8M
@@ -886,6 +1103,22 @@ static void hantro_detach_func(struct hantro_func *func)
 	media_entity_cleanup(&func->vdev.entity);
 }
 
+/* Does the encoder only produce JPEG, which has no use for a frame rate? */
+static bool hantro_jpeg_only_encoder(struct hantro_dev *vpu)
+{
+	unsigned int i;
+
+	for (i = 0; i < vpu->variant->num_enc_fmts; i++) {
+		const struct hantro_fmt *fmt = &vpu->variant->enc_fmts[i];
+
+		if (fmt->codec_mode != HANTRO_MODE_NONE &&
+		    fmt->codec_mode != HANTRO_MODE_JPEG_ENC)
+			return false;
+	}
+
+	return true;
+}
+
 static int hantro_add_func(struct hantro_dev *vpu, unsigned int funcid)
 {
 	const struct of_device_id *match;
@@ -918,12 +1151,20 @@ static int hantro_add_func(struct hantro_dev *vpu, unsigned int funcid)
 		vpu->encoder = func;
 		v4l2_disable_ioctl(vfd, VIDIOC_TRY_DECODER_CMD);
 		v4l2_disable_ioctl(vfd, VIDIOC_DECODER_CMD);
+		if (hantro_jpeg_only_encoder(vpu)) {
+			v4l2_disable_ioctl(vfd, VIDIOC_ENUM_FRAMEINTERVALS);
+			v4l2_disable_ioctl(vfd, VIDIOC_G_PARM);
+			v4l2_disable_ioctl(vfd, VIDIOC_S_PARM);
+		}
 	} else {
 		vpu->decoder = func;
 		v4l2_disable_ioctl(vfd, VIDIOC_TRY_ENCODER_CMD);
 		v4l2_disable_ioctl(vfd, VIDIOC_ENCODER_CMD);
+		v4l2_disable_ioctl(vfd, VIDIOC_ENUM_FRAMEINTERVALS);
 		v4l2_disable_ioctl(vfd, VIDIOC_G_SELECTION);
 		v4l2_disable_ioctl(vfd, VIDIOC_S_SELECTION);
+		v4l2_disable_ioctl(vfd, VIDIOC_G_PARM);
+		v4l2_disable_ioctl(vfd, VIDIOC_S_PARM);
 	}
 
 	video_set_drvdata(vfd, vpu);
@@ -953,7 +1194,7 @@ err_unreg_dev:
 
 static int hantro_add_enc_func(struct hantro_dev *vpu)
 {
-	if (!vpu->variant->enc_fmts)
+	if (!vpu->variant->enc_fmts || vpu->no_encoder)
 		return 0;
 
 	return hantro_add_func(vpu, MEDIA_ENT_F_PROC_VIDEO_ENCODER);
@@ -1000,46 +1241,70 @@ static const struct media_device_ops hantro_m2m_media_ops = {
 };
 
 /*
- * Some SoCs, like RK3588 have multiple identical Hantro cores, but the
- * kernel is currently missing support for multi-core handling. Exposing
- * separate devices for each core to userspace is bad, since that does
- * not allow scheduling tasks properly (and creates ABI). With this workaround
- * the driver will only probe for the first core and early exit for the other
- * cores. Once the driver gains multi-core support, the same technique
- * for detecting the main core can be used to cluster all cores together.
+ * Some SoCs, like RK3588, have multiple identical Hantro cores. Exposing
+ * separate devices for each core to userspace is bad, since that does not
+ * allow scheduling tasks properly (and creates ABI). The first compatible
+ * and available node is considered the main core. For variants with
+ * multi-core support, the main core binds the other cores as components and
+ * schedules jobs on all of them. For the other variants, only the main core
+ * is used.
+ *
+ * Returns the role of the instance, and for a main core the match of the
+ * secondary cores in @match and the total number of cores in @num_cores.
  */
-static int hantro_disable_multicore(struct hantro_dev *vpu)
+static int hantro_get_core_role(struct hantro_dev *vpu,
+				struct component_match **match,
+				unsigned int *num_cores)
 {
-	struct device_node *node = NULL;
+	struct device_node *np = vpu->dev->of_node;
+	struct device_node *node;
+	bool found_main = false;
+	bool is_main_core = false;
 	const char *compatible;
-	bool is_main_core;
 	int ret;
 
+	*num_cores = 1;
+
 	/* Intentionally ignores the fallback strings */
-	ret = of_property_read_string(vpu->dev->of_node, "compatible", &compatible);
+	ret = of_property_read_string(np, "compatible", &compatible);
 	if (ret)
 		return ret;
 
-	/* The first compatible and available node found is considered the main core */
-	do {
-		node = of_find_compatible_node(node, NULL, compatible);
-		if (of_device_is_available(node))
-			break;
-	} while (node);
+	for_each_compatible_node(node, NULL, compatible) {
+		if (!of_device_is_available(node))
+			continue;
 
-	if (!node)
-		return -EINVAL;
+		if (!found_main) {
+			found_main = true;
+			is_main_core = (node == np);
+			if (is_main_core && vpu->variant->multi_core)
+				continue;
+		} else {
+			of_node_get(node);
+			component_match_add_release(vpu->dev, match,
+						    component_release_of,
+						    component_compare_of, node);
+			(*num_cores)++;
+			continue;
+		}
 
-	is_main_core = (vpu->dev->of_node == node);
-
-	of_node_put(node);
-
-	if (!is_main_core) {
-		dev_info(vpu->dev, "missing multi-core support, ignoring this instance\n");
-		return -ENODEV;
+		of_node_put(node);
+		break;
 	}
 
-	return 0;
+	if (!found_main)
+		return -EINVAL;
+
+	if (!is_main_core) {
+		if (!vpu->variant->multi_core) {
+			dev_info(vpu->dev, "missing multi-core support, ignoring this instance\n");
+			return -ENODEV;
+		}
+
+		return HANTRO_CORE_SECONDARY;
+	}
+
+	return *match ? HANTRO_CORE_MAIN : HANTRO_CORE_SINGLE;
 }
 
 static struct v4l2_m2m_dev *hantro_get_v4l2_m2m_dev(struct hantro_dev *vpu)
@@ -1077,37 +1342,57 @@ init_new_m2m_dev:
 	return v4l2_m2m_init(&vpu_m2m_ops);
 }
 
-static int hantro_probe(struct platform_device *pdev)
+/*
+ * The resets may also cover the bus interface that the IOMMU of the VPU is
+ * accessed through, e.g. on the RK3588 AV1 decoder. The IOMMU is a separate
+ * device which is runtime resumed with the VPU while it is unbound, and
+ * accesses its registers again when it runtime suspends afterwards. Holding
+ * the VPU in reset at that point causes an asynchronous external abort, so
+ * leave the resets deasserted for a VPU behind an IOMMU.
+ */
+static void hantro_reset_assert(struct hantro_dev *vpu)
 {
-	const struct of_device_id *match;
-	struct hantro_dev *vpu;
+	if (device_iommu_mapped(vpu->dev))
+		return;
+
+	reset_control_assert(vpu->resets);
+}
+
+static void hantro_free_empty_domain(void *data)
+{
+	iommu_domain_free(data);
+}
+
+static int hantro_alloc_empty_domain(struct hantro_dev *vpu)
+{
+	struct iommu_domain *domain;
+
+	if (!iommu_get_domain_for_dev(vpu->dev))
+		return 0;
+
+	domain = iommu_paging_domain_alloc(vpu->dev);
+	if (IS_ERR(domain)) {
+		/* Not fatal, the IOMMU just won't be restored on timeouts. */
+		dev_warn(vpu->dev, "Failed to allocate an empty IOMMU domain: %pe\n",
+			 domain);
+		return 0;
+	}
+
+	vpu->empty_domain = domain;
+
+	return devm_add_action_or_reset(vpu->dev, hantro_free_empty_domain,
+					domain);
+}
+
+/*
+ * Acquire and initialize the hardware resources of one VPU instance:
+ * clocks, resets, registers, interrupts and runtime PM.
+ */
+static int hantro_hw_init(struct hantro_dev *vpu)
+{
+	struct platform_device *pdev = vpu->pdev;
 	int num_bases;
 	int i, ret;
-
-	vpu = devm_kzalloc(&pdev->dev, sizeof(*vpu), GFP_KERNEL);
-	if (!vpu)
-		return -ENOMEM;
-
-	vpu->dev = &pdev->dev;
-	vpu->pdev = pdev;
-	mutex_init(&vpu->vpu_mutex);
-	spin_lock_init(&vpu->irqlock);
-
-	match = of_match_node(of_hantro_match, pdev->dev.of_node);
-	vpu->variant = match->data;
-
-	ret = hantro_disable_multicore(vpu);
-	if (ret)
-		return ret;
-
-	/*
-	 * Support for nxp,imx8mq-vpu is kept for backwards compatibility
-	 * but it's deprecated. Please update your DTS file to use
-	 * nxp,imx8mq-vpu-g1 or nxp,imx8mq-vpu-g2 instead.
-	 */
-	if (of_device_is_compatible(pdev->dev.of_node, "nxp,imx8mq-vpu"))
-		dev_warn(&pdev->dev, "%s compatible is deprecated\n",
-			 match->compatible);
 
 	INIT_DELAYED_WORK(&vpu->watchdog_work, hantro_watchdog);
 
@@ -1137,6 +1422,10 @@ static int hantro_probe(struct platform_device *pdev)
 	vpu->resets = devm_reset_control_array_get_optional_exclusive(&pdev->dev);
 	if (IS_ERR(vpu->resets))
 		return PTR_ERR(vpu->resets);
+
+	ret = hantro_alloc_empty_domain(vpu);
+	if (ret)
+		return ret;
 
 	num_bases = vpu->variant->num_regs ?: 1;
 	vpu->reg_bases = devm_kcalloc(&pdev->dev, num_bases,
@@ -1173,7 +1462,16 @@ static int hantro_probe(struct platform_device *pdev)
 		if (!vpu->variant->irqs[i].handler)
 			continue;
 
-		if (vpu->variant->num_irqs > 1) {
+		if (vpu->variant->num_irqs > 1 &&
+		    vpu->variant->irqs[i].enc_optional) {
+			irq_name = vpu->variant->irqs[i].name;
+			irq = platform_get_irq_byname_optional(vpu->pdev,
+							       irq_name);
+			if (irq == -ENXIO) {
+				vpu->no_encoder = true;
+				continue;
+			}
+		} else if (vpu->variant->num_irqs > 1) {
 			irq_name = vpu->variant->irqs[i].name;
 			irq = platform_get_irq_byname(vpu->pdev, irq_name);
 		} else {
@@ -1221,18 +1519,41 @@ static int hantro_probe(struct platform_device *pdev)
 		goto err_rst_assert;
 	}
 
-	ret = v4l2_device_register(&pdev->dev, &vpu->v4l2_dev);
-	if (ret) {
-		dev_err(&pdev->dev, "Failed to register v4l2 device\n");
-		goto err_clk_unprepare;
-	}
-	platform_set_drvdata(pdev, vpu);
+	return 0;
+
+err_rst_assert:
+	hantro_reset_assert(vpu);
+err_pm_disable:
+	pm_runtime_dont_use_autosuspend(vpu->dev);
+	pm_runtime_disable(vpu->dev);
+	return ret;
+}
+
+static void hantro_hw_cleanup(struct hantro_dev *vpu)
+{
+	clk_bulk_unprepare(vpu->variant->num_clocks, vpu->clocks);
+	hantro_reset_assert(vpu);
+	pm_runtime_dont_use_autosuspend(vpu->dev);
+	pm_runtime_disable(vpu->dev);
+}
+
+/*
+ * Create the mem2mem device and register the video and media devices that
+ * expose the VPU to userspace. The v4l2_device must already be registered.
+ */
+static int hantro_register_devices(struct hantro_dev *vpu)
+{
+	int ret;
 
 	vpu->m2m_dev = hantro_get_v4l2_m2m_dev(vpu);
 	if (IS_ERR(vpu->m2m_dev)) {
 		v4l2_err(&vpu->v4l2_dev, "Failed to init mem2mem device\n");
-		ret = PTR_ERR(vpu->m2m_dev);
-		goto err_v4l2_unreg;
+		return PTR_ERR(vpu->m2m_dev);
+	}
+
+	if (vpu->num_cores > 1) {
+		v4l2_m2m_set_max_parallel_jobs(vpu->m2m_dev, vpu->num_cores);
+		v4l2_info(&vpu->v4l2_dev, "using %u cores\n", vpu->num_cores);
 	}
 
 	vpu->mdev.dev = vpu->dev;
@@ -1243,13 +1564,13 @@ static int hantro_probe(struct platform_device *pdev)
 
 	ret = hantro_add_enc_func(vpu);
 	if (ret) {
-		dev_err(&pdev->dev, "Failed to register encoder\n");
+		dev_err(vpu->dev, "Failed to register encoder\n");
 		goto err_m2m_rel;
 	}
 
 	ret = hantro_add_dec_func(vpu);
 	if (ret) {
-		dev_err(&pdev->dev, "Failed to register decoder\n");
+		dev_err(vpu->dev, "Failed to register decoder\n");
 		goto err_rm_enc_func;
 	}
 
@@ -1268,15 +1589,207 @@ err_rm_enc_func:
 err_m2m_rel:
 	media_device_cleanup(&vpu->mdev);
 	v4l2_m2m_put(vpu->m2m_dev);
+	return ret;
+}
+
+static void hantro_unregister_devices(struct hantro_dev *vpu)
+{
+	media_device_unregister(&vpu->mdev);
+	hantro_remove_dec_func(vpu);
+	hantro_remove_enc_func(vpu);
+	media_device_cleanup(&vpu->mdev);
+	v4l2_m2m_put(vpu->m2m_dev);
+}
+
+static int hantro_core_bind(struct device *dev, struct device *master,
+			    void *data)
+{
+	struct hantro_dev *core = dev_get_drvdata(dev);
+	struct iommu_domain *domain, *core_domain;
+	struct hantro_dev *vpu = data;
+	int ret;
+
+	/*
+	 * Buffers are allocated and mapped through the main core, before the
+	 * job is scheduled on a core. Put this core into the IOMMU domain of
+	 * the main core, so that it uses the same mappings. A core that can't
+	 * share the mappings is left unused rather than failing the whole
+	 * device.
+	 */
+	domain = iommu_get_domain_for_dev(vpu->dev);
+	core_domain = iommu_get_domain_for_dev(dev);
+	if (domain || core_domain) {
+		if (!domain || !core_domain) {
+			dev_warn(dev, "IOMMU differs from the main core, not using this core\n");
+			return 0;
+		}
+
+		ret = iommu_attach_device(domain, dev);
+		if (ret) {
+			dev_warn(dev, "Failed to attach to the IOMMU domain of the main core (%d), not using this core\n",
+				 ret);
+			return 0;
+		}
+		core->attached_domain = domain;
+	}
+
+	scoped_guard(spinlock_irqsave, &vpu->cores_lock)
+		vpu->cores[vpu->num_cores++] = core;
+
+	return 0;
+}
+
+static void hantro_core_unbind(struct device *dev, struct device *master,
+			       void *data)
+{
+	struct hantro_dev *core = dev_get_drvdata(dev);
+	struct hantro_dev *vpu = data;
+	unsigned int i;
+
+	scoped_guard(spinlock_irqsave, &vpu->cores_lock) {
+		for (i = 1; i < vpu->num_cores; i++) {
+			if (vpu->cores[i] != core)
+				continue;
+
+			memmove(&vpu->cores[i], &vpu->cores[i + 1],
+				(vpu->num_cores - i - 1) * sizeof(*vpu->cores));
+			vpu->num_cores--;
+			break;
+		}
+	}
+
+	cancel_delayed_work_sync(&core->watchdog_work);
+
+	/* Return the core to its own DMA domain, so that it can bind again. */
+	if (core->attached_domain) {
+		iommu_detach_device(core->attached_domain, dev);
+		core->attached_domain = NULL;
+	}
+}
+
+static const struct component_ops hantro_core_ops = {
+	.bind = hantro_core_bind,
+	.unbind = hantro_core_unbind,
+};
+
+static int hantro_master_bind(struct device *dev)
+{
+	struct hantro_dev *vpu = dev_get_drvdata(dev);
+	int ret;
+
+	ret = component_bind_all(dev, vpu);
+	if (ret)
+		return ret;
+
+	ret = hantro_register_devices(vpu);
+	if (ret) {
+		component_unbind_all(dev, vpu);
+		return ret;
+	}
+
+	return 0;
+}
+
+static void hantro_master_unbind(struct device *dev)
+{
+	struct hantro_dev *vpu = dev_get_drvdata(dev);
+
+	/* Wait for running jobs and don't start new ones on unbound cores. */
+	v4l2_m2m_suspend(vpu->m2m_dev);
+	cancel_delayed_work_sync(&vpu->watchdog_work);
+
+	hantro_unregister_devices(vpu);
+	component_unbind_all(dev, vpu);
+}
+
+static const struct component_master_ops hantro_master_ops = {
+	.bind = hantro_master_bind,
+	.unbind = hantro_master_unbind,
+};
+
+static int hantro_probe(struct platform_device *pdev)
+{
+	struct component_match *cmatch = NULL;
+	const struct of_device_id *match;
+	unsigned int num_cores;
+	struct hantro_dev *vpu;
+	int ret;
+
+	vpu = devm_kzalloc(&pdev->dev, sizeof(*vpu), GFP_KERNEL);
+	if (!vpu)
+		return -ENOMEM;
+
+	vpu->dev = &pdev->dev;
+	vpu->pdev = pdev;
+	mutex_init(&vpu->vpu_mutex);
+	spin_lock_init(&vpu->irqlock);
+	spin_lock_init(&vpu->cores_lock);
+
+	match = of_match_node(of_hantro_match, pdev->dev.of_node);
+	vpu->variant = match->data;
+
+	ret = hantro_get_core_role(vpu, &cmatch, &num_cores);
+	if (ret < 0)
+		return ret;
+	vpu->role = ret;
+
+	/*
+	 * Support for nxp,imx8mq-vpu is kept for backwards compatibility
+	 * but it's deprecated. Please update your DTS file to use
+	 * nxp,imx8mq-vpu-g1 or nxp,imx8mq-vpu-g2 instead.
+	 */
+	if (of_device_is_compatible(pdev->dev.of_node, "nxp,imx8mq-vpu"))
+		dev_warn(&pdev->dev, "%s compatible is deprecated\n",
+			 match->compatible);
+
+	if (vpu->role == HANTRO_CORE_SECONDARY) {
+		platform_set_drvdata(pdev, vpu);
+
+		ret = hantro_hw_init(vpu);
+		if (ret)
+			return ret;
+
+		ret = component_add(&pdev->dev, &hantro_core_ops);
+		if (ret) {
+			dev_err(&pdev->dev, "Failed to register core component\n");
+			goto err_hw_cleanup;
+		}
+
+		return 0;
+	}
+
+	vpu->cores = devm_kcalloc(&pdev->dev, num_cores, sizeof(*vpu->cores),
+				  GFP_KERNEL);
+	if (!vpu->cores)
+		return -ENOMEM;
+	vpu->cores[vpu->num_cores++] = vpu;
+
+	ret = hantro_hw_init(vpu);
+	if (ret)
+		return ret;
+
+	ret = v4l2_device_register(&pdev->dev, &vpu->v4l2_dev);
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to register v4l2 device\n");
+		goto err_hw_cleanup;
+	}
+	platform_set_drvdata(pdev, vpu);
+
+	if (vpu->role == HANTRO_CORE_MAIN)
+		ret = component_master_add_with_match(&pdev->dev,
+						      &hantro_master_ops,
+						      cmatch);
+	else
+		ret = hantro_register_devices(vpu);
+	if (ret)
+		goto err_v4l2_unreg;
+
+	return 0;
+
 err_v4l2_unreg:
 	v4l2_device_unregister(&vpu->v4l2_dev);
-err_clk_unprepare:
-	clk_bulk_unprepare(vpu->variant->num_clocks, vpu->clocks);
-err_rst_assert:
-	reset_control_assert(vpu->resets);
-err_pm_disable:
-	pm_runtime_dont_use_autosuspend(vpu->dev);
-	pm_runtime_disable(vpu->dev);
+err_hw_cleanup:
+	hantro_hw_cleanup(vpu);
 	return ret;
 }
 
@@ -1284,18 +1797,20 @@ static void hantro_remove(struct platform_device *pdev)
 {
 	struct hantro_dev *vpu = platform_get_drvdata(pdev);
 
+	if (vpu->role == HANTRO_CORE_SECONDARY) {
+		component_del(&pdev->dev, &hantro_core_ops);
+		hantro_hw_cleanup(vpu);
+		return;
+	}
+
 	v4l2_info(&vpu->v4l2_dev, "Removing %s\n", pdev->name);
 
-	media_device_unregister(&vpu->mdev);
-	hantro_remove_dec_func(vpu);
-	hantro_remove_enc_func(vpu);
-	media_device_cleanup(&vpu->mdev);
-	v4l2_m2m_put(vpu->m2m_dev);
+	if (vpu->role == HANTRO_CORE_MAIN)
+		component_master_del(&pdev->dev, &hantro_master_ops);
+	else
+		hantro_unregister_devices(vpu);
 	v4l2_device_unregister(&vpu->v4l2_dev);
-	clk_bulk_unprepare(vpu->variant->num_clocks, vpu->clocks);
-	reset_control_assert(vpu->resets);
-	pm_runtime_dont_use_autosuspend(vpu->dev);
-	pm_runtime_disable(vpu->dev);
+	hantro_hw_cleanup(vpu);
 }
 
 #ifdef CONFIG_PM

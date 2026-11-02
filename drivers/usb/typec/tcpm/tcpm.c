@@ -296,6 +296,7 @@ enum frs_typec_current {
 
 #define GET_SINK_CAP_RETRY_MS	100
 #define SEND_DISCOVERY_VDM_RETRY_MS	100
+#define VDM_DISCOVERY_MAX_RETRIES	3
 
 struct pd_mode_data {
 	int svid_index;		/* current SVID index		*/
@@ -607,6 +608,8 @@ struct tcpm_port {
 
 	/* VDM Discovery State to determine message sent */
 	enum vdm_discovery_states vdm_discovery_state;
+	/* Discovery requests resent without progress after a response timeout */
+	unsigned int vdm_discovery_retries;
 
 	/* PD state for Vendor Defined Messages */
 	enum vdm_states vdm_state;
@@ -1872,6 +1875,15 @@ static bool tcpm_ams_interruptible(struct tcpm_port *port)
 	return true;
 }
 
+static void tcpm_vdm_handle_ams_interruption(struct tcpm_port *port)
+{
+	tcpm_log(port, "VDM AMS state machine got interrupted");
+
+	port->vdm_state = VDM_STATE_ERR_BUSY;
+	tcpm_ams_finish(port);
+	mod_vdm_delayed_work(port, 0);
+}
+
 static int tcpm_ams_start(struct tcpm_port *port, enum tcpm_ams ams)
 {
 	int ret = 0;
@@ -2355,10 +2367,12 @@ static void tcpm_update_vdm_discovery_state(struct tcpm_port *port,
 {
 	enum vdm_discovery_states old_state = port->vdm_discovery_state;
 
-	if (old_state != new_state)
+	if (old_state != new_state) {
 		tcpm_log_force(port, "vdm discovery state changed: %s -> %s",
 			       vdm_discovery_state_strings[old_state],
 			       vdm_discovery_state_strings[new_state]);
+		port->vdm_discovery_retries = 0;
+	}
 
 	port->vdm_discovery_state = new_state;
 }
@@ -2822,6 +2836,16 @@ static void tcpm_handle_vdm_request(struct tcpm_port *port,
 		port->vdm_sm_running = true;
 		rlen = tcpm_pd_svdm(port, adev, p, cnt, response, &adev_action,
 				    rx_sop_type, &response_tx_sop_type);
+	} else if (PD_VDO_SVDM(p[0]) && PD_VDO_CMDT(p[0]) != CMDT_INIT) {
+		/*
+		 * A Structured VDM response (ACK, NAK or BUSY) that does not
+		 * belong to an outstanding request, for example one that
+		 * arrives after VDMResponseTimer expired. Not_Supported is the
+		 * reply to a request the port does not support, and must not be
+		 * sent for a response: the port partner may take it as a reply
+		 * to its next message. Drop it.
+		 */
+		tcpm_log(port, "Ignoring unexpected VDM response 0x%08x", p[0]);
 	} else {
 		if (port->negotiated_rev >= PD_REV30)
 			tcpm_pd_handle_msg(port, PD_MSG_CTRL_NOT_SUPP, NONE_AMS);
@@ -2914,6 +2938,33 @@ static void tcpm_handle_vdm_request(struct tcpm_port *port,
 		tcpm_queue_vdm(port, response[0], &response[1], rlen - 1, response_tx_sop_type);
 	else
 		port->vdm_sm_running = false;
+}
+
+/*
+ * A Discover SVIDs or Discover Modes request to the port partner got no
+ * response before VDMResponseTimer expired. Once the port partner has answered
+ * Discover Identity it supports Structured VDMs, and the response may only
+ * have been late: resend the request a few times before giving up, and then
+ * register the alternate modes discovered so far.
+ */
+static void tcpm_vdm_discovery_timeout(struct tcpm_port *port)
+{
+	if (port->tx_sop_type != TCPC_TX_SOP ||
+	    port->vdm_discovery_state == VDM_DISCOVERY_UNKNOWN ||
+	    port->vdm_discovery_state == VDM_DISCOVERY_COMPLETE)
+		return;
+
+	if (port->vdm_discovery_retries < VDM_DISCOVERY_MAX_RETRIES) {
+		port->vdm_discovery_retries++;
+		tcpm_log(port, "VDM response timeout, retry discovery (%u)",
+			 port->vdm_discovery_retries);
+		mod_vdm_discovery_delayed_work(port, SEND_DISCOVERY_VDM_RETRY_MS);
+		return;
+	}
+
+	tcpm_log(port, "VDM response timeout, discovery stopped");
+	tcpm_register_partner_altmodes(port);
+	tcpm_update_vdm_discovery_state(port, VDM_DISCOVERY_COMPLETE);
 }
 
 static unsigned int vdm_ready_timeout(u32 vdm_hdr)
@@ -3021,6 +3072,8 @@ static void vdm_run_state_machine(struct tcpm_port *port)
 		break;
 	case VDM_STATE_BUSY:
 		port->vdm_state = VDM_STATE_ERR_TMOUT;
+		if (port->ams == DISCOVER_SVIDS || port->ams == DISCOVER_MODES)
+			tcpm_vdm_discovery_timeout(port);
 		if (port->ams != NONE_AMS)
 			tcpm_ams_finish(port);
 		break;
@@ -3553,11 +3606,8 @@ static void tcpm_pd_data_request(struct tcpm_port *port,
 	bool frs_enable;
 	int ret;
 
-	if (tcpm_vdm_ams(port) && type != PD_DATA_VENDOR_DEF) {
-		port->vdm_state = VDM_STATE_ERR_BUSY;
-		tcpm_ams_finish(port);
-		mod_vdm_delayed_work(port, 0);
-	}
+	if (tcpm_vdm_ams(port) && type != PD_DATA_VENDOR_DEF)
+		tcpm_vdm_handle_ams_interruption(port);
 
 	switch (type) {
 	case PD_DATA_SOURCE_CAP:
@@ -3754,11 +3804,8 @@ static void tcpm_pd_ctrl_request(struct tcpm_port *port,
 	 * Stop VDM state machine if interrupted by other Messages while NOT_SUPP is allowed in
 	 * VDM AMS if waiting for VDM responses and will be handled later.
 	 */
-	if (tcpm_vdm_ams(port) && type != PD_CTRL_NOT_SUPP && type != PD_CTRL_GOOD_CRC) {
-		port->vdm_state = VDM_STATE_ERR_BUSY;
-		tcpm_ams_finish(port);
-		mod_vdm_delayed_work(port, 0);
-	}
+	if (tcpm_vdm_ams(port) && type != PD_CTRL_NOT_SUPP && type != PD_CTRL_GOOD_CRC)
+		tcpm_vdm_handle_ams_interruption(port);
 
 	switch (type) {
 	case PD_CTRL_GOOD_CRC:
@@ -3891,11 +3938,22 @@ static void tcpm_pd_ctrl_request(struct tcpm_port *port,
 			break;
 		case SRC_READY:
 		case SNK_READY:
-			if (port->vdm_state > VDM_STATE_READY) {
+			/* The reply to the VDM that is waiting for a response */
+			if (port->vdm_state == VDM_STATE_BUSY) {
 				port->vdm_state = VDM_STATE_DONE;
 				if (tcpm_vdm_ams(port))
 					tcpm_ams_finish(port);
 				mod_vdm_delayed_work(port, 0);
+				break;
+			}
+			/*
+			 * The VDM is still to be sent, after tSinkTx or after
+			 * the partner answered BUSY, so this Message is not a
+			 * reply to it. Send the VDM as planned.
+			 */
+			if (port->vdm_state > VDM_STATE_READY) {
+				tcpm_log(port, "Ignoring ctrl msg %d, VDM not sent yet",
+					 type);
 				break;
 			}
 			fallthrough;
@@ -4080,11 +4138,8 @@ static void tcpm_pd_ext_msg_request(struct tcpm_port *port,
 	const struct pd_chunked_ext_message_data *ext_msg = &msg->ext_msg;
 
 	/* stopping VDM state machine if interrupted by other Messages */
-	if (tcpm_vdm_ams(port)) {
-		port->vdm_state = VDM_STATE_ERR_BUSY;
-		tcpm_ams_finish(port);
-		mod_vdm_delayed_work(port, 0);
-	}
+	if (tcpm_vdm_ams(port))
+		tcpm_vdm_handle_ams_interruption(port);
 
 	if (!(le16_to_cpu(ext_msg->header) & PD_EXT_HDR_CHUNKED)) {
 		tcpm_pd_handle_msg(port, PD_MSG_CTRL_NOT_SUPP, NONE_AMS);
@@ -5841,20 +5896,25 @@ static void run_state_machine(struct tcpm_port *port)
 			tcpm_set_state(port, SNK_READY, 0);
 			break;
 		}
+
 		/*
+		 * For non self-powered devices, first of all try explicitly
+		 * requesting the source capabilities for better support of
+		 * of non-compliant PD sources (a comment with more details is
+		 * in the SNK_WAIT_CAPABILITIES_TIMEOUT state).
+		 *
 		 * If VBUS has never been low, and we time out waiting
 		 * for source cap, try a soft reset first, in case we
 		 * were already in a stable contract before this boot.
 		 * Do this only once.
 		 */
-		if (port->vbus_never_low) {
+		if (!port->self_powered) {
+			upcoming_state = SNK_WAIT_CAPABILITIES_TIMEOUT;
+		} else if (port->vbus_never_low) {
 			port->vbus_never_low = false;
 			upcoming_state = SNK_SOFT_RESET;
 		} else {
-			if (!port->self_powered)
-				upcoming_state = SNK_WAIT_CAPABILITIES_TIMEOUT;
-			else
-				upcoming_state = hard_reset_state(port);
+			upcoming_state = hard_reset_state(port);
 		}
 
 		tcpm_set_state(port, upcoming_state,
@@ -5876,10 +5936,17 @@ static void run_state_machine(struct tcpm_port *port)
 		 * and handled by all USB PD source and dual role devices
 		 * according to the specification.
 		 */
+		if (port->vbus_never_low) {
+			port->vbus_never_low = false;
+			upcoming_state = SNK_SOFT_RESET;
+		} else {
+			upcoming_state = hard_reset_state(port);
+		}
+
 		if (tcpm_pd_send_control(port, PD_CTRL_GET_SOURCE_CAP, TCPC_TX_SOP))
-			tcpm_set_state_cond(port, hard_reset_state(port), 0);
+			tcpm_set_state_cond(port, upcoming_state, 0);
 		else
-			tcpm_set_state(port, hard_reset_state(port),
+			tcpm_set_state(port, upcoming_state,
 				       port->timings.sink_wait_cap_time);
 		break;
 	case SNK_NEGOTIATE_CAPABILITIES:
@@ -7376,7 +7443,7 @@ static void tcpm_vdm_discovery_work(struct kthread_work *work)
 	case VDM_DISCOVERY_PARTNER_MODES:
 		/* Not all modes have been discovered yet */
 		if (modep->svid_index < modep->nsvids) {
-			msg[0] = VDO(modep_prime->svids[modep->svid_index], 1, svdm_version,
+			msg[0] = VDO(modep->svids[modep->svid_index], 1, svdm_version,
 				     CMD_DISCOVER_MODES);
 		} else if (tcpm_can_communicate_sop_prime(port) && tcpm_cable_vdm_supported(port)) {
 			tx_sop_type = TCPC_TX_SOP_PRIME;
@@ -7411,7 +7478,7 @@ static void tcpm_vdm_discovery_work(struct kthread_work *work)
 		if (modep_prime->svid_index < modep_prime->nsvids) {
 			tx_sop_type = TCPC_TX_SOP_PRIME;
 			svdm_version = typec_get_cable_svdm_version(typec);
-			msg[0] = VDO(modep_prime->svids[modep->svid_index], 1, svdm_version,
+			msg[0] = VDO(modep_prime->svids[modep_prime->svid_index], 1, svdm_version,
 				     CMD_DISCOVER_MODES);
 		} else {
 			goto unlock;

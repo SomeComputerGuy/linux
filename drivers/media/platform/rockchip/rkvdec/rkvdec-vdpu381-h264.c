@@ -11,6 +11,7 @@
 
 #include "rkvdec.h"
 #include "rkvdec-cabac.h"
+#include "rkvdec-ccu.h"
 #include "rkvdec-rcb.h"
 #include "rkvdec-h264-common.h"
 #include "rkvdec-vdpu381-regs.h"
@@ -78,20 +79,28 @@ struct rkvdec_h264_priv_tbl {
 };
 
 struct rkvdec_h264_ctx {
-	struct rkvdec_aux_buf priv_tbl;
+	/* One table per job, see &rkvdec_job.slot */
+	struct rkvdec_aux_buf priv_tbl[RKVDEC_MAX_JOBS];
 	struct rkvdec_h264_reflists reflists;
 	struct rkvdec_vdpu381_regs_h264 regs;
 };
 
+static struct rkvdec_aux_buf *rkvdec_h264_priv_tbl(struct rkvdec_ctx *ctx)
+{
+	struct rkvdec_h264_ctx *h264_ctx = ctx->priv;
+
+	return &h264_ctx->priv_tbl[ctx->job->slot];
+}
+
 static void assemble_hw_pps(struct rkvdec_ctx *ctx,
 			    struct rkvdec_h264_run *run)
 {
-	struct rkvdec_h264_ctx *h264_ctx = ctx->priv;
+	struct rkvdec_aux_buf *tbl_buf = rkvdec_h264_priv_tbl(ctx);
 	const struct v4l2_ctrl_h264_sps *sps = run->sps;
 	const struct v4l2_ctrl_h264_pps *pps = run->pps;
 	const struct v4l2_ctrl_h264_decode_params *dec_params = run->decode_params;
 	const struct v4l2_h264_dpb_entry *dpb = dec_params->dpb;
-	struct rkvdec_h264_priv_tbl *priv_tbl = h264_ctx->priv_tbl.cpu;
+	struct rkvdec_h264_priv_tbl *priv_tbl = tbl_buf->cpu;
 	struct rkvdec_sps_pps *hw_ps;
 	dma_addr_t scaling_list_address;
 	u32 scaling_distance;
@@ -174,7 +183,7 @@ static void assemble_hw_pps(struct rkvdec_ctx *ctx,
 	 * To be on the safe side, program the scaling matrix address
 	 */
 	scaling_distance = offsetof(struct rkvdec_h264_priv_tbl, scaling_list);
-	scaling_list_address = h264_ctx->priv_tbl.dma + scaling_distance;
+	scaling_list_address = tbl_buf->dma + scaling_distance;
 	hw_ps->pps.scaling_list_address = scaling_list_address;
 
 	for (i = 0; i < ARRAY_SIZE(dec_params->dpb); i++) {
@@ -185,22 +194,22 @@ static void assemble_hw_pps(struct rkvdec_ctx *ctx,
 
 static void rkvdec_write_regs(struct rkvdec_ctx *ctx)
 {
-	struct rkvdec_dev *rkvdec = ctx->dev;
+	struct rkvdec_core *core = ctx->core;
 	struct rkvdec_h264_ctx *h264_ctx = ctx->priv;
 
-	rkvdec_memcpy_toio(rkvdec->regs + OFFSET_COMMON_REGS,
+	rkvdec_memcpy_toio(core->regs + OFFSET_COMMON_REGS,
 			   &h264_ctx->regs.common,
 			   sizeof(h264_ctx->regs.common));
-	rkvdec_memcpy_toio(rkvdec->regs + OFFSET_CODEC_PARAMS_REGS,
+	rkvdec_memcpy_toio(core->regs + OFFSET_CODEC_PARAMS_REGS,
 			   &h264_ctx->regs.h264_param,
 			   sizeof(h264_ctx->regs.h264_param));
-	rkvdec_memcpy_toio(rkvdec->regs + OFFSET_COMMON_ADDR_REGS,
+	rkvdec_memcpy_toio(core->regs + OFFSET_COMMON_ADDR_REGS,
 			   &h264_ctx->regs.common_addr,
 			   sizeof(h264_ctx->regs.common_addr));
-	rkvdec_memcpy_toio(rkvdec->regs + OFFSET_CODEC_ADDR_REGS,
+	rkvdec_memcpy_toio(core->regs + OFFSET_CODEC_ADDR_REGS,
 			   &h264_ctx->regs.h264_addr,
 			   sizeof(h264_ctx->regs.h264_addr));
-	rkvdec_memcpy_toio(rkvdec->regs + OFFSET_POC_HIGHBIT_REGS,
+	rkvdec_memcpy_toio(core->regs + OFFSET_POC_HIGHBIT_REGS,
 			   &h264_ctx->regs.h264_highpoc,
 			   sizeof(h264_ctx->regs.h264_highpoc));
 }
@@ -211,7 +220,7 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	const struct v4l2_ctrl_h264_decode_params *dec_params = run->decode_params;
 	const struct v4l2_h264_dpb_entry *dpb = dec_params->dpb;
 	struct rkvdec_h264_ctx *h264_ctx = ctx->priv;
-	dma_addr_t priv_start_addr = h264_ctx->priv_tbl.dma;
+	dma_addr_t priv_start_addr = rkvdec_h264_priv_tbl(ctx)->dma;
 	const struct v4l2_pix_format_mplane *dst_fmt;
 	struct vb2_v4l2_buffer *src_buf = run->base.bufs.src;
 	struct vb2_v4l2_buffer *dst_buf = run->base.bufs.dst;
@@ -224,6 +233,8 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	u32 y_virstride;
 	u32 offset;
 	u32 pixels;
+	bool field_pic;
+	u32 *highpoc;
 	u32 i;
 
 	memset(regs, 0, sizeof(*regs));
@@ -236,6 +247,16 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	regs->common.reg011_important_en.dec_clkgate_e = 1;
 	regs->common.reg011_important_en.dec_timeout_e = 1;
 	regs->common.reg011_important_en.pix_range_det_e = 1;
+
+	/*
+	 * Store the co-located motion vectors compressed, as the vendor code
+	 * does for frame-only streams. This cuts the memory traffic of
+	 * B-frames and the hardware time of 4K streams by about 5%. The
+	 * compressed data fits the space reserved for the uncompressed
+	 * layout. Field and MBAFF streams use the uncompressed layout.
+	 */
+	regs->common.reg012_secondary_en.colmv_compress_en =
+		!!(run->sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY);
 
 	/*
 	 * Even though the scan list address can be set in RPS,
@@ -289,21 +310,57 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	else
 		regs->common.reg032_timeout_threshold = RKVDEC_TIMEOUT_MAX;
 
+	rkvdec_vdpu381_set_ccu_regs(ctx, &regs->common);
+
 	/* Set TOP and BOTTOM POCs */
-	regs->h264_param.reg065_cur_top_poc = dec_params->top_field_order_cnt;
-	regs->h264_param.reg066_cur_bot_poc = dec_params->bottom_field_order_cnt;
+	ctx->job->field_pic = !!(dec_params->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC);
+
+	/*
+	 * A field picture only has the POC of its own field, the other one is
+	 * 0, as in the Rockchip MPP (h264d_fill.c): in CCU mode, the cores take
+	 * these as the fields the core is writing.
+	 */
+	if (!(dec_params->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC) ||
+	    !(dec_params->flags & V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD)) {
+		regs->h264_param.reg065_cur_top_poc = dec_params->top_field_order_cnt;
+		rkvdec_job_add_poc(ctx, dec_params->top_field_order_cnt, false);
+	}
+	if (!(dec_params->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC) ||
+	    (dec_params->flags & V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD)) {
+		regs->h264_param.reg066_cur_bot_poc = dec_params->bottom_field_order_cnt;
+		rkvdec_job_add_poc(ctx, dec_params->bottom_field_order_cnt, false);
+	}
+
+	/*
+	 * POC high bits, which tell the cores what a reference is: the field
+	 * parity of field pictures, 3 for unused entries of frame pictures.
+	 */
+	field_pic = !!(dec_params->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC);
+	highpoc = (u32 *)&regs->h264_highpoc;
+	if (field_pic && (dec_params->flags & V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD))
+		highpoc[4] = 1;
 
 	/* Set ref pic address & poc */
 	for (i = 0; i < ARRAY_SIZE(dec_params->dpb); i++) {
 		struct vb2_buffer *vb_buf = run->ref_buf[i];
 		dma_addr_t buf_dma;
 
+		if (field_pic)
+			highpoc[i / 4] |= 0x10 << ((i % 4) * 8);
+		else if (!vb_buf)
+			highpoc[i / 4] |= 0x33 << ((i % 4) * 8);
+
 		/*
 		 * If a DPB entry is unused or invalid, address of current destination
 		 * buffer is returned.
 		 */
-		if (!vb_buf)
+		if (vb_buf) {
+			rkvdec_job_add_ref(ctx, vb_buf);
+			rkvdec_job_add_poc(ctx, dpb[i].top_field_order_cnt, true);
+			rkvdec_job_add_poc(ctx, dpb[i].bottom_field_order_cnt, true);
+		} else {
 			vb_buf = &dst_buf->vb2_buf;
+		}
 
 		buf_dma = vb2_dma_contig_plane_dma_addr(vb_buf, 0);
 
@@ -368,10 +425,10 @@ static void config_registers(struct rkvdec_ctx *ctx,
 
 static int rkvdec_h264_start(struct rkvdec_ctx *ctx)
 {
-	struct rkvdec_dev *rkvdec = ctx->dev;
 	struct rkvdec_h264_priv_tbl *priv_tbl;
 	struct rkvdec_h264_ctx *h264_ctx;
 	struct v4l2_ctrl *ctrl;
+	unsigned int i;
 	int ret;
 
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
@@ -387,22 +444,32 @@ static int rkvdec_h264_start(struct rkvdec_ctx *ctx)
 	if (!h264_ctx)
 		return -ENOMEM;
 
-	priv_tbl = dma_alloc_coherent(rkvdec->dev, sizeof(*priv_tbl),
-				      &h264_ctx->priv_tbl.dma, GFP_KERNEL);
-	if (!priv_tbl) {
-		ret = -ENOMEM;
-		goto err_free_ctx;
-	}
+	for (i = 0; i < ctx->num_job_slots; i++) {
+		struct rkvdec_aux_buf *buf = &h264_ctx->priv_tbl[i];
 
-	h264_ctx->priv_tbl.size = sizeof(*priv_tbl);
-	h264_ctx->priv_tbl.cpu = priv_tbl;
-	memcpy(priv_tbl->cabac_table, rkvdec_h264_cabac_table,
-	       sizeof(rkvdec_h264_cabac_table));
+		priv_tbl = dma_alloc_coherent(ctx->dev->main_core->dev,
+					      sizeof(*priv_tbl), &buf->dma,
+					      GFP_KERNEL);
+		if (!priv_tbl) {
+			ret = -ENOMEM;
+			goto err_free_tbl;
+		}
+
+		buf->size = sizeof(*priv_tbl);
+		buf->cpu = priv_tbl;
+		memcpy(priv_tbl->cabac_table, rkvdec_h264_cabac_table,
+		       sizeof(rkvdec_h264_cabac_table));
+	}
 
 	ctx->priv = h264_ctx;
 	return 0;
 
-err_free_ctx:
+err_free_tbl:
+	while (i--)
+		dma_free_coherent(ctx->dev->main_core->dev,
+				  h264_ctx->priv_tbl[i].size,
+				  h264_ctx->priv_tbl[i].cpu,
+				  h264_ctx->priv_tbl[i].dma);
 	kfree(h264_ctx);
 	return ret;
 }
@@ -410,20 +477,24 @@ err_free_ctx:
 static void rkvdec_h264_stop(struct rkvdec_ctx *ctx)
 {
 	struct rkvdec_h264_ctx *h264_ctx = ctx->priv;
-	struct rkvdec_dev *rkvdec = ctx->dev;
+	unsigned int i;
 
-	dma_free_coherent(rkvdec->dev, h264_ctx->priv_tbl.size,
-			  h264_ctx->priv_tbl.cpu, h264_ctx->priv_tbl.dma);
+	for (i = 0; i < ctx->num_job_slots; i++)
+		dma_free_coherent(ctx->dev->main_core->dev,
+				  h264_ctx->priv_tbl[i].size,
+				  h264_ctx->priv_tbl[i].cpu,
+				  h264_ctx->priv_tbl[i].dma);
 	kfree(h264_ctx);
 }
 
 static int rkvdec_h264_run(struct rkvdec_ctx *ctx)
 {
 	struct v4l2_h264_reflist_builder reflist_builder;
-	struct rkvdec_dev *rkvdec = ctx->dev;
+	struct rkvdec_core *core = ctx->core;
 	struct rkvdec_h264_ctx *h264_ctx = ctx->priv;
-	struct rkvdec_h264_priv_tbl *tbl = h264_ctx->priv_tbl.cpu;
+	struct rkvdec_h264_priv_tbl *tbl = rkvdec_h264_priv_tbl(ctx)->cpu;
 	struct rkvdec_h264_run run;
+	int ret;
 
 	rkvdec_h264_run_preamble(ctx, &run);
 
@@ -443,10 +514,16 @@ static int rkvdec_h264_run(struct rkvdec_ctx *ctx)
 
 	rkvdec_run_postamble(ctx, &run.base);
 
-	rkvdec_schedule_watchdog(rkvdec, h264_ctx->regs.common.reg032_timeout_threshold);
+	/* Before the watchdog: this may wait for the earlier frames. */
+	ret = rkvdec_job_wait_poc_alias(ctx);
+	if (ret)
+		return ret;
+
+	rkvdec_schedule_watchdog(core, h264_ctx->regs.common.reg032_timeout_threshold);
 
 	/* Start decoding! */
-	writel(VDPU381_DEC_E_BIT, rkvdec->regs + VDPU381_REG_DEC_E);
+	rkvdec_ccu_start(ctx);
+	writel(VDPU381_DEC_E_BIT, core->regs + VDPU381_REG_DEC_E);
 
 	return 0;
 }

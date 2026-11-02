@@ -7,6 +7,7 @@
  */
 
 #include <linux/clk.h>
+#include <linux/delay.h>
 
 #include "hantro.h"
 #include "hantro_jpeg.h"
@@ -56,6 +57,46 @@ static const struct hantro_fmt rockchip_vpu_enc_fmts[] = {
 			.step_width = MB_DIM,
 			.min_height = 32,
 			.max_height = 8192,
+			.step_height = MB_DIM,
+		},
+	},
+};
+
+/*
+ * The VEPU2 encoder of the RK3588 VPU121, next to its decoder, encodes H.264.
+ * Unlike the VEPU121 cores of the RK3588, which are JPEG encoders only.
+ */
+static const struct hantro_fmt rk3588_vpu121_enc_fmts[] = {
+	{
+		.fourcc = V4L2_PIX_FMT_YUV420M,
+		.codec_mode = HANTRO_MODE_NONE,
+		.enc_fmt = ROCKCHIP_VPU_ENC_FMT_YUV420P,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_NV12M,
+		.codec_mode = HANTRO_MODE_NONE,
+		.enc_fmt = ROCKCHIP_VPU_ENC_FMT_YUV420SP,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_YUYV,
+		.codec_mode = HANTRO_MODE_NONE,
+		.enc_fmt = ROCKCHIP_VPU_ENC_FMT_YUYV422,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_UYVY,
+		.codec_mode = HANTRO_MODE_NONE,
+		.enc_fmt = ROCKCHIP_VPU_ENC_FMT_UYVY422,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_H264_SLICE,
+		.codec_mode = HANTRO_MODE_H264_ENC,
+		.max_depth = 2,
+		.frmsize = {
+			.min_width = 96,
+			.max_width = 1920,
+			.step_width = MB_DIM,
+			.min_height = 96,
+			.max_height = 1088,
 			.step_height = MB_DIM,
 		},
 	},
@@ -274,10 +315,10 @@ static const struct hantro_fmt rockchip_vdpu2_dec_fmts[] = {
 		.max_depth = 2,
 		.frmsize = {
 			.min_width = FMT_MIN_WIDTH,
-			.max_width = FMT_UHD_WIDTH,
+			.max_width = FMT_FHD_WIDTH,
 			.step_width = MB_DIM,
 			.min_height = FMT_MIN_HEIGHT,
-			.max_height = FMT_UHD_HEIGHT,
+			.max_height = FMT_FHD_HEIGHT,
 			.step_height = MB_DIM,
 		},
 	},
@@ -315,10 +356,10 @@ static const struct hantro_fmt rk3399_vpu_dec_fmts[] = {
 		.max_depth = 2,
 		.frmsize = {
 			.min_width = FMT_MIN_WIDTH,
-			.max_width = FMT_UHD_WIDTH,
+			.max_width = FMT_FHD_WIDTH,
 			.step_width = MB_DIM,
 			.min_height = FMT_MIN_HEIGHT,
-			.max_height = FMT_UHD_HEIGHT,
+			.max_height = FMT_FHD_HEIGHT,
 			.step_height = MB_DIM,
 		},
 	},
@@ -468,6 +509,33 @@ static void rk3066_vpu_dec_reset(struct hantro_ctx *ctx)
 	vdpu_write(vpu, G1_REG_CONFIG_DEC_CLK_GATE_E, G1_REG_CONFIG);
 }
 
+/*
+ * Stopping the encoder through its registers isn't enough when it is stuck
+ * on the bus, for instance after a translation fault in its IOMMU: it keeps
+ * AXI transactions outstanding and never becomes idle, which also prevents
+ * the IOMMU from stalling. Pulse the reset lines of the core, if the device
+ * tree describes them, to return it to its idle state.
+ */
+static void rockchip_vpu_enc_hw_reset(struct hantro_dev *vpu)
+{
+	int ret;
+
+	if (!vpu->resets)
+		return;
+
+	ret = reset_control_assert(vpu->resets);
+	if (ret) {
+		dev_warn(vpu->dev, "Failed to assert resets: %d\n", ret);
+		return;
+	}
+
+	udelay(5);
+
+	ret = reset_control_deassert(vpu->resets);
+	if (ret)
+		dev_err(vpu->dev, "Failed to deassert resets: %d\n", ret);
+}
+
 static void rockchip_vpu1_enc_reset(struct hantro_ctx *ctx)
 {
 	struct hantro_dev *vpu = ctx->dev;
@@ -475,6 +543,7 @@ static void rockchip_vpu1_enc_reset(struct hantro_ctx *ctx)
 	vepu_write(vpu, H1_REG_INTERRUPT_DIS_BIT, H1_REG_INTERRUPT);
 	vepu_write(vpu, 0, H1_REG_ENC_CTRL);
 	vepu_write(vpu, 0, H1_REG_AXI_CTRL);
+	rockchip_vpu_enc_hw_reset(vpu);
 }
 
 static void rockchip_vpu2_dec_reset(struct hantro_ctx *ctx)
@@ -488,11 +557,12 @@ static void rockchip_vpu2_dec_reset(struct hantro_ctx *ctx)
 
 static void rockchip_vpu2_enc_reset(struct hantro_ctx *ctx)
 {
-	struct hantro_dev *vpu = ctx->dev;
+	struct hantro_dev *vpu = ctx->core;
 
 	vepu_write(vpu, VEPU_REG_INTERRUPT_DIS_BIT, VEPU_REG_INTERRUPT);
 	vepu_write(vpu, 0, VEPU_REG_ENCODE_START);
 	vepu_write(vpu, 0, VEPU_REG_AXI_CTRL);
+	rockchip_vpu_enc_hw_reset(vpu);
 }
 
 /*
@@ -605,6 +675,34 @@ static const struct hantro_codec_ops rk3568_vepu_codec_ops[] = {
 	},
 };
 
+static const struct hantro_codec_ops rk3588_vpu121_codec_ops[] = {
+	[HANTRO_MODE_H264_ENC] = {
+		.run = rockchip_vpu2_h264_enc_run,
+		.reset = rockchip_vpu2_enc_reset,
+		.init = rockchip_vpu2_h264_enc_init,
+		.exit = rockchip_vpu2_h264_enc_exit,
+		.done = rockchip_vpu2_h264_enc_done,
+	},
+	[HANTRO_MODE_H264_DEC] = {
+		.run = rockchip_vpu2_h264_dec_run,
+		.reset = rockchip_vpu2_dec_reset,
+		.init = hantro_h264_dec_init,
+		.exit = hantro_h264_dec_exit,
+	},
+	[HANTRO_MODE_MPEG2_DEC] = {
+		.run = rockchip_vpu2_mpeg2_dec_run,
+		.reset = rockchip_vpu2_dec_reset,
+		.init = hantro_mpeg2_dec_init,
+		.exit = hantro_mpeg2_dec_exit,
+	},
+	[HANTRO_MODE_VP8_DEC] = {
+		.run = rockchip_vpu2_vp8_dec_run,
+		.reset = rockchip_vpu2_dec_reset,
+		.init = hantro_vp8_dec_init,
+		.exit = hantro_vp8_dec_exit,
+	},
+};
+
 static const struct hantro_codec_ops rk3588_vpu981_codec_ops[] = {
 	[HANTRO_MODE_AV1_DEC] = {
 		.run = rockchip_vpu981_av1_dec_run,
@@ -632,6 +730,12 @@ static const struct hantro_irq rockchip_vdpu2_irqs[] = {
 
 static const struct hantro_irq rockchip_vpu2_irqs[] = {
 	{ "vepu", rockchip_vpu2_vepu_irq },
+	{ "vdpu", rockchip_vpu2_vdpu_irq },
+};
+
+/* Older device trees only describe the decoder of the RK3588 VPU121. */
+static const struct hantro_irq rk3588_vpu121_irqs[] = {
+	{ "vepu", rockchip_vpu2_vepu_irq, .enc_optional = true },
 	{ "vdpu", rockchip_vpu2_vdpu_irq },
 };
 
@@ -771,6 +875,24 @@ const struct hantro_variant rk3568_vepu_variant = {
 	.num_clocks = ARRAY_SIZE(rockchip_vpu_clk_names)
 };
 
+/*
+ * The RK3588 has four identical VEPU121 cores, each with its own IOMMU,
+ * which are driven as a single multi-core device.
+ */
+const struct hantro_variant rk3588_vepu121_variant = {
+	.enc_offset = 0x0,
+	.enc_fmts = rockchip_vpu_enc_fmts,
+	.num_enc_fmts = ARRAY_SIZE(rockchip_vpu_enc_fmts),
+	.codec = HANTRO_JPEG_ENCODER,
+	.codec_ops = rk3568_vepu_codec_ops,
+	.irqs = rk3568_vepu_irqs,
+	.num_irqs = ARRAY_SIZE(rk3568_vepu_irqs),
+	.init = rockchip_vpu_hw_init,
+	.clk_names = rockchip_vpu_clk_names,
+	.num_clocks = ARRAY_SIZE(rockchip_vpu_clk_names),
+	.multi_core = 1,
+};
+
 const struct hantro_variant rk3568_vpu_variant = {
 	.dec_offset = 0x400,
 	.dec_fmts = rockchip_vdpu2_dec_fmts,
@@ -780,6 +902,28 @@ const struct hantro_variant rk3568_vpu_variant = {
 	.codec_ops = rk3399_vpu_codec_ops,
 	.irqs = rockchip_vdpu2_irqs,
 	.num_irqs = ARRAY_SIZE(rockchip_vdpu2_irqs),
+	.init = rockchip_vpu_hw_init,
+	.clk_names = rockchip_vpu_clk_names,
+	.num_clocks = ARRAY_SIZE(rockchip_vpu_clk_names)
+};
+
+/*
+ * The RK3588 VPU121 is a VDPU2 decoder and a VEPU2 encoder sharing clocks,
+ * power domain and IOMMU. The encoder is only used for H.264, JPEG is left
+ * to the VEPU121 JPEG encoder cores.
+ */
+const struct hantro_variant rk3588_vpu121_variant = {
+	.enc_offset = 0x0,
+	.enc_fmts = rk3588_vpu121_enc_fmts,
+	.num_enc_fmts = ARRAY_SIZE(rk3588_vpu121_enc_fmts),
+	.dec_offset = 0x400,
+	.dec_fmts = rockchip_vdpu2_dec_fmts,
+	.num_dec_fmts = ARRAY_SIZE(rockchip_vdpu2_dec_fmts),
+	.codec = HANTRO_H264_ENCODER | HANTRO_MPEG2_DECODER |
+		 HANTRO_VP8_DECODER | HANTRO_H264_DECODER,
+	.codec_ops = rk3588_vpu121_codec_ops,
+	.irqs = rk3588_vpu121_irqs,
+	.num_irqs = ARRAY_SIZE(rk3588_vpu121_irqs),
 	.init = rockchip_vpu_hw_init,
 	.clk_names = rockchip_vpu_clk_names,
 	.num_clocks = ARRAY_SIZE(rockchip_vpu_clk_names)

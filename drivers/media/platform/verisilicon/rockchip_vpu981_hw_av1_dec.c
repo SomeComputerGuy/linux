@@ -236,27 +236,32 @@ static void rockchip_vpu981_av1_dec_tiles_free(struct hantro_ctx *ctx)
 				  av1_dec->db_data_col.cpu,
 				  av1_dec->db_data_col.dma);
 	av1_dec->db_data_col.cpu = NULL;
+	av1_dec->db_data_col.size = 0;
 
 	if (av1_dec->db_ctrl_col.cpu)
 		dma_free_coherent(vpu->dev, av1_dec->db_ctrl_col.size,
 				  av1_dec->db_ctrl_col.cpu,
 				  av1_dec->db_ctrl_col.dma);
 	av1_dec->db_ctrl_col.cpu = NULL;
+	av1_dec->db_ctrl_col.size = 0;
 
 	if (av1_dec->cdef_col.cpu)
 		dma_free_coherent(vpu->dev, av1_dec->cdef_col.size,
 				  av1_dec->cdef_col.cpu, av1_dec->cdef_col.dma);
 	av1_dec->cdef_col.cpu = NULL;
+	av1_dec->cdef_col.size = 0;
 
 	if (av1_dec->sr_col.cpu)
 		dma_free_coherent(vpu->dev, av1_dec->sr_col.size,
 				  av1_dec->sr_col.cpu, av1_dec->sr_col.dma);
 	av1_dec->sr_col.cpu = NULL;
+	av1_dec->sr_col.size = 0;
 
 	if (av1_dec->lr_col.cpu)
 		dma_free_coherent(vpu->dev, av1_dec->lr_col.size,
 				  av1_dec->lr_col.cpu, av1_dec->lr_col.dma);
 	av1_dec->lr_col.cpu = NULL;
+	av1_dec->lr_col.size = 0;
 }
 
 static int rockchip_vpu981_av1_dec_tiles_reallocate(struct hantro_ctx *ctx)
@@ -269,15 +274,30 @@ static int rockchip_vpu981_av1_dec_tiles_reallocate(struct hantro_ctx *ctx)
 	unsigned int height = ALIGN(ctrls->frame->frame_height_minus_1 + 1, 64);
 	unsigned int height_in_sb = height / 64;
 	unsigned int stripe_num = ((height + 8) + 63) / 64;
+	size_t db_data_size, db_ctrl_size, cdef_size, sr_size, lr_size;
 	size_t size;
 
-	if (av1_dec->db_data_col.size >=
-	    ALIGN(height * 12 * ctx->bit_depth / 8, 128) * num_tile_cols)
+	db_data_size = ALIGN(height * 12 * ctx->bit_depth / 8, 128) * num_tile_cols;
+	db_ctrl_size = ALIGN(height * 2 * 16 / 4, 128) * num_tile_cols;
+	cdef_size = ALIGN(height_in_sb * 44 * ctx->bit_depth * 16 / 8, 128) * num_tile_cols;
+	sr_size = ALIGN(height_in_sb * (3040 + 1280), 128) * num_tile_cols;
+	lr_size = ALIGN(stripe_num * 1536 * ctx->bit_depth / 8, 128) * num_tile_cols;
+
+	/*
+	 * The five buffers scale differently with the frame height, the
+	 * number of tile columns and the bit depth, so each of them has to be
+	 * big enough for the current frame, not only the deblocking data one.
+	 */
+	if (av1_dec->db_data_col.size >= db_data_size &&
+	    av1_dec->db_ctrl_col.size >= db_ctrl_size &&
+	    av1_dec->cdef_col.size >= cdef_size &&
+	    av1_dec->sr_col.size >= sr_size &&
+	    av1_dec->lr_col.size >= lr_size)
 		return 0;
 
 	rockchip_vpu981_av1_dec_tiles_free(ctx);
 
-	size = ALIGN(height * 12 * ctx->bit_depth / 8, 128) * num_tile_cols;
+	size = db_data_size;
 	av1_dec->db_data_col.cpu = dma_alloc_coherent(vpu->dev, size,
 						      &av1_dec->db_data_col.dma,
 						      GFP_KERNEL);
@@ -285,7 +305,7 @@ static int rockchip_vpu981_av1_dec_tiles_reallocate(struct hantro_ctx *ctx)
 		goto buffer_allocation_error;
 	av1_dec->db_data_col.size = size;
 
-	size = ALIGN(height * 2 * 16 / 4, 128) * num_tile_cols;
+	size = db_ctrl_size;
 	av1_dec->db_ctrl_col.cpu = dma_alloc_coherent(vpu->dev, size,
 						      &av1_dec->db_ctrl_col.dma,
 						      GFP_KERNEL);
@@ -293,7 +313,7 @@ static int rockchip_vpu981_av1_dec_tiles_reallocate(struct hantro_ctx *ctx)
 		goto buffer_allocation_error;
 	av1_dec->db_ctrl_col.size = size;
 
-	size = ALIGN(height_in_sb * 44 * ctx->bit_depth * 16 / 8, 128) * num_tile_cols;
+	size = cdef_size;
 	av1_dec->cdef_col.cpu = dma_alloc_coherent(vpu->dev, size,
 						   &av1_dec->cdef_col.dma,
 						   GFP_KERNEL);
@@ -301,7 +321,7 @@ static int rockchip_vpu981_av1_dec_tiles_reallocate(struct hantro_ctx *ctx)
 		goto buffer_allocation_error;
 	av1_dec->cdef_col.size = size;
 
-	size = ALIGN(height_in_sb * (3040 + 1280), 128) * num_tile_cols;
+	size = sr_size;
 	av1_dec->sr_col.cpu = dma_alloc_coherent(vpu->dev, size,
 						 &av1_dec->sr_col.dma,
 						 GFP_KERNEL);
@@ -309,7 +329,7 @@ static int rockchip_vpu981_av1_dec_tiles_reallocate(struct hantro_ctx *ctx)
 		goto buffer_allocation_error;
 	av1_dec->sr_col.size = size;
 
-	size = ALIGN(stripe_num * 1536 * ctx->bit_depth / 8, 128) * num_tile_cols;
+	size = lr_size;
 	av1_dec->lr_col.cpu = dma_alloc_coherent(vpu->dev, size,
 						 &av1_dec->lr_col.dma,
 						 GFP_KERNEL);
@@ -369,6 +389,7 @@ void rockchip_vpu981_av1_dec_exit(struct hantro_ctx *ctx)
 
 int rockchip_vpu981_av1_dec_init(struct hantro_ctx *ctx)
 {
+	int ret = 0;
 	struct hantro_dev *vpu = ctx->dev;
 	struct hantro_av1_dec_hw_ctx *av1_dec = &ctx->av1_dec;
 
@@ -377,39 +398,54 @@ int rockchip_vpu981_av1_dec_init(struct hantro_ctx *ctx)
 	av1_dec->global_model.cpu = dma_alloc_coherent(vpu->dev, GLOBAL_MODEL_SIZE,
 						       &av1_dec->global_model.dma,
 						       GFP_KERNEL);
-	if (!av1_dec->global_model.cpu)
-		return -ENOMEM;
+	if (!av1_dec->global_model.cpu) {
+		ret = -ENOMEM;
+		goto global_model_cpu_err;
+	}
+
 	av1_dec->global_model.size = GLOBAL_MODEL_SIZE;
 
 	av1_dec->tile_info.cpu = dma_alloc_coherent(vpu->dev, AV1_TILE_INFO_SIZE,
 						    &av1_dec->tile_info.dma,
 						    GFP_KERNEL);
-	if (!av1_dec->tile_info.cpu)
-		return -ENOMEM;
+	if (!av1_dec->tile_info.cpu) {
+		ret = -ENOMEM;
+		goto tile_info_cpu_err;
+	}
+
 	av1_dec->tile_info.size = AV1_TILE_INFO_SIZE;
 
 	av1_dec->film_grain.cpu = dma_alloc_coherent(vpu->dev,
 						     ALIGN(sizeof(struct rockchip_av1_film_grain), 2048),
 						     &av1_dec->film_grain.dma,
 						     GFP_KERNEL);
-	if (!av1_dec->film_grain.cpu)
-		return -ENOMEM;
+	if (!av1_dec->film_grain.cpu) {
+		ret = -ENOMEM;
+		goto film_grain_cpu_err;
+	}
+
 	av1_dec->film_grain.size = ALIGN(sizeof(struct rockchip_av1_film_grain), 2048);
 
 	av1_dec->prob_tbl.cpu = dma_alloc_coherent(vpu->dev,
 						   ALIGN(sizeof(struct av1cdfs), 2048),
 						   &av1_dec->prob_tbl.dma,
 						   GFP_KERNEL);
-	if (!av1_dec->prob_tbl.cpu)
-		return -ENOMEM;
+	if (!av1_dec->prob_tbl.cpu) {
+		ret = -ENOMEM;
+		goto prob_tbl_cpu_err;
+	}
+
 	av1_dec->prob_tbl.size = ALIGN(sizeof(struct av1cdfs), 2048);
 
 	av1_dec->prob_tbl_out.cpu = dma_alloc_coherent(vpu->dev,
 						       ALIGN(sizeof(struct av1cdfs), 2048),
 						       &av1_dec->prob_tbl_out.dma,
 						       GFP_KERNEL);
-	if (!av1_dec->prob_tbl_out.cpu)
-		return -ENOMEM;
+	if (!av1_dec->prob_tbl_out.cpu) {
+		ret = -ENOMEM;
+		goto prob_tbl_out_cpu_err;
+	}
+
 	av1_dec->prob_tbl_out.size = ALIGN(sizeof(struct av1cdfs), 2048);
 	av1_dec->cdfs = &av1_dec->default_cdfs;
 	av1_dec->cdfs_ndvc = &av1_dec->default_cdfs_ndvc;
@@ -420,11 +456,37 @@ int rockchip_vpu981_av1_dec_init(struct hantro_ctx *ctx)
 						   AV1_TILE_SIZE,
 						   &av1_dec->tile_buf.dma,
 						   GFP_KERNEL);
-	if (!av1_dec->tile_buf.cpu)
-		return -ENOMEM;
+	if (!av1_dec->tile_buf.cpu) {
+		ret = -ENOMEM;
+		goto tile_buf_cpu_err;
+	}
+
 	av1_dec->tile_buf.size = AV1_TILE_SIZE;
 
-	return 0;
+	return ret;
+
+tile_buf_cpu_err:
+	dma_free_coherent(vpu->dev, av1_dec->prob_tbl_out.size,
+			  av1_dec->prob_tbl_out.cpu,
+			  av1_dec->prob_tbl_out.dma);
+prob_tbl_out_cpu_err:
+	dma_free_coherent(vpu->dev, av1_dec->prob_tbl.size,
+			  av1_dec->prob_tbl.cpu,
+			  av1_dec->prob_tbl.dma);
+prob_tbl_cpu_err:
+	dma_free_coherent(vpu->dev, av1_dec->film_grain.size,
+			  av1_dec->film_grain.cpu,
+			  av1_dec->film_grain.dma);
+film_grain_cpu_err:
+	dma_free_coherent(vpu->dev, av1_dec->tile_info.size,
+			  av1_dec->tile_info.cpu,
+			  av1_dec->tile_info.dma);
+tile_info_cpu_err:
+	dma_free_coherent(vpu->dev, av1_dec->global_model.size,
+			  av1_dec->global_model.cpu,
+			  av1_dec->global_model.dma);
+global_model_cpu_err:
+	return ret;
 }
 
 static int rockchip_vpu981_av1_dec_prepare_run(struct hantro_ctx *ctx)
@@ -2175,13 +2237,11 @@ int rockchip_vpu981_av1_dec_run(struct hantro_ctx *ctx)
 
 	ret = rockchip_vpu981_av1_dec_prepare_run(ctx);
 	if (ret)
-		goto prepare_error;
+		return ret;
 
 	vb2_src = hantro_get_src_buf(ctx);
-	if (!vb2_src) {
-		ret = -EINVAL;
-		goto prepare_error;
-	}
+	if (!vb2_src)
+		return -EINVAL;
 
 	rockchip_vpu981_av1_dec_clean_refs(ctx);
 	rockchip_vpu981_av1_dec_frame_ref(ctx, vb2_src->vb2_buf.timestamp);
@@ -2229,11 +2289,6 @@ int rockchip_vpu981_av1_dec_run(struct hantro_ctx *ctx)
 	hantro_reg_write(vpu, &av1_dec_e, 1);
 
 	return 0;
-
-prepare_error:
-	hantro_end_prepare_run(ctx);
-	hantro_irq_done(vpu, VB2_BUF_STATE_ERROR);
-	return ret;
 }
 
 static void rockchip_vpu981_postproc_enable(struct hantro_ctx *ctx)

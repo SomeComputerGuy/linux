@@ -7,6 +7,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/bitfield.h>
 #include <linux/delay.h>
+#include <linux/iopoll.h>
 #include <linux/printk.h>
 
 #include <media/v4l2-common.h>
@@ -261,52 +262,89 @@ static void rga3_cmd_set_wr_format(struct rga_ctx *ctx)
 
 static void rga3_hw_setup_cmdbuf(struct rga_ctx *ctx)
 {
-	memset(ctx->cmdbuf_virt, 0, RGA3_CMDBUF_SIZE);
-
 	rga3_cmd_set_win0_format(ctx);
 	rga3_cmd_set_trans_info(ctx);
 	rga3_cmd_set_wr_format(ctx);
 }
 
-static void rga3_hw_start(struct rockchip_rga *rga,
+static void rga3_hw_start(struct rga_core *core,
 			  struct rga_vb_buffer *src, struct rga_vb_buffer *dst)
 {
-	struct rga_ctx *ctx = rga->curr;
+	struct rga_ctx *ctx = core->curr;
 
 	rga3_cmd_set_win0_addr(ctx, &src->dma_addrs);
 	rga3_cmd_set_wr_addr(ctx, &dst->dma_addrs);
 
-	rga_write(rga, RGA3_CMD_ADDR, ctx->cmdbuf_phy);
+	rga_write(core, RGA3_CMD_ADDR, ctx->cmdbuf_phy);
 
 	/* sync CMD buf for RGA */
-	dma_sync_single_for_device(rga->dev, ctx->cmdbuf_phy,
+	dma_sync_single_for_device(core->rga->cores[0]->dev, ctx->cmdbuf_phy,
 				   PAGE_SIZE, DMA_BIDIRECTIONAL);
 
 	/* set to master mode and start the conversion */
-	rga_write(rga, RGA3_SYS_CTRL,
+	rga_write(core, RGA3_SYS_CTRL,
 		  FIELD_PREP(RGA3_CMD_MODE, RGA3_CMD_MODE_MASTER));
-	rga_write(rga, RGA3_INT_EN, FIELD_PREP(RGA3_INT_FRM_DONE, 1));
-	rga_write(rga, RGA3_CMD_CTRL,
+	rga_write(core, RGA3_INT_EN, RGA3_INT_FRM_DONE | RGA3_INT_ERRORS);
+	rga_write(core, RGA3_CMD_CTRL,
 		  FIELD_PREP(RGA3_CMD_LINE_START_PULSE, 1));
 }
 
-static bool rga3_handle_irq(struct rockchip_rga *rga)
+static enum rga_irq_status rga3_handle_irq(struct rga_core *core)
 {
-	u32 intr;
+	u32 raw, intr;
 
-	intr = rga_read(rga, RGA3_INT_RAW);
+	/*
+	 * The interrupt line is shared with the IOMMU of the core, and
+	 * INT_RAW also has status bits that don't raise an interrupt.
+	 */
+	raw = rga_read(core, RGA3_INT_RAW);
+	intr = raw & rga_read(core, RGA3_INT_EN);
+	if (!intr)
+		return RGA_IRQ_NONE;
+
 	/* clear all interrupts */
-	rga_write(rga, RGA3_INT_CLR, intr);
+	rga_write(core, RGA3_INT_CLR, raw);
 
-	return FIELD_GET(RGA3_INT_FRM_DONE, intr);
+	if (intr & RGA3_INT_ERRORS) {
+		/* stay quiet until the reset, the next job enables them again */
+		rga_write(core, RGA3_INT_EN, 0);
+		dev_err(core->dev, "error interrupt, INT_RAW 0x%08x STATUS0 0x%08x CMD_STATE 0x%08x\n",
+			raw, rga_read(core, RGA3_STATUS0),
+			rga_read(core, RGA3_CMD_STATE));
+		return RGA_IRQ_ERROR;
+	}
+
+	return FIELD_GET(RGA3_INT_FRM_DONE, intr) ? RGA_IRQ_DONE : RGA_IRQ_BUSY;
 }
 
-static void rga3_get_version(struct rockchip_rga *rga)
+/*
+ * A job that failed can leave the core busy on the bus, for instance when its
+ * IOMMU reported a page fault and it went on with the frame. The soft reset
+ * of the core lets its AXI master finish the outstanding transactions, which
+ * pulsing its reset lines alone doesn't: the next job could then hang.
+ */
+static void rga3_soft_reset(struct rga_core *core)
 {
-	u32 version = rga_read(rga, RGA3_VERSION_NUM);
+	u32 val;
+	int ret;
 
-	rga->version.major = FIELD_GET(RGA3_VERSION_NUM_MAJOR, version);
-	rga->version.minor = FIELD_GET(RGA3_VERSION_NUM_MINOR, version);
+	rga_write(core, RGA3_SYS_CTRL, RGA3_CCLK_SRESET | RGA3_ACLK_SRESET);
+	ret = readl_poll_timeout(core->regs + RGA3_RO_SRST, val,
+				 val & RGA3_RO_SRST_DONE,
+				 1, RGA3_RESET_TIMEOUT);
+	rga_write(core, RGA3_SYS_CTRL, 0);
+	if (ret)
+		dev_warn(core->dev, "soft reset timed out, RO_SRST 0x%08x\n", val);
+}
+
+static struct rockchip_rga_version rga3_get_version(struct rga_core *core)
+{
+	u32 version = rga_read(core, RGA3_VERSION_NUM);
+
+	return (struct rockchip_rga_version) {
+		.major = FIELD_GET(RGA3_VERSION_NUM_MAJOR, version),
+		.minor = FIELD_GET(RGA3_VERSION_NUM_MINOR, version),
+	};
 }
 
 static struct rga3_fmt rga3_formats[] = {
@@ -505,6 +543,7 @@ const struct rga_hw rga3_hw = {
 	.setup_cmdbuf = rga3_hw_setup_cmdbuf,
 	.start = rga3_hw_start,
 	.handle_irq = rga3_handle_irq,
+	.reset = rga3_soft_reset,
 	.get_version = rga3_get_version,
 	.enum_format = rga3_enum_format,
 	.adjust_and_map_format = rga3_adjust_and_map_format,

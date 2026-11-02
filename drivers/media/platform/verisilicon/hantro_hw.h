@@ -12,6 +12,7 @@
 #include <linux/interrupt.h>
 #include <linux/v4l2-controls.h>
 #include <media/v4l2-ctrls.h>
+#include <media/v4l2-h264-enc.h>
 #include <media/v4l2-vp9.h>
 #include <media/videobuf2-core.h>
 
@@ -67,6 +68,25 @@ struct hantro_aux_buf {
 	dma_addr_t dma;
 	size_t size;
 	unsigned long attrs;
+};
+
+/* Number of registers programmed for an H.264 encode on the VEPU2. */
+#define ROCKCHIP_VPU2_H264_ENC_NUM_REGS		184
+
+/**
+ * struct hantro_h264_enc_hw_ctx - Per context data specific to H264 encoding.
+ * @enc:		H.264 stateless encode core state.
+ * @cabac_tbl:		CABAC context initialization tables, one per
+ *			cabac_init_idc value.
+ * @strm_offset:	Offset of the hardware stream in the destination
+ *			buffer, aligned down to 8 bytes.
+ * @regs:		Registers of the encode run being prepared.
+ */
+struct hantro_h264_enc_hw_ctx {
+	struct v4l2_h264_enc enc;
+	struct hantro_aux_buf cabac_tbl;
+	unsigned int strm_offset;
+	u32 regs[ROCKCHIP_VPU2_H264_ENC_NUM_REGS];
 };
 
 /* Max. number of entries in the DPB (HW limitation). */
@@ -171,9 +191,14 @@ struct hantro_hevc_dec_hw_ctx {
  * struct hantro_mpeg2_dec_hw_ctx
  *
  * @qtable:		Quantization table
+ * @field_ts:		OUTPUT timestamp of the last field picture decoded, if it
+ *			was the first field of a frame
+ * @field_structure:	picture_structure of that field, 0 if there is none
  */
 struct hantro_mpeg2_dec_hw_ctx {
 	struct hantro_aux_buf qtable;
+	u64 field_ts;
+	u8 field_structure;
 };
 
 /**
@@ -375,7 +400,11 @@ struct hantro_postproc_ops {
  * @run:	Start single {en,de)coding job. Called from atomic context
  *		to indicate that a pair of buffers is ready and the hardware
  *		should be programmed and started. Returns zero if OK, a
- *		negative value in error cases.
+ *		negative value in error cases. On error, the hardware must
+ *		not have been started, and neither hantro_end_prepare_run()
+ *		nor hantro_irq_done() must have been called: the core then
+ *		completes the request controls, releases the clocks and the
+ *		runtime PM reference, and finishes the job with an error.
  * @done:	Read back processing results and additional data from hardware.
  * @reset:	Reset the hardware in case of a timeout.
  */
@@ -414,6 +443,8 @@ extern const struct hantro_variant rk3328_vpu_variant;
 extern const struct hantro_variant rk3399_vpu_variant;
 extern const struct hantro_variant rk3568_vepu_variant;
 extern const struct hantro_variant rk3568_vpu_variant;
+extern const struct hantro_variant rk3588_vpu121_variant;
+extern const struct hantro_variant rk3588_vepu121_variant;
 extern const struct hantro_variant rk3588_vpu981_variant;
 extern const struct hantro_variant sama5d4_vdec_variant;
 extern const struct hantro_variant sunxi_vpu_variant;
@@ -440,6 +471,11 @@ int rockchip_vpu2_jpeg_enc_run(struct hantro_ctx *ctx);
 void hantro_h1_jpeg_enc_done(struct hantro_ctx *ctx);
 void rockchip_vpu2_jpeg_enc_done(struct hantro_ctx *ctx);
 
+int rockchip_vpu2_h264_enc_init(struct hantro_ctx *ctx);
+void rockchip_vpu2_h264_enc_exit(struct hantro_ctx *ctx);
+int rockchip_vpu2_h264_enc_run(struct hantro_ctx *ctx);
+void rockchip_vpu2_h264_enc_done(struct hantro_ctx *ctx);
+
 dma_addr_t hantro_h264_get_ref_buf(struct hantro_ctx *ctx,
 				   unsigned int dpb_idx);
 u16 hantro_h264_get_ref_nbr(struct hantro_ctx *ctx,
@@ -447,6 +483,15 @@ u16 hantro_h264_get_ref_nbr(struct hantro_ctx *ctx,
 int hantro_h264_dec_prepare_run(struct hantro_ctx *ctx);
 int rockchip_vpu2_h264_dec_run(struct hantro_ctx *ctx);
 int hantro_g1_h264_dec_run(struct hantro_ctx *ctx);
+/*
+ * H.264 CABAC context initialization values (m, n) as signed bytes, packed
+ * two pairs per word with the first one in the most significant half: the
+ * 460 contexts of I slices, then those of P and B slices for each of the
+ * three cabac_init_idc values.
+ */
+#define HANTRO_H264_CABAC_TABLE_SIZE	(460 * 2)
+extern const u32 hantro_h264_cabac_table[HANTRO_H264_CABAC_TABLE_SIZE];
+
 int hantro_h264_dec_init(struct hantro_ctx *ctx);
 void hantro_h264_dec_exit(struct hantro_ctx *ctx);
 
@@ -567,6 +612,9 @@ int hantro_g1_mpeg2_dec_run(struct hantro_ctx *ctx);
 int rockchip_vpu2_mpeg2_dec_run(struct hantro_ctx *ctx);
 void hantro_mpeg2_dec_copy_qtable(u8 *qtable,
 				  const struct v4l2_ctrl_mpeg2_quantisation *ctrl);
+bool hantro_mpeg2_dec_second_field(struct hantro_ctx *ctx,
+				   const struct v4l2_ctrl_mpeg2_picture *pic,
+				   u64 timestamp);
 int hantro_mpeg2_dec_init(struct hantro_ctx *ctx);
 void hantro_mpeg2_dec_exit(struct hantro_ctx *ctx);
 

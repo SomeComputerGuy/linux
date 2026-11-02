@@ -558,18 +558,21 @@ static const struct vop2_video_port_data rk3568_vop_video_ports[] = {
 		.gamma_lut_len = 1024,
 		.cubic_lut_len = 9 * 9 * 9,
 		.max_output = { 4096, 2304 },
+		.max_pixel_clock_rate = 600000000U,
 		.pre_scan_max_dly = { 69, 53, 53, 42 },
 		.offset = 0xc00,
 	}, {
 		.id = 1,
 		.gamma_lut_len = 1024,
 		.max_output = { 2048, 1536 },
+		.max_pixel_clock_rate = 200000000U,
 		.pre_scan_max_dly = { 40, 40, 40, 40 },
 		.offset = 0xd00,
 	}, {
 		.id = 2,
 		.gamma_lut_len = 1024,
 		.max_output = { 1920, 1080 },
+		.max_pixel_clock_rate = 150000000U,
 		.pre_scan_max_dly = { 40, 40, 40, 40 },
 		.offset = 0xe00,
 	},
@@ -774,6 +777,7 @@ static const struct vop2_video_port_data rk3576_vop_video_ports[] = {
 		.gamma_lut_len = 1024,
 		.cubic_lut_len = 9 * 9 * 9, /* 9x9x9 */
 		.max_output = { 4096, 2304 },
+		.max_pixel_clock_rate = 600000000U * 2,
 		/* win layer_mix hdr  */
 		.pre_scan_max_dly = { 10, 8, 2, 0 },
 		.offset = 0xc00,
@@ -784,6 +788,7 @@ static const struct vop2_video_port_data rk3576_vop_video_ports[] = {
 		.gamma_lut_len = 1024,
 		.cubic_lut_len = 729, /* 9x9x9 */
 		.max_output = { 2560, 1600 },
+		.max_pixel_clock_rate = 300000000U,
 		/* win layer_mix hdr  */
 		.pre_scan_max_dly = { 10, 6, 0, 0 },
 		.offset = 0xd00,
@@ -792,6 +797,7 @@ static const struct vop2_video_port_data rk3576_vop_video_ports[] = {
 		.id = 2,
 		.gamma_lut_len = 1024,
 		.max_output = { 1920, 1080 },
+		.max_pixel_clock_rate = 150000000U,
 		/* win layer_mix hdr  */
 		.pre_scan_max_dly = { 10, 6, 0, 0 },
 		.offset = 0xe00,
@@ -1060,6 +1066,7 @@ static const struct vop2_video_port_data rk3588_vop_video_ports[] = {
 		.gamma_lut_len = 1024,
 		.cubic_lut_len = 9 * 9 * 9, /* 9x9x9 */
 		.max_output = { 4096, 2304 },
+		.max_pixel_clock_rate = 600000000U * 4,
 		/* hdr2sdr sdr2hdr hdr2hdr sdr2sdr */
 		.pre_scan_max_dly = { 76, 65, 65, 54 },
 		.offset = 0xc00,
@@ -1069,6 +1076,7 @@ static const struct vop2_video_port_data rk3588_vop_video_ports[] = {
 		.gamma_lut_len = 1024,
 		.cubic_lut_len = 729, /* 9x9x9 */
 		.max_output = { 4096, 2304 },
+		.max_pixel_clock_rate = 600000000U * 4,
 		.pre_scan_max_dly = { 76, 65, 65, 54 },
 		.offset = 0xd00,
 	}, {
@@ -1077,12 +1085,14 @@ static const struct vop2_video_port_data rk3588_vop_video_ports[] = {
 		.gamma_lut_len = 1024,
 		.cubic_lut_len = 17 * 17 * 17, /* 17x17x17 */
 		.max_output = { 4096, 2304 },
+		.max_pixel_clock_rate = 600000000U * 4,
 		.pre_scan_max_dly = { 52, 52, 52, 52 },
 		.offset = 0xe00,
 	}, {
 		.id = 3,
 		.gamma_lut_len = 1024,
 		.max_output = { 2048, 1536 },
+		.max_pixel_clock_rate = 150000000U,
 		.pre_scan_max_dly = { 52, 52, 52, 52 },
 		.offset = 0xf00,
 	},
@@ -1564,13 +1574,13 @@ static unsigned long rk3588_calc_dclk(unsigned long child_clk, unsigned long max
  * DSI: mipi_pixclk <= dclk_out <= dclk_core
  */
 static unsigned long rk3588_calc_cru_cfg(struct vop2_video_port *vp, int id,
+					 const struct drm_crtc_state *crtc_state,
 					 int *dclk_core_div, int *dclk_out_div,
 					 int *if_pixclk_div, int *if_dclk_div)
 {
 	struct vop2 *vop2 = vp->vop2;
-	struct drm_crtc *crtc = &vp->crtc;
-	struct drm_display_mode *adjusted_mode = &crtc->state->adjusted_mode;
-	struct rockchip_crtc_state *vcstate = to_rockchip_crtc_state(crtc->state);
+	const struct drm_display_mode *adjusted_mode = &crtc_state->adjusted_mode;
+	struct rockchip_crtc_state *vcstate = to_rockchip_crtc_state(crtc_state);
 	int output_mode = vcstate->output_mode;
 	unsigned long v_pixclk = adjusted_mode->crtc_clock * 1000LL; /* video timing pixclk */
 	unsigned long dclk_core_rate = v_pixclk >> 2;
@@ -1578,6 +1588,15 @@ static unsigned long rk3588_calc_cru_cfg(struct vop2_video_port *vp, int id,
 	unsigned long dclk_out_rate;
 	unsigned long if_pixclk_rate;
 	int K = 1;
+
+	/*
+	 * Not every interface uses every divider: dclk_out only feeds DP and
+	 * MIPI, the interface dividers are unused for DP. Start from 1 so that
+	 * no divider is left uninitialised when its value is converted below.
+	 */
+	*dclk_out_div = 1;
+	*if_pixclk_div = 1;
+	*if_dclk_div = 1;
 
 	if (vop2_output_if_is_hdmi(id)) {
 		/*
@@ -1648,6 +1667,9 @@ static unsigned long rk3588_calc_cru_cfg(struct vop2_video_port *vp, int id,
 	}
 
 	*dclk_core_div = dclk_rate / dclk_core_rate;
+	/* An unused dclk_out must not run faster than dclk_core */
+	if (!vop2_output_if_is_dp(id) && !vop2_output_if_is_mipi(id))
+		*dclk_out_div = *dclk_core_div;
 	*if_pixclk_div = ilog2(*if_pixclk_div);
 	*if_dclk_div = ilog2(*if_dclk_div);
 	*dclk_core_div = ilog2(*dclk_core_div);
@@ -1665,6 +1687,15 @@ static unsigned long rk3588_calc_cru_cfg(struct vop2_video_port *vp, int id,
  * 1: Video Port3
  * 3: Video Port 1(MIPI1 only)
  */
+static unsigned long rk3588_dclk_rate(struct vop2_video_port *vp, int id,
+				      const struct drm_crtc_state *crtc_state)
+{
+	int dclk_core_div, dclk_out_div, if_pixclk_div, if_dclk_div;
+
+	return rk3588_calc_cru_cfg(vp, id, crtc_state, &dclk_core_div,
+				   &dclk_out_div, &if_pixclk_div, &if_dclk_div);
+}
+
 static u32 rk3588_get_mipi_port_mux(int vp_id)
 {
 	if (vp_id == 1)
@@ -1675,12 +1706,16 @@ static u32 rk3588_get_mipi_port_mux(int vp_id)
 		return 0;
 }
 
-static u32 rk3588_get_hdmi_pol(u32 flags)
+/*
+ * The HDMI sync polarity bits in GRF_VO1_CON0 are set for an active low
+ * (negative) sync.
+ */
+static u32 rk3588_get_hdmi_pol(u32 polflags)
 {
 	u32 val;
 
-	val = (flags & DRM_MODE_FLAG_NHSYNC) ? BIT(HSYNC_POSITIVE) : 0;
-	val |= (flags & DRM_MODE_FLAG_NVSYNC) ? BIT(VSYNC_POSITIVE) : 0;
+	val = (polflags & BIT(HSYNC_POSITIVE)) ? 0 : BIT(HSYNC_POSITIVE);
+	val |= (polflags & BIT(VSYNC_POSITIVE)) ? 0 : BIT(VSYNC_POSITIVE);
 
 	return val;
 }
@@ -1692,8 +1727,8 @@ static unsigned long rk3588_set_intf_mux(struct vop2_video_port *vp, int id, u32
 	unsigned long clock;
 	u32 die, dip, div, vp_clk_div, val;
 
-	clock = rk3588_calc_cru_cfg(vp, id, &dclk_core_div, &dclk_out_div,
-				    &if_pixclk_div, &if_dclk_div);
+	clock = rk3588_calc_cru_cfg(vp, id, vp->crtc.state, &dclk_core_div,
+				    &dclk_out_div, &if_pixclk_div, &if_dclk_div);
 	if (!clock)
 		return 0;
 
@@ -2497,6 +2532,7 @@ static const struct vop2_ops rk3576_vop_ops = {
 
 static const struct vop2_ops rk3588_vop_ops = {
 	.setup_intf_mux = rk3588_set_intf_mux,
+	.dclk_rate = rk3588_dclk_rate,
 	.setup_bg_dly = rk3568_vop2_setup_bg_dly,
 	.setup_overlay = rk3568_vop2_setup_overlay,
 };
@@ -2561,7 +2597,8 @@ static const struct vop2_data rk3576_vop = {
 static const struct vop2_data rk3588_vop = {
 	.version = VOP_VERSION_RK3588,
 	.feature = VOP2_FEATURE_HAS_SYS_GRF | VOP2_FEATURE_HAS_VO1_GRF |
-		   VOP2_FEATURE_HAS_VOP_GRF | VOP2_FEATURE_HAS_SYS_PMU,
+		   VOP2_FEATURE_HAS_VOP_GRF | VOP2_FEATURE_HAS_SYS_PMU |
+		   VOP2_FEATURE_AXI_BALANCE,
 	.nr_vps = 4,
 	.max_input = { 4096, 4320 },
 	.max_output = { 4096, 4320 },

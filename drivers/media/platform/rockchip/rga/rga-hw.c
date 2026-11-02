@@ -158,7 +158,6 @@ static void rga_cmd_set_dst_addr(struct rga_ctx *ctx, dma_addr_t dma_addr)
 
 static void rga_cmd_set_trans_info(struct rga_ctx *ctx)
 {
-	struct rockchip_rga *rga = ctx->rga;
 	u32 *dest = ctx->cmdbuf_virt;
 	unsigned int scale_dst_w, scale_dst_h;
 	unsigned int src_h, src_w, dst_h, dst_w;
@@ -251,13 +250,6 @@ static void rga_cmd_set_trans_info(struct rga_ctx *ctx)
 	 */
 	if (src_info.data.rot_mode == RGA_SRC_ROT_MODE_90_DEGREE ||
 	    src_info.data.rot_mode == RGA_SRC_ROT_MODE_270_DEGREE) {
-		if (rga->version.major == 0 || rga->version.minor == 0) {
-			if (dst_w == src_h)
-				src_h -= 8;
-			if (abs(src_w - dst_h) < 16)
-				src_w -= 16;
-		}
-
 		scale_dst_h = dst_w;
 		scale_dst_w = dst_h;
 	} else {
@@ -417,10 +409,10 @@ static void rga_cmd_set_mode(struct rga_ctx *ctx)
 	dest[(RGA_MODE_CTRL - RGA_MODE_BASE_REG) >> 2] = mode.val;
 }
 
-static void rga_cmd_set(struct rga_ctx *ctx,
+static void rga_cmd_set(struct rga_core *core,
 			struct rga_vb_buffer *src, struct rga_vb_buffer *dst)
 {
-	struct rockchip_rga *rga = ctx->rga;
+	struct rga_ctx *ctx = core->curr;
 
 	rga_cmd_set_src_addr(ctx, src->dma_desc_pa);
 	/*
@@ -434,52 +426,54 @@ static void rga_cmd_set(struct rga_ctx *ctx,
 	rga_cmd_set_src_info(ctx, &src->dma_addrs);
 	rga_cmd_set_dst_info(ctx, &dst->dma_addrs);
 
-	rga_write(rga, RGA_CMD_BASE, ctx->cmdbuf_phy);
+	rga_write(core, RGA_CMD_BASE, ctx->cmdbuf_phy);
 
 	/* sync CMD buf for RGA */
-	dma_sync_single_for_device(rga->dev, ctx->cmdbuf_phy,
+	dma_sync_single_for_device(core->rga->cores[0]->dev, ctx->cmdbuf_phy,
 				   PAGE_SIZE, DMA_BIDIRECTIONAL);
 }
 
 static void rga_hw_setup_cmdbuf(struct rga_ctx *ctx)
 {
-	memset(ctx->cmdbuf_virt, 0, RGA_CMDBUF_SIZE);
-
 	rga_cmd_set_mode(ctx);
 	rga_cmd_set_trans_info(ctx);
 }
 
-static void rga_hw_start(struct rockchip_rga *rga,
+static void rga_hw_start(struct rga_core *core,
 			 struct rga_vb_buffer *src,  struct rga_vb_buffer *dst)
 {
-	struct rga_ctx *ctx = rga->curr;
+	rga_cmd_set(core, src, dst);
 
-	rga_cmd_set(ctx, src, dst);
+	rga_write(core, RGA_SYS_CTRL, 0x00);
 
-	rga_write(rga, RGA_SYS_CTRL, 0x00);
+	rga_write(core, RGA_SYS_CTRL, 0x22);
 
-	rga_write(rga, RGA_SYS_CTRL, 0x22);
+	rga_write(core, RGA_INT, 0x600);
 
-	rga_write(rga, RGA_INT, 0x600);
-
-	rga_write(rga, RGA_CMD_CTRL, 0x1);
+	rga_write(core, RGA_CMD_CTRL, 0x1);
 }
 
-static bool rga_handle_irq(struct rockchip_rga *rga)
+static enum rga_irq_status rga_handle_irq(struct rga_core *core)
 {
 	int intr;
 
-	intr = rga_read(rga, RGA_INT) & 0xf;
+	intr = rga_read(core, RGA_INT) & 0xf;
+	if (!intr)
+		return RGA_IRQ_NONE;
 
-	rga_mod(rga, RGA_INT, intr << 4, 0xf << 4);
+	rga_mod(core, RGA_INT, intr << 4, 0xf << 4);
 
-	return intr & RGA_INT_COMMAND_FINISHED;
+	return intr & RGA_INT_COMMAND_FINISHED ? RGA_IRQ_DONE : RGA_IRQ_BUSY;
 }
 
-static void rga_get_version(struct rockchip_rga *rga)
+static struct rockchip_rga_version rga_get_version(struct rga_core *core)
 {
-	rga->version.major = (rga_read(rga, RGA_VERSION_INFO) >> 24) & 0xFF;
-	rga->version.minor = (rga_read(rga, RGA_VERSION_INFO) >> 20) & 0x0F;
+	u32 version = rga_read(core, RGA_VERSION_INFO);
+
+	return (struct rockchip_rga_version) {
+		.major = (version >> 24) & 0xFF,
+		.minor = (version >> 20) & 0x0F,
+	};
 }
 
 static struct rga_fmt formats[] = {

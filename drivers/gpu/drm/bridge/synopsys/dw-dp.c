@@ -23,17 +23,21 @@
 #include <drm/drm_bridge.h>
 #include <drm/drm_bridge_connector.h>
 #include <drm/display/drm_dp_helper.h>
+#include <drm/display/drm_hdmi_audio_helper.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_of.h>
 #include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_simple_kms_helper.h>
 
+#include <sound/hdmi-codec.h>
+
 #define DW_DP_VERSION_NUMBER			0x0000
 #define DW_DP_VERSION_TYPE			0x0004
 #define DW_DP_ID				0x0008
 
 #define DW_DP_CONFIG_REG1			0x0100
+#define AUDIO_SELECT				GENMASK(2, 1)
 #define DW_DP_CONFIG_REG2			0x0104
 #define DW_DP_CONFIG_REG3			0x0108
 
@@ -110,6 +114,10 @@
 #define HBR_MODE_ENABLE				BIT(10)
 #define AUDIO_DATA_WIDTH			GENMASK(9, 5)
 #define AUDIO_DATA_IN_EN			GENMASK(4, 1)
+#define AUDIO_DATA_IN_EN_CHANNEL12		BIT(0)
+#define AUDIO_DATA_IN_EN_CHANNEL34		BIT(1)
+#define AUDIO_DATA_IN_EN_CHANNEL56		BIT(2)
+#define AUDIO_DATA_IN_EN_CHANNEL78		BIT(3)
 #define AUDIO_INF_SELECT			BIT(0)
 
 #define DW_DP_SDP_VERTICAL_CTRL			0x0500
@@ -253,6 +261,8 @@
 
 #define SDP_REG_BANK_SIZE			16
 
+#define DW_DP_SDP_VERSION			0x12
+
 struct dw_dp_link_caps {
 	bool enhanced_framing;
 	bool tps3_supported;
@@ -277,14 +287,26 @@ struct dw_dp_link_train {
 
 struct dw_dp_link {
 	u8 dpcd[DP_RECEIVER_CAP_SIZE];
+	u8 downstream_ports[DP_MAX_DOWNSTREAM_PORTS];
 	unsigned char revision;
 	unsigned int rate;
 	unsigned int lanes;
+	bool enabled;
 	u8 sink_count;
 	u8 vsc_sdp_supported;
 	struct dw_dp_link_caps caps;
 	struct dw_dp_link_train train;
 	struct drm_dp_desc desc;
+};
+
+/* Limits of the downstream facing port of a branch device */
+struct dw_dp_dfp {
+	int max_bpc;
+	int max_dotclock;
+	int min_tmds_clock;
+	int max_tmds_clock;
+	bool tmds;
+	bool ycbcr_420_passthrough;
 };
 
 struct dw_dp_bridge_state {
@@ -305,6 +327,19 @@ struct dw_dp_hotplug {
 	bool long_hpd;
 };
 
+enum dw_dp_audio_interface_support {
+	DW_DP_AUDIO_I2S_ONLY = 0,
+	DW_DP_AUDIO_SPDIF_ONLY = 1,
+	DW_DP_AUDIO_I2S_AND_SPDIF = 2,
+	DW_DP_AUDIO_NONE = 3,
+};
+
+enum dw_dp_audio_interface {
+	DW_DP_AUDIO_I2S = 0,
+	DW_DP_AUDIO_SPDIF = 1,
+	DW_DP_AUDIO_UNUSED,
+};
+
 struct dw_dp {
 	struct drm_bridge bridge;
 	struct device *dev;
@@ -320,15 +355,33 @@ struct dw_dp {
 	int irq;
 	struct work_struct hpd_work;
 	struct dw_dp_hotplug hotplug;
+	enum dw_dp_audio_interface audio_interface;
+	int audio_channels;
+	int audio_channel_allocation;
+	int audio_sample_width;
+	bool audio_muted;
+	bool cec_registered;
+	int audio_sdp_nr;
 	/* Serialize hpd status access */
 	struct mutex irq_lock;
+	/* Serialize sdp_reg_bank access */
+	struct mutex sdp_lock;
+	/* Serialize audio state */
+	struct mutex audio_lock;
 
 	struct drm_dp_aux aux;
 
 	struct dw_dp_link link;
+	struct dw_dp_dfp dfp;
 	struct dw_dp_plat_data plat_data;
 	u8 pixel_mode;
+	bool usbc_mode;
+	bool usbc_hpd;
+	bool pm_active;
 
+	struct drm_bridge *next_bridge;
+
+	int vsc_sdp_nr;
 	DECLARE_BITMAP(sdp_reg_bank, SDP_REG_BANK_SIZE);
 };
 
@@ -471,6 +524,60 @@ static bool dw_dp_bandwidth_ok(struct dw_dp *dp,
 	return true;
 }
 
+static void dw_dp_update_dfp(struct dw_dp *dp, const struct drm_edid *drm_edid)
+{
+	const u8 *dpcd = dp->link.dpcd;
+	const u8 *port = dp->link.downstream_ports;
+	struct dw_dp_dfp *dfp = &dp->dfp;
+
+	dfp->max_bpc = drm_dp_downstream_max_bpc(dpcd, port, drm_edid);
+	dfp->max_dotclock = drm_dp_downstream_max_dotclock(dpcd, port);
+	dfp->min_tmds_clock = drm_dp_downstream_min_tmds_clock(dpcd, port, drm_edid);
+	dfp->max_tmds_clock = drm_dp_downstream_max_tmds_clock(dpcd, port, drm_edid);
+	dfp->tmds = drm_dp_downstream_is_tmds(dpcd, port, drm_edid);
+	dfp->ycbcr_420_passthrough = drm_dp_downstream_420_passthrough(dpcd, port);
+
+	dev_dbg(dp->dev, "DFP max bpc %d, max dotclock %d, TMDS clock %d-%d\n",
+		dfp->max_bpc, dfp->max_dotclock, dfp->min_tmds_clock,
+		dfp->max_tmds_clock);
+}
+
+/* YCbCr 4:2:0 needs the VSC SDP, and a TMDS converter must pass it through */
+static bool dw_dp_ycbcr_420_ok(struct dw_dp *dp)
+{
+	return dp->link.vsc_sdp_supported &&
+	       (!dp->dfp.tmds || dp->dfp.ycbcr_420_passthrough);
+}
+
+static bool dw_dp_dfp_tmds_clock_ok(struct dw_dp *dp, int clock, int bpc,
+				    enum drm_output_color_format color_format)
+{
+	const struct dw_dp_dfp *dfp = &dp->dfp;
+	int tmds_clock;
+
+	if (!dfp->tmds)
+		return true;
+
+	switch (color_format) {
+	case DRM_OUTPUT_COLOR_FORMAT_YCBCR422:
+		tmds_clock = clock;
+		break;
+	case DRM_OUTPUT_COLOR_FORMAT_YCBCR420:
+		tmds_clock = clock / 2 * bpc / 8;
+		break;
+	default:
+		tmds_clock = clock * bpc / 8;
+		break;
+	}
+
+	if (dfp->min_tmds_clock && tmds_clock < dfp->min_tmds_clock)
+		return false;
+	if (dfp->max_tmds_clock && tmds_clock > dfp->max_tmds_clock)
+		return false;
+
+	return true;
+}
+
 static bool dw_dp_hpd_detect(struct dw_dp *dp)
 {
 	u32 value;
@@ -499,6 +606,7 @@ static void dw_dp_link_reset(struct dw_dp_link *link)
 
 	dw_dp_link_caps_reset(&link->caps);
 	memset(link->dpcd, 0, sizeof(link->dpcd));
+	memset(link->downstream_ports, 0, sizeof(link->downstream_ports));
 }
 
 static int dw_dp_link_parse(struct dw_dp *dp, struct drm_connector *connector)
@@ -525,6 +633,11 @@ static int dw_dp_link_parse(struct dw_dp *dp, struct drm_connector *connector)
 		if (!link->sink_count)
 			return -ENODEV;
 	}
+
+	ret = drm_dp_read_downstream_info(&dp->aux, link->dpcd,
+					  link->downstream_ports);
+	if (ret < 0)
+		return ret;
 
 	link->vsc_sdp_supported = drm_dp_vsc_sdp_supported(&dp->aux, link->dpcd);
 
@@ -1042,11 +1155,13 @@ static int dw_dp_send_sdp(struct dw_dp *dp, struct dw_dp_sdp *sdp)
 	u32 reg;
 	int i, nr;
 
-	nr = find_first_zero_bit(dp->sdp_reg_bank, SDP_REG_BANK_SIZE);
-	if (nr < SDP_REG_BANK_SIZE)
-		set_bit(nr, dp->sdp_reg_bank);
-	else
-		return -EBUSY;
+	scoped_guard(mutex, &dp->sdp_lock) {
+		nr = find_first_zero_bit(dp->sdp_reg_bank, SDP_REG_BANK_SIZE);
+		if (nr < SDP_REG_BANK_SIZE)
+			set_bit(nr, dp->sdp_reg_bank);
+		else
+			return -EBUSY;
+	}
 
 	reg = DW_DP_SDP_REGISTER_BANK + nr * 9 * 4;
 
@@ -1059,16 +1174,26 @@ static int dw_dp_send_sdp(struct dw_dp *dp, struct dw_dp_sdp *sdp)
 			     FIELD_PREP(SDP_REGS, get_unaligned_le32(payload)));
 
 	if (sdp->flags & DW_DP_SDP_VERTICAL_INTERVAL)
-		regmap_update_bits(dp->regmap, DW_DP_SDP_VERTICAL_CTRL,
-				   EN_VERTICAL_SDP << nr,
-				   EN_VERTICAL_SDP << nr);
+		regmap_set_bits(dp->regmap, DW_DP_SDP_VERTICAL_CTRL,
+				EN_VERTICAL_SDP << nr);
 
 	if (sdp->flags & DW_DP_SDP_HORIZONTAL_INTERVAL)
-		regmap_update_bits(dp->regmap, DW_DP_SDP_HORIZONTAL_CTRL,
-				   EN_HORIZONTAL_SDP << nr,
-				   EN_HORIZONTAL_SDP << nr);
+		regmap_set_bits(dp->regmap, DW_DP_SDP_HORIZONTAL_CTRL,
+				EN_HORIZONTAL_SDP << nr);
 
-	return 0;
+	return nr;
+}
+
+static void dw_dp_clear_sdp(struct dw_dp *dp, int nr)
+{
+	regmap_clear_bits(dp->regmap, DW_DP_SDP_VERTICAL_CTRL,
+			  EN_VERTICAL_SDP << nr);
+
+	regmap_clear_bits(dp->regmap, DW_DP_SDP_HORIZONTAL_CTRL,
+			  EN_HORIZONTAL_SDP << nr);
+
+	scoped_guard(mutex, &dp->sdp_lock)
+		clear_bit(nr, dp->sdp_reg_bank);
 }
 
 static int dw_dp_send_vsc_sdp(struct dw_dp *dp)
@@ -1386,7 +1511,7 @@ static int dw_dp_video_enable(struct dw_dp *dp)
 			   FIELD_PREP(VIDEO_STREAM_ENABLE, 1));
 
 	if (dw_dp_video_need_vsc_sdp(dp))
-		dw_dp_send_vsc_sdp(dp);
+		dp->vsc_sdp_nr = dw_dp_send_vsc_sdp(dp);
 
 	return 0;
 }
@@ -1454,16 +1579,13 @@ static int dw_dp_aux_read_data(struct dw_dp *dp, u8 *buffer, size_t size)
 	return size;
 }
 
-static ssize_t dw_dp_aux_transfer(struct drm_dp_aux *aux,
-				  struct drm_dp_aux_msg *msg)
+static ssize_t dw_dp_aux_xfer(struct dw_dp *dp, struct drm_dp_aux_msg *msg)
 {
-	struct dw_dp *dp = container_of(aux, struct dw_dp, aux);
 	unsigned long timeout = msecs_to_jiffies(10);
 	u32 status, value;
 	ssize_t ret = 0;
 
-	if (WARN_ON(msg->size > 16))
-		return -E2BIG;
+	reinit_completion(&dp->complete);
 
 	switch (msg->request & ~DP_AUX_I2C_MOT) {
 	case DP_AUX_NATIVE_WRITE:
@@ -1491,6 +1613,12 @@ static ssize_t dw_dp_aux_transfer(struct drm_dp_aux *aux,
 	status = wait_for_completion_timeout(&dp->complete, timeout);
 	if (!status) {
 		dev_err(dp->dev, "timeout waiting for AUX reply\n");
+		regmap_update_bits(dp->regmap, DW_DP_SOFT_RESET_CTRL,
+				   AUX_RESET, FIELD_PREP(AUX_RESET, 1));
+		usleep_range(10, 20);
+		regmap_update_bits(dp->regmap, DW_DP_SOFT_RESET_CTRL,
+				   AUX_RESET, FIELD_PREP(AUX_RESET, 0));
+		synchronize_irq(dp->irq);
 		return -ETIMEDOUT;
 	}
 
@@ -1504,7 +1632,7 @@ static ssize_t dw_dp_aux_transfer(struct drm_dp_aux *aux,
 		if (msg->request & DP_AUX_I2C_READ) {
 			size_t count = FIELD_GET(AUX_BYTES_READ, value) - 1;
 
-			if (count != msg->size)
+			if (!count || count > msg->size)
 				return -EBUSY;
 
 			ret = dw_dp_aux_read_data(dp, msg->buffer, count);
@@ -1512,6 +1640,50 @@ static ssize_t dw_dp_aux_transfer(struct drm_dp_aux *aux,
 				return ret;
 		}
 	}
+
+	return ret;
+}
+
+static ssize_t dw_dp_aux_transfer(struct drm_dp_aux *aux,
+				  struct drm_dp_aux_msg *msg)
+{
+	struct dw_dp *dp = container_of(aux, struct dw_dp, aux);
+	ssize_t ret;
+
+	if (WARN_ON(msg->size > 16))
+		return -E2BIG;
+
+	PM_RUNTIME_ACQUIRE_AUTOSUSPEND(dp->dev, pm);
+	ret = PM_RUNTIME_ACQUIRE_ERR(&pm);
+	if (ret)
+		return ret;
+
+	/*
+	 * The controller does not run an AUX transaction while its HPD state
+	 * machine reports the sink as unplugged: there is no reply event and
+	 * the transfer would only end with the software timeout. A source
+	 * must not start AUX transactions while HPD is deasserted anyway, so
+	 * fail right away. This happens e.g. when a branch device drops HPD
+	 * while a short pulse is being handled, or while the state machine is
+	 * still debouncing HPD after the controller has been (re)initialized.
+	 */
+	if (!dw_dp_hpd_detect(dp))
+		return -ENXIO;
+
+	/*
+	 * The AUX channel goes through the PHY. An enabled link, detection
+	 * and EDID reads keep it powered, but the transfer can be called at
+	 * any other time too (short pulse handling, CEC-Tunneling-over-AUX,
+	 * the AUX character device), so power it up for the transfer. This
+	 * only takes a reference if it is powered already.
+	 */
+	ret = phy_power_on(dp->phy);
+	if (ret)
+		return ret;
+
+	ret = dw_dp_aux_xfer(dp, msg);
+
+	phy_power_off(dp->phy);
 
 	return ret;
 }
@@ -1528,6 +1700,7 @@ static int dw_dp_bridge_atomic_check(struct drm_bridge *bridge,
 				     struct drm_connector_state *conn_state)
 {
 	struct drm_display_mode *adjusted_mode = &crtc_state->adjusted_mode;
+	unsigned int out_bus_format = bridge_state->output_bus_cfg.format;
 	struct dw_dp *dp = bridge_to_dp(bridge);
 	struct dw_dp_bridge_state *state;
 	const struct dw_dp_output_format *fmt;
@@ -1538,7 +1711,10 @@ static int dw_dp_bridge_atomic_check(struct drm_bridge *bridge,
 	state = to_dw_dp_bridge_state(bridge_state);
 	mode = &state->mode;
 
-	fmt = dw_dp_get_output_format(bridge_state->output_bus_cfg.format);
+	if (out_bus_format == MEDIA_BUS_FMT_FIXED)
+		out_bus_format = bridge_state->input_bus_cfg.format;
+
+	fmt = dw_dp_get_output_format(out_bus_format);
 	if (!fmt)
 		return -EINVAL;
 
@@ -1574,10 +1750,19 @@ static enum drm_mode_status dw_dp_bridge_mode_valid(struct drm_bridge *bridge,
 	struct dw_dp *dp = bridge_to_dp(bridge);
 	struct dw_dp_link *link = &dp->link;
 	u32 min_bpp;
+	bool ycbcr_420 = info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR420) &&
+			 dw_dp_ycbcr_420_ok(dp) &&
+			 (drm_mode_is_420_only(info, mode) || drm_mode_is_420_also(info, mode));
 
-	if (info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR420) &&
-	    link->vsc_sdp_supported &&
-	    (drm_mode_is_420_only(info, mode) || drm_mode_is_420_also(info, mode)))
+	if (dp->dfp.max_dotclock && mode->clock > dp->dfp.max_dotclock)
+		return MODE_CLOCK_HIGH;
+
+	if (!dw_dp_dfp_tmds_clock_ok(dp, mode->clock, 8,
+				     ycbcr_420 ? DRM_OUTPUT_COLOR_FORMAT_YCBCR420 :
+						 DRM_OUTPUT_COLOR_FORMAT_RGB444))
+		return MODE_CLOCK_RANGE;
+
+	if (ycbcr_420)
 		min_bpp = 12;
 	else if (info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR422))
 		min_bpp = 16;
@@ -1586,8 +1771,7 @@ static enum drm_mode_status dw_dp_bridge_mode_valid(struct drm_bridge *bridge,
 	else
 		min_bpp = 24;
 
-	if (!link->vsc_sdp_supported &&
-	    drm_mode_is_420_only(info, mode))
+	if (!dw_dp_ycbcr_420_ok(dp) && drm_mode_is_420_only(info, mode))
 		return MODE_NO_420;
 
 	if (!dw_dp_bandwidth_ok(dp, mode, min_bpp, link->lanes, link->rate))
@@ -1601,7 +1785,12 @@ static bool dw_dp_needs_link_retrain(struct dw_dp *dp)
 	struct dw_dp_link *link = &dp->link;
 	u8 link_status[DP_LINK_STATUS_SIZE];
 
-	if (!dw_dp_link_train_valid(&link->train))
+	/*
+	 * Check the link whenever it is enabled, not only after a successful
+	 * training: a retrain attempted while the sink was not ready clears
+	 * the training state, and a later IRQ_HPD must still retry.
+	 */
+	if (!link->enabled)
 		return false;
 
 	if (drm_dp_dpcd_read_link_status(&dp->aux, link_status) < 0)
@@ -1615,6 +1804,9 @@ static void dw_dp_link_disable(struct dw_dp *dp)
 {
 	struct dw_dp_link *link = &dp->link;
 
+	if (!link->enabled)
+		return;
+
 	if (dw_dp_hpd_detect(dp))
 		drm_dp_link_power_down(&dp->aux, dp->link.revision);
 
@@ -1624,6 +1816,7 @@ static void dw_dp_link_disable(struct dw_dp *dp)
 
 	link->train.clock_recovered = false;
 	link->train.channel_equalized = false;
+	link->enabled = false;
 }
 
 static int dw_dp_link_enable(struct dw_dp *dp)
@@ -1636,11 +1829,312 @@ static int dw_dp_link_enable(struct dw_dp *dp)
 
 	ret = drm_dp_link_power_up(&dp->aux, dp->link.revision);
 	if (ret < 0)
-		return ret;
+		goto err_phy_power_off;
 
 	ret = dw_dp_link_train(dp);
+	if (ret < 0)
+		goto err_link_power_down;
 
+	dp->link.enabled = true;
+
+	return 0;
+
+err_link_power_down:
+	drm_dp_link_power_down(&dp->aux, dp->link.revision);
+	dw_dp_phy_xmit_enable(dp, 0);
+
+err_phy_power_off:
+	phy_power_off(dp->phy);
 	return ret;
+}
+
+static int dw_dp_audio_infoframe_send(struct dw_dp *dp)
+{
+	struct hdmi_audio_infoframe frame;
+	struct dw_dp_sdp sdp;
+	int ret;
+
+	ret = hdmi_audio_infoframe_init(&frame);
+	if (ret < 0)
+		return ret;
+
+	frame.coding_type = HDMI_AUDIO_CODING_TYPE_STREAM;
+	frame.sample_frequency = HDMI_AUDIO_SAMPLE_FREQUENCY_STREAM;
+	frame.sample_size = HDMI_AUDIO_SAMPLE_SIZE_STREAM;
+	frame.channels = dp->audio_channels;
+	frame.channel_allocation = dp->audio_channel_allocation;
+
+	ret = hdmi_audio_infoframe_pack_for_dp(&frame, &sdp.base, DW_DP_SDP_VERSION);
+	if (ret < 0)
+		return ret;
+
+	sdp.flags = DW_DP_SDP_VERTICAL_INTERVAL;
+
+	return dw_dp_send_sdp(dp, &sdp);
+}
+
+static void dw_dp_audio_infoframe_clear(struct dw_dp *dp)
+{
+	if (dp->audio_sdp_nr >= 0) {
+		dw_dp_clear_sdp(dp, dp->audio_sdp_nr);
+		dp->audio_sdp_nr = -1;
+	}
+
+	regmap_clear_bits(dp->regmap, DW_DP_SDP_VERTICAL_CTRL,
+			  EN_AUDIO_STREAM_SDP | EN_AUDIO_TIMESTAMP_SDP);
+	regmap_clear_bits(dp->regmap, DW_DP_SDP_HORIZONTAL_CTRL,
+			  EN_AUDIO_STREAM_SDP);
+
+	regmap_clear_bits(dp->regmap, DW_DP_AUD_CONFIG1, AUDIO_DATA_IN_EN);
+}
+
+static void __dw_dp_audio_disable(struct dw_dp *dp)
+{
+	dw_dp_audio_infoframe_clear(dp);
+
+	if (dp->audio_interface == DW_DP_AUDIO_SPDIF)
+		clk_disable_unprepare(dp->spdif_clk);
+	else if (dp->audio_interface == DW_DP_AUDIO_I2S)
+		clk_disable_unprepare(dp->i2s_clk);
+
+	dp->audio_interface = DW_DP_AUDIO_UNUSED;
+}
+
+static int __dw_dp_audio_enable(struct dw_dp *dp)
+{
+	u8 audio_data_in_en;
+
+	switch (dp->audio_channels) {
+	case 1:
+	case 2:
+		audio_data_in_en = AUDIO_DATA_IN_EN_CHANNEL12;
+		break;
+	case 8:
+		audio_data_in_en = AUDIO_DATA_IN_EN_CHANNEL12 |
+				   AUDIO_DATA_IN_EN_CHANNEL34 |
+				   AUDIO_DATA_IN_EN_CHANNEL56 |
+				   AUDIO_DATA_IN_EN_CHANNEL78;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	regmap_update_bits(dp->regmap, DW_DP_AUD_CONFIG1,
+			   AUDIO_DATA_IN_EN | NUM_CHANNELS | AUDIO_DATA_WIDTH |
+			   AUDIO_INF_SELECT | HBR_MODE_ENABLE | AUDIO_MUTE,
+			   FIELD_PREP(AUDIO_DATA_IN_EN, audio_data_in_en) |
+			   FIELD_PREP(NUM_CHANNELS, dp->audio_channels - 1) |
+			   FIELD_PREP(AUDIO_DATA_WIDTH, dp->audio_sample_width) |
+			   FIELD_PREP(AUDIO_INF_SELECT, dp->audio_interface) |
+			   FIELD_PREP(HBR_MODE_ENABLE, 0) |
+			   FIELD_PREP(AUDIO_MUTE, dp->audio_muted));
+
+	/* Wait for inf switch */
+	usleep_range(20, 40);
+
+	/*
+	 * Send audio stream during vertical and horizontal blanking periods.
+	 * Send out audio timestamp SDP once per video frame during the vertical
+	 * blanking period
+	 */
+	regmap_update_bits(dp->regmap, DW_DP_SDP_VERTICAL_CTRL,
+			   EN_AUDIO_STREAM_SDP | EN_AUDIO_TIMESTAMP_SDP,
+			   FIELD_PREP(EN_AUDIO_STREAM_SDP, 1) |
+			   FIELD_PREP(EN_AUDIO_TIMESTAMP_SDP, 1));
+	regmap_update_bits(dp->regmap, DW_DP_SDP_HORIZONTAL_CTRL,
+			   EN_AUDIO_STREAM_SDP,
+			   FIELD_PREP(EN_AUDIO_STREAM_SDP, 1));
+
+	if (dp->audio_sdp_nr >= 0) {
+		dw_dp_clear_sdp(dp, dp->audio_sdp_nr);
+		dp->audio_sdp_nr = -1;
+	}
+
+	dp->audio_sdp_nr = dw_dp_audio_infoframe_send(dp);
+	if (dp->audio_sdp_nr < 0) {
+		dw_dp_audio_infoframe_clear(dp);
+		return dp->audio_sdp_nr;
+	}
+
+	return 0;
+}
+
+static int dw_dp_audio_startup(struct drm_bridge *bridge,
+			       struct drm_connector *connector)
+{
+	struct dw_dp *dp = bridge_to_dp(bridge);
+
+	dev_dbg(dp->dev, "audio startup\n");
+
+	return pm_runtime_get_active(dp->dev, RPM_TRANSPARENT);
+}
+
+static void dw_dp_audio_unprepare(struct drm_bridge *bridge,
+				  struct drm_connector *connector)
+{
+	struct dw_dp *dp = bridge_to_dp(bridge);
+
+	guard(mutex)(&dp->audio_lock);
+
+	__dw_dp_audio_disable(dp);
+}
+
+static int dw_dp_audio_prepare(struct drm_bridge *bridge,
+			       struct drm_connector *connector,
+			       struct hdmi_codec_daifmt *daifmt,
+			       struct hdmi_codec_params *params)
+{
+	struct dw_dp *dp = bridge_to_dp(bridge);
+	u8 supported_audio_interfaces;
+	enum dw_dp_audio_interface audio_interface;
+	u32 cfg1;
+	int ret;
+
+	guard(mutex)(&dp->audio_lock);
+
+	/*
+	 * prepare might be called multiple times, so release the clocks
+	 * from previous calls to keep the calls in balance.
+	 */
+	if (dp->audio_interface != DW_DP_AUDIO_UNUSED)
+		__dw_dp_audio_disable(dp);
+
+	/* The hardware is limited to 1,2 or 8 channels */
+	switch (params->cea.channels) {
+	case 1:
+	case 2:
+	case 8:
+		break;
+	default:
+		dev_err(dp->dev, "invalid audio channels %d\n", params->cea.channels);
+		return -EINVAL;
+	}
+
+	if (params->sample_width < 16 || params->sample_width > 24) {
+		dev_err(dp->dev, "invalid data sample width %d\n", params->sample_width);
+		return -EINVAL;
+	}
+
+	switch (daifmt->fmt) {
+	case HDMI_SPDIF:
+		audio_interface = DW_DP_AUDIO_SPDIF;
+		break;
+	case HDMI_I2S:
+		/*
+		 * It is recommended to use SPDIF instead of I2S, since I2S mode requires
+		 * manually inserting PCUV control bits from userspace and this is done
+		 * automatically in hardware for SPDIF mode.
+		 */
+		audio_interface = DW_DP_AUDIO_I2S;
+		break;
+	default:
+		dev_err(dp->dev, "invalid DAI format %d\n", daifmt->fmt);
+		return -EINVAL;
+	}
+
+	regmap_read(dp->regmap, DW_DP_CONFIG_REG1, &cfg1);
+	supported_audio_interfaces = FIELD_GET(AUDIO_SELECT, cfg1);
+
+	if (supported_audio_interfaces != DW_DP_AUDIO_I2S_AND_SPDIF &&
+	    supported_audio_interfaces != audio_interface) {
+		dev_err(dp->dev, "unsupported DAI %d\n", daifmt->fmt);
+		return -EINVAL;
+	}
+
+	ret = clk_prepare_enable(dp->spdif_clk);
+	if (ret)
+		return ret;
+
+	ret = clk_prepare_enable(dp->i2s_clk);
+	if (ret) {
+		clk_disable_unprepare(dp->spdif_clk);
+		return ret;
+	}
+
+	if (audio_interface == DW_DP_AUDIO_I2S)
+		clk_disable_unprepare(dp->spdif_clk);
+	else if (audio_interface == DW_DP_AUDIO_SPDIF)
+		clk_disable_unprepare(dp->i2s_clk);
+
+	dp->audio_channels = params->cea.channels;
+	dp->audio_channel_allocation = params->cea.channel_allocation;
+	dp->audio_sample_width = params->sample_width;
+	dp->audio_interface = audio_interface;
+
+	ret = __dw_dp_audio_enable(dp);
+	if (ret < 0) {
+		dev_err(dp->dev, "failed to enable audio\n");
+		__dw_dp_audio_disable(dp);
+		return ret;
+	}
+
+	dev_dbg(dp->dev, "audio prepare with %d channels using DAI=%d\n",
+		dp->audio_channels, dp->audio_interface);
+
+	return 0;
+}
+
+static void dw_dp_audio_shutdown(struct drm_bridge *bridge,
+				 struct drm_connector *connector)
+{
+	struct dw_dp *dp = bridge_to_dp(bridge);
+
+	dev_dbg(dp->dev, "audio shutdown\n");
+
+	dw_dp_audio_unprepare(bridge, connector);
+	pm_runtime_put_autosuspend(dp->dev);
+}
+
+static int dw_dp_audio_mute_stream(struct drm_bridge *bridge,
+				   struct drm_connector *connector,
+				   bool enable, int direction)
+{
+	struct dw_dp *dp = bridge_to_dp(bridge);
+
+	dev_dbg(dp->dev, "audio %smute\n", enable ? "" : "un");
+
+	guard(mutex)(&dp->audio_lock);
+
+	dp->audio_muted = enable;
+
+	regmap_update_bits(dp->regmap, DW_DP_AUD_CONFIG1, AUDIO_MUTE,
+			   FIELD_PREP(AUDIO_MUTE, enable));
+
+	return 0;
+}
+
+/*
+ * Program a DP 1.3+ protocol converter (branch device) the way
+ * intel_dp_configure_protocol_converter() does: select HDMI rather than DVI
+ * output when it drives an HDMI sink, so that the converter sends the AVI
+ * InfoFrame and audio, and turn off the colour space conversions, since the
+ * stream is always sent in the format the sink is to receive.
+ */
+static void dw_dp_configure_protocol_converter(struct dw_dp *dp,
+					       struct drm_connector *connector)
+{
+	struct dw_dp_link *link = &dp->link;
+	bool hdmi;
+	u8 val;
+
+	if (link->dpcd[DP_DPCD_REV] < 0x13 || !drm_dp_is_branch(link->dpcd))
+		return;
+
+	hdmi = connector->display_info.is_hdmi &&
+	       drm_dp_downstream_is_type(link->dpcd, link->downstream_ports,
+					 DP_DS_PORT_TYPE_HDMI);
+	val = hdmi ? DP_HDMI_DVI_OUTPUT_CONFIG : 0;
+	if (drm_dp_dpcd_write_byte(&dp->aux, DP_PROTOCOL_CONVERTER_CONTROL_0,
+				   val) < 0)
+		dev_dbg(dp->dev, "failed to set protocol converter %s mode\n",
+			hdmi ? "HDMI" : "DVI");
+
+	if (drm_dp_dpcd_write_byte(&dp->aux, DP_PROTOCOL_CONVERTER_CONTROL_1,
+				   0) < 0)
+		dev_dbg(dp->dev, "failed to disable protocol converter YCbCr 4:2:0 conversion\n");
+
+	if (drm_dp_pcon_convert_rgb_to_ycbcr(&dp->aux, 0) < 0)
+		dev_dbg(dp->dev, "failed to disable protocol converter RGB->YCbCr conversion\n");
 }
 
 static void dw_dp_bridge_atomic_enable(struct drm_bridge *bridge,
@@ -1650,6 +2144,13 @@ static void dw_dp_bridge_atomic_enable(struct drm_bridge *bridge,
 	struct drm_connector *connector;
 	struct drm_connector_state *conn_state;
 	int ret;
+
+	ret = pm_runtime_get_active(dp->dev, RPM_TRANSPARENT);
+	if (ret) {
+		dev_err(dp->dev, "runtime PM failure\n");
+		return;
+	}
+	dp->pm_active = true;
 
 	connector = drm_atomic_get_new_connector_for_encoder(state, bridge->encoder);
 	if (!connector) {
@@ -1663,18 +2164,26 @@ static void dw_dp_bridge_atomic_enable(struct drm_bridge *bridge,
 		return;
 	}
 
-	set_bit(0, dp->sdp_reg_bank);
-
 	ret = dw_dp_link_enable(dp);
 	if (ret < 0) {
 		dev_err(dp->dev, "failed to enable link: %d\n", ret);
 		return;
 	}
 
+	dw_dp_configure_protocol_converter(dp, connector);
+
 	ret = dw_dp_video_enable(dp);
 	if (ret < 0) {
 		dev_err(dp->dev, "failed to enable video: %d\n", ret);
 		return;
+	}
+
+	scoped_guard(mutex, &dp->audio_lock) {
+		if (dp->audio_interface != DW_DP_AUDIO_UNUSED) {
+			ret = __dw_dp_audio_enable(dp);
+			if (ret < 0)
+				dev_err(dp->dev, "failed to restore audio: %d\n", ret);
+		}
 	}
 }
 
@@ -1701,10 +2210,20 @@ static void dw_dp_bridge_atomic_disable(struct drm_bridge *bridge,
 {
 	struct dw_dp *dp = bridge_to_dp(bridge);
 
+	if (!dp->pm_active)
+		return;
+	dp->pm_active = false;
+
 	dw_dp_video_disable(dp);
 	dw_dp_link_disable(dp);
-	bitmap_zero(dp->sdp_reg_bank, SDP_REG_BANK_SIZE);
+
+	if (dp->vsc_sdp_nr >= 0) {
+		dw_dp_clear_sdp(dp, dp->vsc_sdp_nr);
+		dp->vsc_sdp_nr = -1;
+	}
+
 	dw_dp_reset(dp);
+	pm_runtime_put_autosuspend(dp->dev);
 }
 
 static bool dw_dp_hpd_detect_link(struct dw_dp *dp, struct drm_connector *connector)
@@ -1725,13 +2244,23 @@ static enum drm_connector_status dw_dp_bridge_detect(struct drm_bridge *bridge,
 {
 	struct dw_dp *dp = bridge_to_dp(bridge);
 
-	if (!dw_dp_hpd_detect(dp))
+	PM_RUNTIME_ACQUIRE_AUTOSUSPEND(dp->dev, pm);
+	if (PM_RUNTIME_ACQUIRE_ERR(&pm))
 		return connector_status_disconnected;
+
+	if (!dw_dp_hpd_detect(dp))
+		goto disconnected;
 
 	if (!dw_dp_hpd_detect_link(dp, connector))
-		return connector_status_disconnected;
+		goto disconnected;
 
 	return connector_status_connected;
+
+disconnected:
+	if (dp->cec_registered)
+		drm_dp_cec_unset_edid(&dp->aux);
+
+	return connector_status_disconnected;
 }
 
 static const struct drm_edid *dw_dp_bridge_edid_read(struct drm_bridge *bridge,
@@ -1748,6 +2277,22 @@ static const struct drm_edid *dw_dp_bridge_edid_read(struct drm_bridge *bridge,
 	edid = drm_edid_read_ddc(connector, &dp->aux.ddc);
 
 	phy_power_off(dp->phy);
+
+	dw_dp_update_dfp(dp, edid);
+
+	/*
+	 * The CEC adapter needs the connector, which is only known once the
+	 * bridge connector calls into us.
+	 */
+	if (!dp->cec_registered) {
+		drm_dp_cec_register_connector(&dp->aux, connector);
+		dp->cec_registered = true;
+	}
+
+	if (edid)
+		drm_dp_cec_set_edid(&dp->aux, drm_edid_raw(edid));
+	else
+		drm_dp_cec_unset_edid(&dp->aux);
 
 	return edid;
 }
@@ -1778,11 +2323,14 @@ static u32 *dw_dp_bridge_atomic_get_output_bus_fmts(struct drm_bridge *bridge,
 		if (fmt->bpc > conn_state->max_bpc)
 			continue;
 
+		if (dp->dfp.max_bpc && fmt->bpc > dp->dfp.max_bpc)
+			continue;
+
 		if (!(BIT(fmt->color_format) & di->color_formats))
 			continue;
 
 		if (fmt->color_format == DRM_OUTPUT_COLOR_FORMAT_YCBCR420 &&
-		    !link->vsc_sdp_supported)
+		    !dw_dp_ycbcr_420_ok(dp))
 			continue;
 
 		if (fmt->color_format != DRM_OUTPUT_COLOR_FORMAT_YCBCR420 &&
@@ -1792,12 +2340,46 @@ static u32 *dw_dp_bridge_atomic_get_output_bus_fmts(struct drm_bridge *bridge,
 		if (!dw_dp_bandwidth_ok(dp, &mode, fmt->bpp, link->lanes, link->rate))
 			continue;
 
+		if (!dw_dp_dfp_tmds_clock_ok(dp, mode.clock, fmt->bpc, fmt->color_format))
+			continue;
+
 		output_fmts[j++] = fmt->bus_format;
+	}
+
+	if (j == 0) {
+		kfree(output_fmts);
+		output_fmts = NULL;
 	}
 
 	*num_output_fmts = j;
 
 	return output_fmts;
+}
+
+static u32 *
+dw_dp_bridge_atomic_get_input_bus_fmts(struct drm_bridge *bridge,
+				       struct drm_bridge_state *bridge_state,
+				       struct drm_crtc_state *crtc_state,
+				       struct drm_connector_state *conn_state,
+				       u32 output_fmt,
+				       unsigned int *num_input_fmts)
+{
+	/*
+	 * MEDIA_BUS_FMT_FIXED means the downstream bridge does not constrain
+	 * the bus format. In that case, advertise all formats supported by the
+	 * DP link so the upstream encoder can negotiate the best match.
+	 */
+	if (output_fmt == MEDIA_BUS_FMT_FIXED)
+		return dw_dp_bridge_atomic_get_output_bus_fmts(bridge,
+							       bridge_state,
+							       crtc_state,
+							       conn_state,
+							       num_input_fmts);
+
+	return drm_atomic_helper_bridge_propagate_bus_fmt(bridge, bridge_state,
+							 crtc_state, conn_state,
+							 output_fmt,
+							 num_input_fmts);
 }
 
 static struct drm_bridge_state *dw_dp_bridge_atomic_duplicate_state(struct drm_bridge *bridge)
@@ -1813,11 +2395,139 @@ static struct drm_bridge_state *dw_dp_bridge_atomic_duplicate_state(struct drm_b
 	return &state->base;
 }
 
+static bool dw_dp_is_routed_to_usb_c(struct drm_encoder *encoder)
+{
+	struct drm_bridge *last_bridge __free(drm_bridge_put) = NULL;
+	struct fwnode_handle *fwnode;
+
+	last_bridge = drm_bridge_chain_get_last_bridge(encoder);
+	if (!last_bridge)
+		return false;
+
+	fwnode = of_fwnode_handle(last_bridge->of_node);
+	return fwnode_device_is_compatible(fwnode, "usb-c-connector");
+}
+
+static int dw_dp_bridge_attach(struct drm_bridge *bridge,
+			       struct drm_encoder *encoder,
+			       enum drm_bridge_attach_flags flags)
+{
+	struct dw_dp *dp = bridge_to_dp(bridge);
+	struct device *dev = dp->dev;
+	int ret;
+
+	ret = pm_runtime_get_active(dp->dev, RPM_TRANSPARENT);
+	if (ret)
+		return ret;
+
+	dp->aux.dev = dev;
+	dp->aux.drm_dev = encoder->dev;
+	dp->aux.name = dev_name(dev);
+	dp->aux.transfer = dw_dp_aux_transfer;
+
+	ret = drm_dp_aux_register(&dp->aux);
+	if (ret) {
+		dev_err(dev, "Aux register failed: %d\n", ret);
+		goto err_runtime_pm_put;
+	}
+
+	enable_irq(dp->irq);
+
+	ret = drm_bridge_attach(encoder, dp->next_bridge, bridge,
+				DRM_BRIDGE_ATTACH_NO_CONNECTOR);
+	if (ret) {
+		dev_err(dev, "Failed to attach next bridge: %d\n", ret);
+		goto err_disable_irq;
+	}
+
+	dp->usbc_mode = dw_dp_is_routed_to_usb_c(encoder);
+
+	if (dp->plat_data.hpd_sw_sel)
+		dp->plat_data.hpd_sw_sel(dp->plat_data.data, dp->usbc_mode);
+
+	/* USB-C has out-of-band hotplug detection, so device may runtime suspend */
+	if (dp->usbc_mode) {
+		dev_dbg(dev, "USB-C mode\n");
+		pm_runtime_put_autosuspend(dp->dev);
+	}
+
+	return 0;
+
+err_disable_irq:
+	disable_irq(dp->irq);
+	cancel_work_sync(&dp->hpd_work);
+
+	drm_dp_aux_unregister(&dp->aux);
+
+err_runtime_pm_put:
+	pm_runtime_put_autosuspend(dp->dev);
+
+	return ret;
+}
+
+static void dw_dp_bridge_detach(struct drm_bridge *bridge)
+{
+	struct dw_dp *dp = bridge_to_dp(bridge);
+
+	disable_irq(dp->irq);
+	cancel_work_sync(&dp->hpd_work);
+
+	if (dp->cec_registered) {
+		drm_dp_cec_unregister_connector(&dp->aux);
+		dp->cec_registered = false;
+	}
+
+	drm_dp_aux_unregister(&dp->aux);
+
+	if (!dp->usbc_mode)
+		pm_runtime_put_autosuspend(dp->dev);
+}
+
+static void dw_dp_bridge_oob_notify(struct drm_bridge *bridge,
+				    struct drm_connector *connector,
+				    enum drm_connector_status status)
+{
+	bool hpd_high = status != connector_status_disconnected;
+	struct dw_dp *dp = bridge_to_dp(bridge);
+	bool was_high = dp->usbc_hpd;
+	int ret;
+
+	dp->usbc_hpd = hpd_high;
+
+	PM_RUNTIME_ACQUIRE_AUTOSUSPEND(dp->dev, pm);
+	ret = PM_RUNTIME_ACQUIRE_ERR(&pm);
+	if (ret)
+		return;
+
+	if (dp->plat_data.hpd_sw_cfg)
+		dp->plat_data.hpd_sw_cfg(dp->plat_data.data, hpd_high);
+	else
+		dev_err_once(dp->dev, "Missing platform handler for OOB HPD handling\n");
+
+	/*
+	 * Forcing the HPD level only lets the controller see plug and unplug
+	 * edges. An out-of-band event that keeps HPD asserted (a DP Alt Mode
+	 * Attention with IRQ_HPD, or a new pin assignment, which reinitializes
+	 * the PHY) is the equivalent of an HPD short pulse: the sink may have
+	 * lost the link, so check the link status and retrain if needed.
+	 * Don't override a pending long pulse.
+	 */
+	if (hpd_high && was_high) {
+		mutex_lock(&dp->irq_lock);
+		if (!work_pending(&dp->hpd_work))
+			dp->hotplug.long_hpd = false;
+		mutex_unlock(&dp->irq_lock);
+		schedule_work(&dp->hpd_work);
+	}
+}
+
 static const struct drm_bridge_funcs dw_dp_bridge_funcs = {
+	.attach = dw_dp_bridge_attach,
+	.detach = dw_dp_bridge_detach,
 	.atomic_duplicate_state = dw_dp_bridge_atomic_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
 	.atomic_create_state = drm_atomic_helper_bridge_create_state,
-	.atomic_get_input_bus_fmts = drm_atomic_helper_bridge_propagate_bus_fmt,
+	.atomic_get_input_bus_fmts = dw_dp_bridge_atomic_get_input_bus_fmts,
 	.atomic_get_output_bus_fmts = dw_dp_bridge_atomic_get_output_bus_fmts,
 	.atomic_check = dw_dp_bridge_atomic_check,
 	.mode_valid = dw_dp_bridge_mode_valid,
@@ -1825,6 +2535,12 @@ static const struct drm_bridge_funcs dw_dp_bridge_funcs = {
 	.atomic_disable = dw_dp_bridge_atomic_disable,
 	.detect = dw_dp_bridge_detect,
 	.edid_read = dw_dp_bridge_edid_read,
+	.oob_notify = dw_dp_bridge_oob_notify,
+
+	.dp_audio_startup = dw_dp_audio_startup,
+	.dp_audio_prepare = dw_dp_audio_prepare,
+	.dp_audio_shutdown = dw_dp_audio_shutdown,
+	.dp_audio_mute_stream = dw_dp_audio_mute_stream,
 };
 
 static int dw_dp_link_retrain(struct dw_dp *dp)
@@ -1856,11 +2572,39 @@ static int dw_dp_link_retrain(struct dw_dp *dp)
 	return ret;
 }
 
+/*
+ * A branch device signals a change on its downstream side (e.g. a monitor
+ * plugged into or unplugged from a dock) with a short HPD pulse, setting
+ * DOWNSTREAM_PORT_STATUS_CHANGED and updating SINK_COUNT.
+ */
+static bool dw_dp_downstream_changed(struct dw_dp *dp)
+{
+	struct dw_dp_link *link = &dp->link;
+	u8 status;
+	int ret;
+
+	if (!drm_dp_is_branch(link->dpcd))
+		return false;
+
+	ret = drm_dp_dpcd_read_byte(&dp->aux, DP_LANE_ALIGN_STATUS_UPDATED, &status);
+	if (ret == 0 && (status & DP_DOWNSTREAM_PORT_STATUS_CHANGED))
+		return true;
+
+	ret = drm_dp_read_sink_count(&dp->aux);
+
+	return ret >= 0 && ret != link->sink_count;
+}
+
 static void dw_dp_hpd_work(struct work_struct *work)
 {
 	struct dw_dp *dp = container_of(work, struct dw_dp, hpd_work);
 	bool long_hpd;
 	int ret;
+
+	PM_RUNTIME_ACQUIRE_AUTOSUSPEND(dp->dev, pm);
+	ret = PM_RUNTIME_ACQUIRE_ERR(&pm);
+	if (ret)
+		return;
 
 	mutex_lock(&dp->irq_lock);
 	long_hpd = dp->hotplug.long_hpd;
@@ -1869,14 +2613,37 @@ static void dw_dp_hpd_work(struct work_struct *work)
 	dev_dbg(dp->dev, "[drm] Get hpd irq - %s\n", long_hpd ? "long" : "short");
 
 	if (!long_hpd) {
-		if (dw_dp_needs_link_retrain(dp)) {
-			ret = dw_dp_link_retrain(dp);
-			if (ret)
-				dev_warn(dp->dev, "Retrain link failed\n");
+		/* HPD went low since: the unplug event follows */
+		if (!dw_dp_hpd_detect(dp))
+			return;
+
+		/*
+		 * Keep the PHY, which carries the AUX channel, powered for
+		 * all the DPCD accesses below rather than for each of them,
+		 * as detection does. The link may be disabled.
+		 */
+		ret = phy_power_on(dp->phy);
+		if (ret)
+			return;
+
+		if (dw_dp_downstream_changed(dp)) {
+			dev_dbg(dp->dev, "Downstream port status changed\n");
+			long_hpd = true;
+		} else {
+			drm_dp_cec_irq(&dp->aux);
+
+			if (dw_dp_needs_link_retrain(dp)) {
+				ret = dw_dp_link_retrain(dp);
+				if (ret)
+					dev_warn(dp->dev, "Retrain link failed\n");
+			}
 		}
-	} else {
-		drm_helper_hpd_irq_event(dp->bridge.dev);
+
+		phy_power_off(dp->phy);
 	}
+
+	if (long_hpd)
+		drm_helper_hpd_irq_event(dp->bridge.dev);
 }
 
 static void dw_dp_handle_hpd_event(struct dw_dp *dp)
@@ -1953,6 +2720,25 @@ static const struct regmap_config dw_dp_regmap_config = {
 	.rd_table = &dw_dp_readable_table,
 };
 
+int dw_dp_bind(struct dw_dp *dp, struct drm_encoder *encoder)
+{
+	return drm_bridge_attach(encoder, &dp->bridge, NULL, DRM_BRIDGE_ATTACH_NO_CONNECTOR);
+}
+EXPORT_SYMBOL_GPL(dw_dp_bind);
+
+void dw_dp_unbind(struct dw_dp *dp)
+{
+	/* nothing to do as bridge is detached automatically */
+}
+EXPORT_SYMBOL_GPL(dw_dp_unbind);
+
+static void dw_dp_put_next_bridge(void *data)
+{
+	struct dw_dp *dp = data;
+
+	drm_bridge_put(dp->next_bridge);
+}
+
 static void dw_dp_phy_exit(void *data)
 {
 	struct dw_dp *dp = data;
@@ -1960,14 +2746,24 @@ static void dw_dp_phy_exit(void *data)
 	phy_exit(dp->phy);
 }
 
-struct dw_dp *dw_dp_bind(struct device *dev, struct drm_encoder *encoder,
-			 const struct dw_dp_plat_data *plat_data)
+static void dw_dp_manual_suspend(void *data)
 {
-	struct platform_device *pdev = to_platform_device(dev);
+	struct dw_dp *dp = data;
+
+	dw_dp_runtime_suspend(dp);
+}
+
+static void dw_dp_enable_irq(void *data)
+{
+	struct dw_dp *dp = data;
+
+	enable_irq(dp->irq);
+}
+
+struct dw_dp *dw_dp_alloc(struct platform_device *pdev, const struct dw_dp_plat_data *plat_data)
+{
+	struct device *dev = &pdev->dev;
 	struct dw_dp *dp;
-	struct drm_bridge *bridge;
-	void __iomem *res;
-	int ret;
 
 	dp = devm_drm_bridge_alloc(dev, struct dw_dp, bridge, &dw_dp_bridge_funcs);
 	if (IS_ERR(dp))
@@ -1976,127 +2772,227 @@ struct dw_dp *dw_dp_bind(struct device *dev, struct drm_encoder *encoder,
 	dp->dev = dev;
 	dp->pixel_mode = plat_data->pixel_mode;
 
+	dp->plat_data.hpd_sw_sel = plat_data->hpd_sw_sel;
+	dp->plat_data.hpd_sw_cfg = plat_data->hpd_sw_cfg;
+	dp->plat_data.data = plat_data->data;
 	dp->plat_data.max_link_rate = plat_data->max_link_rate;
-	bridge = &dp->bridge;
-	mutex_init(&dp->irq_lock);
+	dp->plat_data.autosuspend_delay = plat_data->autosuspend_delay;
+
 	INIT_WORK(&dp->hpd_work, dw_dp_hpd_work);
 	init_completion(&dp->complete);
 
+	return dp;
+}
+EXPORT_SYMBOL_GPL(dw_dp_alloc);
+
+int dw_dp_probe(struct dw_dp *dp)
+{
+	struct device *dev = dp->dev;
+	struct platform_device *pdev = to_platform_device(dev);
+	struct drm_bridge *bridge;
+	void __iomem *res;
+	int ret;
+
+	ret = devm_mutex_init(dev, &dp->irq_lock);
+	if (ret)
+		return ret;
+
+	ret = devm_mutex_init(dev, &dp->sdp_lock);
+	if (ret)
+		return ret;
+
+	ret = devm_mutex_init(dev, &dp->audio_lock);
+	if (ret)
+		return ret;
+
 	res = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(res))
-		return ERR_CAST(res);
+		return PTR_ERR(res);
 
 	dp->regmap = devm_regmap_init_mmio(dev, res, &dw_dp_regmap_config);
 	if (IS_ERR(dp->regmap)) {
 		dev_err_probe(dev, PTR_ERR(dp->regmap), "failed to create regmap\n");
-		return ERR_CAST(dp->regmap);
+		return PTR_ERR(dp->regmap);
 	}
 
 	dp->phy = devm_of_phy_get(dev, dev->of_node, NULL);
 	if (IS_ERR(dp->phy)) {
 		dev_err_probe(dev, PTR_ERR(dp->phy), "failed to get phy\n");
-		return ERR_CAST(dp->phy);
+		return PTR_ERR(dp->phy);
 	}
 
-	dp->apb_clk = devm_clk_get_enabled(dev, "apb");
+	dp->apb_clk = devm_clk_get(dev, "apb");
 	if (IS_ERR(dp->apb_clk)) {
 		dev_err_probe(dev, PTR_ERR(dp->apb_clk), "failed to get apb clock\n");
-		return ERR_CAST(dp->apb_clk);
+		return PTR_ERR(dp->apb_clk);
 	}
 
-	dp->aux_clk = devm_clk_get_enabled(dev, "aux");
+	dp->aux_clk = devm_clk_get(dev, "aux");
 	if (IS_ERR(dp->aux_clk)) {
 		dev_err_probe(dev, PTR_ERR(dp->aux_clk), "failed to get aux clock\n");
-		return ERR_CAST(dp->aux_clk);
+		return PTR_ERR(dp->aux_clk);
 	}
 
 	dp->i2s_clk = devm_clk_get_optional(dev, "i2s");
 	if (IS_ERR(dp->i2s_clk)) {
 		dev_err_probe(dev, PTR_ERR(dp->i2s_clk), "failed to get i2s clock\n");
-		return ERR_CAST(dp->i2s_clk);
+		return PTR_ERR(dp->i2s_clk);
 	}
 
 	dp->spdif_clk = devm_clk_get_optional(dev, "spdif");
 	if (IS_ERR(dp->spdif_clk)) {
 		dev_err_probe(dev, PTR_ERR(dp->spdif_clk), "failed to get spdif clock\n");
-		return ERR_CAST(dp->spdif_clk);
+		return PTR_ERR(dp->spdif_clk);
 	}
 
 	dp->hdcp_clk = devm_clk_get(dev, "hdcp");
 	if (IS_ERR(dp->hdcp_clk)) {
 		dev_err_probe(dev, PTR_ERR(dp->hdcp_clk), "failed to get hdcp clock\n");
-		return ERR_CAST(dp->hdcp_clk);
+		return PTR_ERR(dp->hdcp_clk);
 	}
 
+	/*
+	 * This reset line is deasserted by default; asserting it hangs the SoC if the
+	 * related power-domain is still active.
+	 */
 	dp->rstc = devm_reset_control_get(dev, NULL);
 	if (IS_ERR(dp->rstc)) {
 		dev_err_probe(dev, PTR_ERR(dp->rstc), "failed to get reset control\n");
-		return ERR_CAST(dp->rstc);
+		return PTR_ERR(dp->rstc);
 	}
 
-	bridge->of_node = dev->of_node;
-	bridge->ops = DRM_BRIDGE_OP_DETECT | DRM_BRIDGE_OP_EDID | DRM_BRIDGE_OP_HPD;
-	bridge->type = DRM_MODE_CONNECTOR_DisplayPort;
-	bridge->ycbcr_420_allowed = true;
+	dp->irq = platform_get_irq(pdev, 0);
+	if (dp->irq < 0)
+		return dp->irq;
 
-	ret = devm_drm_bridge_add(dev, bridge);
+	ret = devm_request_threaded_irq(dev, dp->irq, NULL, dw_dp_irq,
+					IRQF_ONESHOT | IRQF_NO_AUTOEN, dev_name(dev), dp);
+	if (ret) {
+		dev_err_probe(dev, ret, "failed to request irq\n");
+		return ret;
+	}
+
+	/*
+	 * Disable IRQ a second time; this ensures the interrupt is only
+	 * enabled when the bridge is attached AND runtime PM is enabled.
+	 * Also register a devm action to restore the correct balance during
+	 * device removal.
+	 */
+	disable_irq(dp->irq);
+
+	ret = devm_add_action_or_reset(dev, dw_dp_enable_irq, dp);
 	if (ret)
-		return ERR_PTR(ret);
+		return ret;
 
-	dp->aux.dev = dev;
-	dp->aux.drm_dev = encoder->dev;
-	dp->aux.name = dev_name(dev);
-	dp->aux.transfer = dw_dp_aux_transfer;
-	ret = drm_dp_aux_register(&dp->aux);
-	if (ret) {
-		dev_err_probe(dev, ret, "Aux register failed\n");
-		return ERR_PTR(ret);
+	dp->next_bridge = of_drm_get_bridge_by_endpoint(dev->of_node, 1, 0);
+	if (IS_ERR(dp->next_bridge)) {
+		dev_err_probe(dev, PTR_ERR(dp->next_bridge), "failed to get follow-up bridge\n");
+		return PTR_ERR(dp->next_bridge);
 	}
 
-	ret = drm_bridge_attach(encoder, bridge, NULL, DRM_BRIDGE_ATTACH_NO_CONNECTOR);
-	if (ret) {
-		dev_err_probe(dev, ret, "Failed to attach bridge\n");
-		goto unregister_aux;
+	ret = devm_add_action_or_reset(dev, dw_dp_put_next_bridge, dp);
+	if (ret)
+		return ret;
+
+	if (dp->plat_data.autosuspend_delay > 0) {
+		pm_runtime_use_autosuspend(dev);
+		pm_runtime_set_autosuspend_delay(dev, dp->plat_data.autosuspend_delay);
+		ret = devm_pm_runtime_enable(dev);
+		if (ret)
+			return ret;
 	}
 
-	dw_dp_init_hw(dp);
+	if (!pm_runtime_enabled(dev)) {
+		dw_dp_runtime_resume(dp);
+
+		ret = devm_add_action_or_reset(dev, dw_dp_manual_suspend, dp);
+		if (ret)
+			return ret;
+	}
 
 	ret = phy_init(dp->phy);
 	if (ret) {
 		dev_err_probe(dev, ret, "phy init failed\n");
-		goto unregister_aux;
+		return ret;
 	}
 
 	ret = devm_add_action_or_reset(dev, dw_dp_phy_exit, dp);
 	if (ret)
-		goto unregister_aux;
+		return ret;
 
-	dp->irq = platform_get_irq(pdev, 0);
-	if (dp->irq < 0) {
-		ret = dp->irq;
-		goto unregister_aux;
-	}
+	dp->vsc_sdp_nr = -1;
+	dp->audio_interface = DW_DP_AUDIO_UNUSED;
+	dp->audio_sdp_nr = -1;
 
-	ret = devm_request_threaded_irq(dev, dp->irq, NULL, dw_dp_irq,
-					IRQF_ONESHOT, dev_name(dev), dp);
-	if (ret) {
-		dev_err_probe(dev, ret, "failed to request irq\n");
-		goto unregister_aux;
-	}
+	bridge = &dp->bridge;
+	bridge->of_node = dev->of_node;
+	bridge->ops = DRM_BRIDGE_OP_DP_AUDIO |
+		      DRM_BRIDGE_OP_DETECT |
+		      DRM_BRIDGE_OP_EDID |
+		      DRM_BRIDGE_OP_HPD;
+	bridge->type = DRM_MODE_CONNECTOR_DisplayPort;
+	bridge->ycbcr_420_allowed = true;
+	bridge->hdmi_audio_dev = dev;
+	bridge->hdmi_audio_max_i2s_playback_channels = 8;
+	bridge->hdmi_audio_dai_port = 1;
+	bridge->hdmi_audio_spdif_playback = true;
 
-	return dp;
-
-unregister_aux:
-	drm_dp_aux_unregister(&dp->aux);
-	return ERR_PTR(ret);
+	return devm_drm_bridge_add(dev, bridge);
 }
-EXPORT_SYMBOL_GPL(dw_dp_bind);
+EXPORT_SYMBOL_GPL(dw_dp_probe);
 
-void dw_dp_unbind(struct dw_dp *dp)
+int dw_dp_runtime_suspend(struct dw_dp *dp)
 {
-	drm_dp_aux_unregister(&dp->aux);
+	disable_irq(dp->irq);
+
+	clk_disable_unprepare(dp->aux_clk);
+	clk_disable_unprepare(dp->apb_clk);
+
+	return 0;
 }
-EXPORT_SYMBOL_GPL(dw_dp_unbind);
+EXPORT_SYMBOL_GPL(dw_dp_runtime_suspend);
+
+int dw_dp_runtime_resume(struct dw_dp *dp)
+{
+	u32 value;
+	int ret;
+
+	ret = clk_prepare_enable(dp->apb_clk);
+	if (ret)
+		return ret;
+
+	ret = clk_prepare_enable(dp->aux_clk);
+	if (ret) {
+		clk_disable_unprepare(dp->apb_clk);
+		return ret;
+	}
+
+	if (dp->plat_data.hpd_sw_sel)
+		dp->plat_data.hpd_sw_sel(dp->plat_data.data, dp->usbc_mode);
+	if (dp->plat_data.hpd_sw_cfg)
+		dp->plat_data.hpd_sw_cfg(dp->plat_data.data, dp->usbc_hpd);
+
+	dw_dp_init_hw(dp);
+
+	enable_irq(dp->irq);
+
+	/*
+	 * The HPD state machine restarts with the controller, and reports
+	 * the sink as plugged only after it has held HPD high for at least
+	 * 100 ms. Wait for that, so that the AUX transfers, detection or
+	 * short pulse handling that resumed the controller see the sink.
+	 * Nothing to wait for if the Type-C side reports HPD low.
+	 */
+	if (dp->usbc_mode && !dp->usbc_hpd)
+		return 0;
+
+	regmap_read_poll_timeout(dp->regmap, DW_DP_HPD_STATUS, value,
+				 FIELD_GET(HPD_STATE, value) == DW_DP_HPD_STATE_PLUG,
+				 5000, 200000);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(dw_dp_runtime_resume);
 
 MODULE_AUTHOR("Andy Yan <andyshrk@163.com>");
 MODULE_DESCRIPTION("DW DP Core Library");

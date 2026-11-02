@@ -131,13 +131,18 @@ rockchip_vpu2_jpeg_enc_set_qtable(struct hantro_dev *vpu,
 
 int rockchip_vpu2_jpeg_enc_run(struct hantro_ctx *ctx)
 {
-	struct hantro_dev *vpu = ctx->dev;
+	struct hantro_dev *vpu = ctx->core;
 	struct vb2_v4l2_buffer *src_buf, *dst_buf;
 	struct hantro_jpeg_ctx jpeg_ctx;
 	u32 reg;
+	int ret;
 
 	src_buf = hantro_get_src_buf(ctx);
 	dst_buf = hantro_get_dst_buf(ctx);
+
+	ret = hantro_jpeg_enc_check_job(ctx, &dst_buf->vb2_buf);
+	if (ret)
+		return ret;
 
 	hantro_start_prepare_run(ctx);
 
@@ -188,7 +193,7 @@ int rockchip_vpu2_jpeg_enc_run(struct hantro_ctx *ctx)
 
 void rockchip_vpu2_jpeg_enc_done(struct hantro_ctx *ctx)
 {
-	struct hantro_dev *vpu = ctx->dev;
+	struct hantro_dev *vpu = ctx->core;
 	u32 bytesused = vepu_read(vpu, VEPU_REG_STR_BUF_LIMIT) / 8;
 	struct vb2_v4l2_buffer *dst_buf = hantro_get_dst_buf(ctx);
 

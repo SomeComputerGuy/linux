@@ -221,6 +221,9 @@ Compressed Formats
 	See the :ref:`associated Codec Control IDs <v4l2-codec-stateless-hevc>`.
 	Buffers associated with this pixel format must contain the appropriate
 	number of macroblocks to decode a full corresponding frame.
+	Stateless video encoders use this pixel format on their CAPTURE queue:
+	each buffer then receives one complete access unit, as described in
+	:ref:`HEVC stateless encoding <v4l2-codec-stateless-hevc-encode>`.
     * .. _V4L2-PIX-FMT-FWHT:
 
       - ``V4L2_PIX_FMT_FWHT``

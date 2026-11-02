@@ -44,6 +44,46 @@ config V4L2_JPEG_HELPER
 config V4L2_H264
 	tristate
 
+# Used by drivers that need v4l2-h264-enc.ko
+config V4L2_H264_ENC
+	tristate
+
+# Used by drivers that need v4l2-hevc-enc-rbsp.ko
+config V4L2_HEVC_ENC_RBSP
+	tristate
+
+# Used by drivers that need v4l2-hevc-enc.ko
+config V4L2_HEVC_ENC
+	tristate
+	select V4L2_HEVC_ENC_RBSP
+
+config V4L2_HEVC_ENC_RBSP_KUNIT_TEST
+	tristate "KUnit tests for the V4L2 HEVC encode RBSP writer" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	select V4L2_HEVC_ENC_RBSP
+	default KUNIT_ALL_TESTS
+	help
+	  Build the KUnit tests of the HEVC NAL unit writer used by stateless
+	  HEVC encoders. They check the VPS, SPS, PPS, access unit delimiter
+	  and slice segment headers it writes, byte for byte, against known
+	  bitstreams.
+
+	  If unsure, say N.
+
+config V4L2_HEVC_ENC_KUNIT_TEST
+	tristate "KUnit tests for the V4L2 HEVC encode core" if !KUNIT_ALL_TESTS
+	depends on KUNIT && VIDEO_DEV
+	select V4L2_HEVC_ENC
+	select VIDEOBUF2_CORE
+	default KUNIT_ALL_TESTS
+	help
+	  Build the KUnit tests of the stateless HEVC encode core. They run
+	  short sequences of pictures through it and check the reference
+	  picture sets, reference picture lists, decoded picture buffer and
+	  feedback that result, and the validation of the encode parameters.
+
+	  If unsure, say N.
+
 # Used by drivers that need v4l2-vp9.ko
 config V4L2_VP9
 	tristate

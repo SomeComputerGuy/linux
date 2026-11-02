@@ -29,6 +29,7 @@
 #define VOP2_FEATURE_HAS_VO1_GRF	BIT(2)
 #define VOP2_FEATURE_HAS_VOP_GRF	BIT(3)
 #define VOP2_FEATURE_HAS_SYS_PMU	BIT(4)
+#define VOP2_FEATURE_AXI_BALANCE	BIT(5)
 
 #define WIN_FEATURE_AFBDC		BIT(0)
 #define WIN_FEATURE_CLUSTER		BIT(1)
@@ -165,6 +166,8 @@ enum vop2_win_regs {
 	VOP2_WIN_MAX_REG,
 };
 
+struct reset_control;
+
 struct vop2_regs_dump {
 	const char *name;
 	u32 base;
@@ -217,6 +220,27 @@ struct vop2_win {
 	u32 offset;
 
 	enum drm_plane_type type;
+
+	/**
+	 * @axi_bus: AXI read port the window currently fetches through,
+	 * protected by &vop2.axi_lock.
+	 */
+	u8 axi_bus;
+	/** @axi_active: the window is fetching, protected by &vop2.axi_lock */
+	bool axi_active;
+	/** @axi_load: estimated fetch rate in bytes/s, protected by &vop2.axi_lock */
+	u64 axi_load;
+	/**
+	 * @axi_peak: estimated fetch rate in bytes/s while the lines of the
+	 * window are scanned out, protected by &vop2.axi_lock.
+	 */
+	u64 axi_peak;
+	/** @axi_y1: first display line of the window, protected by &vop2.axi_lock */
+	u16 axi_y1;
+	/** @axi_y2: last display line + 1 of the window, protected by &vop2.axi_lock */
+	u16 axi_y2;
+	/** @axi_vp: video port the window is fetching for, protected by &vop2.axi_lock */
+	u8 axi_vp;
 };
 
 struct vop2_video_port_data {
@@ -225,6 +249,7 @@ struct vop2_video_port_data {
 	u16 gamma_lut_len;
 	u16 cubic_lut_len;
 	struct vop_rect max_output;
+	u32 max_pixel_clock_rate;
 	const u8 pre_scan_max_dly[4];
 	unsigned int offset;
 	/**
@@ -238,10 +263,30 @@ struct vop2_video_port {
 	struct vop2 *vop2;
 	struct clk *dclk;
 	struct clk *dclk_src;
+	/**
+	 * @pll_v0: per-VP handle on the dedicated video PLL (RK3588 V0PLL), so
+	 * that the rate protection one VP holds also applies to the others.
+	 */
+	struct clk *pll_v0;
+	/** @pll_v0_held: @pll_v0 rate protected while the DCLK runs from it */
+	bool pll_v0_held;
+	struct reset_control *dclk_rst;
 	unsigned int id;
 	const struct vop2_video_port_data *data;
 
 	struct completion dsp_hold_completion;
+
+	/**
+	 * @enabled: CRTC fully brought up by atomic_enable(); allows
+	 * atomic_disable() to skip teardown after a failed enable.
+	 */
+	bool enabled;
+
+	/**
+	 * @aclk_boost: this video port holds a reference on the raised ACLK
+	 * rate, see vop2_crtc_needs_aclk_boost().
+	 */
+	bool aclk_boost;
 
 	/**
 	 * @win_mask: Bitmask of windows attached to the video port;
@@ -252,6 +297,16 @@ struct vop2_video_port {
 	struct drm_pending_vblank_event *event;
 
 	unsigned int nlayers;
+
+	/** @irq_lock: protects @vblank_enabled and @post_buf_empty_masked */
+	spinlock_t irq_lock;
+	/** @vblank_enabled: the FS interrupt is enabled for vblank reporting */
+	bool vblank_enabled;
+	/**
+	 * @post_buf_empty_masked: POST_BUF_EMPTY is masked until the next
+	 * frame start
+	 */
+	bool post_buf_empty_masked;
 };
 
 /**
@@ -262,6 +317,9 @@ struct vop2_video_port {
  */
 struct vop2_ops {
 	unsigned long (*setup_intf_mux)(struct vop2_video_port *vp, int ep_id, u32 polflags);
+	/* DCLK rate setup_intf_mux() will return for this state, 0 if invalid */
+	unsigned long (*dclk_rate)(struct vop2_video_port *vp, int ep_id,
+				   const struct drm_crtc_state *crtc_state);
 	void (*setup_bg_dly)(struct vop2_video_port *vp);
 	void (*setup_overlay)(struct vop2_video_port *vp);
 };
@@ -324,11 +382,14 @@ struct vop2 {
 	 * we need a ref counter here.
 	 */
 	unsigned int enable_count;
+	/** @aclk_boost_count: number of video ports that need the raised ACLK rate */
+	unsigned int aclk_boost_count;
 	struct clk *hclk;
 	struct clk *aclk;
 	struct clk *pclk;
 	struct clk *pll_hdmiphy0;
 	struct clk *pll_hdmiphy1;
+	struct reset_control *axi_rst;
 
 	/* optional internal rgb encoder */
 	struct rockchip_rgb *rgb;
@@ -345,6 +406,9 @@ struct vop2 {
 	 * take effect in sequence.
 	 */
 	struct mutex ovl_lock;
+
+	/* protects the AXI port assignment of all windows (&vop2_win.axi_bus) */
+	spinlock_t axi_lock;
 
 	/* must be put at the end of the struct */
 	struct vop2_win win[];

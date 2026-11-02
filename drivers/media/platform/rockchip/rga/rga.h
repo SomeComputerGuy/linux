@@ -9,6 +9,8 @@
 #include <linux/bits.h>
 #include <linux/clk.h>
 #include <linux/platform_device.h>
+#include <linux/reset.h>
+#include <linux/workqueue.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -34,6 +36,42 @@ struct rga_dma_desc {
 struct rockchip_rga_version {
 	u32 major;
 	u32 minor;
+};
+
+#define RGA_NUM_RESETS 3
+
+/**
+ * struct rga_core - one RGA core
+ * @dev:		device of the core
+ * @regs:		registers of the core
+ * @irq:		interrupt of the core
+ * @clks:		clocks of the core
+ * @num_clks:		number of clocks
+ * @resets:		core, AXI and AHB reset lines of the core
+ * @empty_domain:	empty IOMMU domain, used to reinitialize the IOMMU after
+ *			a failed job; NULL if the core isn't behind an IOMMU
+ * @attached_domain:	IOMMU domain of the first core that this core is
+ *			attached to, if any
+ * @watchdog_work:	resets the core when its job times out or fails
+ * @job_failed:		the core reported an error for the current job and
+ *			@watchdog_work is queued to reset it
+ * @rga:		RGA device the core is bound to
+ * @curr:		context of the job running on the core, if any
+ */
+struct rga_core {
+	struct device *dev;
+	void __iomem *regs;
+	int irq;
+	struct clk_bulk_data *clks;
+	int num_clks;
+	struct reset_control_bulk_data resets[RGA_NUM_RESETS];
+	struct iommu_domain *empty_domain;
+	struct iommu_domain *attached_domain;
+	struct delayed_work watchdog_work;
+	bool job_failed;
+
+	struct rockchip_rga *rga;
+	struct rga_ctx *curr;
 };
 
 struct rga_ctx {
@@ -70,21 +108,18 @@ struct rockchip_rga {
 	struct v4l2_m2m_dev *m2m_dev;
 	struct video_device *vfd;
 
-	struct device *dev;
-	struct regmap *grf;
-	void __iomem *regs;
-	struct clk_bulk_data *clks;
-	int num_clks;
 	struct rockchip_rga_version version;
 
 	/* vfd lock */
 	struct mutex mutex;
 	/* ctrl parm lock */
 	spinlock_t ctrl_lock;
-
-	struct rga_ctx *curr;
+	spinlock_t cores_lock;
 
 	const struct rga_hw *hw;
+
+	u8 num_cores;
+	struct rga_core *cores[];
 };
 
 struct rga_addrs {
@@ -120,22 +155,36 @@ int rga_check_scaling(const struct rga_hw *hw, const struct v4l2_rect *crop_in,
 extern const struct vb2_ops rga_qops;
 
 /* RGA Hardware */
-static inline void rga_write(struct rockchip_rga *rga, u32 reg, u32 value)
+static inline void rga_write(struct rga_core *core, u32 reg, u32 value)
 {
-	writel(value, rga->regs + reg);
+	writel(value, core->regs + reg);
 };
 
-static inline u32 rga_read(struct rockchip_rga *rga, u32 reg)
+static inline u32 rga_read(struct rga_core *core, u32 reg)
 {
-	return readl(rga->regs + reg);
+	return readl(core->regs + reg);
 };
 
-static inline void rga_mod(struct rockchip_rga *rga, u32 reg, u32 val, u32 mask)
+static inline void rga_mod(struct rga_core *core, u32 reg, u32 val, u32 mask)
 {
-	u32 temp = rga_read(rga, reg) & ~(mask);
+	u32 temp = rga_read(core, reg) & ~(mask);
 
 	temp |= val & mask;
-	rga_write(rga, reg, temp);
+	rga_write(core, reg, temp);
+};
+
+/**
+ * enum rga_irq_status - what an interrupt of a core reports
+ * @RGA_IRQ_NONE:	the core didn't raise an interrupt
+ * @RGA_IRQ_BUSY:	the job is still running
+ * @RGA_IRQ_DONE:	the job is done
+ * @RGA_IRQ_ERROR:	the job failed and the core must be reset
+ */
+enum rga_irq_status {
+	RGA_IRQ_NONE,
+	RGA_IRQ_BUSY,
+	RGA_IRQ_DONE,
+	RGA_IRQ_ERROR,
 };
 
 #define RGA_FEATURE_FLIP	BIT(0)
@@ -152,11 +201,19 @@ struct rga_hw {
 	u8 stride_alignment;
 	u8 features;
 
+	/*
+	 * Requires that the cmdbuf is already zeroed.
+	 */
 	void (*setup_cmdbuf)(struct rga_ctx *ctx);
-	void (*start)(struct rockchip_rga *rga,
+	void (*start)(struct rga_core *core,
 		      struct rga_vb_buffer *src, struct rga_vb_buffer *dst);
-	bool (*handle_irq)(struct rockchip_rga *rga);
-	void (*get_version)(struct rockchip_rga *rga);
+	enum rga_irq_status (*handle_irq)(struct rga_core *core);
+	/*
+	 * Optional, stops a core that is still busy before its reset lines
+	 * are pulsed.
+	 */
+	void (*reset)(struct rga_core *core);
+	struct rockchip_rga_version (*get_version)(struct rga_core *core);
 	void *(*adjust_and_map_format)(struct rga_ctx *ctx,
 				       struct v4l2_pix_format_mplane *format,
 				       bool is_output);

@@ -23,9 +23,11 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/ratelimit.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string_choices.h>
+#include <linux/workqueue.h>
 
 #include "iommu-pages.h"
 
@@ -46,6 +48,15 @@
 #define RK_MMU_POLL_PERIOD_US		100
 #define RK_MMU_FORCE_RESET_TIMEOUT_US	100000
 #define RK_MMU_POLL_TIMEOUT_US		1000
+
+/*
+ * More page faults than RK_MMU_FAULT_STORM_COUNT within
+ * RK_MMU_FAULT_STORM_MS make a storm: the next fault is held for
+ * RK_MMU_FAULT_HOLD_MS, with the interrupt masked.
+ */
+#define RK_MMU_FAULT_STORM_COUNT	64
+#define RK_MMU_FAULT_STORM_MS		100
+#define RK_MMU_FAULT_HOLD_MS		100
 
 /* RK_MMU_STATUS fields */
 #define RK_MMU_STATUS_PAGING_ENABLED       BIT(0)
@@ -116,6 +127,11 @@ struct rk_iommu {
 	struct list_head node; /* entry in rk_iommu_domain.iommus */
 	struct iommu_domain *domain; /* domain to which iommu is attached */
 	const struct rk_iommu_ops *rk_ops;
+	struct ratelimit_state fault_rs; /* for the fault reports */
+	unsigned long fault_window; /* jiffies: start of the storm window */
+	unsigned int fault_count; /* faults in the storm window */
+	unsigned long held_banks; /* banks holding a fault, interrupt masked */
+	struct delayed_work release_work; /* releases the held faults */
 };
 
 struct rk_iommudata {
@@ -371,16 +387,54 @@ static void rk_iommu_zap_lines(struct rk_iommu *iommu, dma_addr_t iova_start,
 	}
 }
 
+/*
+ * The banks of one IOMMU are commanded together but don't always share one
+ * state: a reset of the master, or a FORCE_RESET that times out, can put one
+ * bank into bypass and leave another one translating. The helpers below look
+ * at every bank on its own, so that no command is skipped for a bank only
+ * because another one is in a different state.
+ */
+
+/* Every bank that translates is stalled (a bank in bypass cannot stall). */
 static bool rk_iommu_is_stall_active(struct rk_iommu *iommu)
 {
-	bool active = true;
+	u32 status;
+	int i;
+
+	for (i = 0; i < iommu->num_mmu; i++) {
+		status = rk_iommu_read(iommu->bases[i], RK_MMU_STATUS);
+		if ((status & RK_MMU_STATUS_PAGING_ENABLED) &&
+		    !(status & RK_MMU_STATUS_STALL_ACTIVE))
+			return false;
+	}
+
+	return true;
+}
+
+/* No bank is stalled. */
+static bool rk_iommu_is_stall_inactive(struct rk_iommu *iommu)
+{
 	int i;
 
 	for (i = 0; i < iommu->num_mmu; i++)
-		active &= !!(rk_iommu_read(iommu->bases[i], RK_MMU_STATUS) &
-					   RK_MMU_STATUS_STALL_ACTIVE);
+		if (rk_iommu_read(iommu->bases[i], RK_MMU_STATUS) &
+		    RK_MMU_STATUS_STALL_ACTIVE)
+			return false;
 
-	return active;
+	return true;
+}
+
+/* No bank translates. */
+static bool rk_iommu_is_paging_disabled(struct rk_iommu *iommu)
+{
+	int i;
+
+	for (i = 0; i < iommu->num_mmu; i++)
+		if (rk_iommu_read(iommu->bases[i], RK_MMU_STATUS) &
+		    RK_MMU_STATUS_PAGING_ENABLED)
+			return false;
+
+	return true;
 }
 
 static bool rk_iommu_is_paging_enabled(struct rk_iommu *iommu)
@@ -411,11 +465,8 @@ static int rk_iommu_enable_stall(struct rk_iommu *iommu)
 	int ret, i;
 	bool val;
 
+	/* Stall can only be enabled on the banks that translate */
 	if (rk_iommu_is_stall_active(iommu))
-		return 0;
-
-	/* Stall can only be enabled if paging is enabled */
-	if (!rk_iommu_is_paging_enabled(iommu))
 		return 0;
 
 	/*
@@ -449,13 +500,13 @@ static int rk_iommu_disable_stall(struct rk_iommu *iommu)
 	int ret, i;
 	bool val;
 
-	if (!rk_iommu_is_stall_active(iommu))
+	if (rk_iommu_is_stall_inactive(iommu))
 		return 0;
 
 	rk_iommu_command(iommu, RK_MMU_CMD_DISABLE_STALL);
 
-	ret = readx_poll_timeout(rk_iommu_is_stall_active, iommu, val,
-				 !val, RK_MMU_POLL_PERIOD_US,
+	ret = readx_poll_timeout(rk_iommu_is_stall_inactive, iommu, val,
+				 val, RK_MMU_POLL_PERIOD_US,
 				 RK_MMU_POLL_TIMEOUT_US);
 	if (ret)
 		for (i = 0; i < iommu->num_mmu; i++)
@@ -491,13 +542,13 @@ static int rk_iommu_disable_paging(struct rk_iommu *iommu)
 	int ret, i;
 	bool val;
 
-	if (!rk_iommu_is_paging_enabled(iommu))
+	if (rk_iommu_is_paging_disabled(iommu))
 		return 0;
 
 	rk_iommu_command(iommu, RK_MMU_CMD_DISABLE_PAGING);
 
-	ret = readx_poll_timeout(rk_iommu_is_paging_enabled, iommu, val,
-				 !val, RK_MMU_POLL_PERIOD_US,
+	ret = readx_poll_timeout(rk_iommu_is_paging_disabled, iommu, val,
+				 val, RK_MMU_POLL_PERIOD_US,
 				 RK_MMU_POLL_TIMEOUT_US);
 	if (ret)
 		for (i = 0; i < iommu->num_mmu; i++)
@@ -533,8 +584,8 @@ static int rk_iommu_force_reset(struct rk_iommu *iommu)
 	rk_iommu_command(iommu, RK_MMU_CMD_FORCE_RESET);
 
 	ret = readx_poll_timeout(rk_iommu_is_reset_done, iommu, val,
-				 val, RK_MMU_FORCE_RESET_TIMEOUT_US,
-				 RK_MMU_POLL_TIMEOUT_US);
+				 val, RK_MMU_POLL_PERIOD_US,
+				 RK_MMU_FORCE_RESET_TIMEOUT_US);
 	if (ret) {
 		dev_err(iommu->dev, "FORCE_RESET command timed out\n");
 		return ret;
@@ -564,6 +615,17 @@ static void log_iova(struct rk_iommu *iommu, int index, dma_addr_t iova)
 	mmu_dte_addr = rk_iommu_read(base, RK_MMU_DTE_ADDR);
 	mmu_dte_addr_phys = iommu->rk_ops->pt_address(mmu_dte_addr);
 
+	/*
+	 * A reset of the master can reset its IOMMU too, between the fault and
+	 * this handler: DTE_ADDR then reads 0. Don't walk a directory that
+	 * isn't in memory; the caller still acknowledges the fault.
+	 */
+	if (!mmu_dte_addr || !pfn_valid(PHYS_PFN(mmu_dte_addr_phys))) {
+		dev_err(iommu->dev, "iova = %pad: fault while page table lost to reset (MMU_DTE_ADDR %#08x)\n",
+			&iova, mmu_dte_addr);
+		return;
+	}
+
 	dte_addr_phys = mmu_dte_addr_phys + (4 * dte_index);
 	dte_addr = phys_to_virt(dte_addr_phys);
 	dte = *dte_addr;
@@ -590,6 +652,88 @@ print_it:
 		rk_pte_is_page_valid(pte), &page_addr_phys, page_flags);
 }
 
+/*
+ * PAGE_FAULT_DONE lets the faulting master go on. A master whose job points
+ * at unmapped memory, such as a codec core given a bad address, keeps
+ * accessing it and faults again right away, many thousands of times a
+ * second, until its own driver resets it; and an encoder core was seen to
+ * retry the same few addresses for minutes. That interrupt storm keeps one
+ * CPU in hard interrupt context, which can also keep the master's driver
+ * from ever running the timeout that would stop it.
+ *
+ * In a storm, don't acknowledge the fault: the master is held at its
+ * faulting access, as the bank stays in PAGE_FAULT_ACTIVE, and the fault
+ * interrupt of the bank is masked. rk_iommu_enable() (an attach, as done by
+ * a driver that resets its core, or a runtime resume) acknowledges the
+ * fault and unmasks the interrupt, and so does release_work after
+ * RK_MMU_FAULT_HOLD_MS if nothing did, so that a master whose driver has no
+ * recovery isn't stopped for good.
+ */
+static bool rk_iommu_fault_storm(struct rk_iommu *iommu)
+{
+	unsigned long now = jiffies;
+
+	if (time_after(now, iommu->fault_window +
+		       msecs_to_jiffies(RK_MMU_FAULT_STORM_MS))) {
+		iommu->fault_window = now;
+		iommu->fault_count = 0;
+	}
+
+	return ++iommu->fault_count > RK_MMU_FAULT_STORM_COUNT;
+}
+
+static void rk_iommu_hold_fault(struct rk_iommu *iommu, int index)
+{
+	rk_iommu_write(iommu->bases[index], RK_MMU_INT_MASK, 0);
+	if (!test_and_set_bit(index, &iommu->held_banks))
+		dev_warn_ratelimited(iommu->dev,
+				     "page fault storm: holding the master for %u ms\n",
+				     RK_MMU_FAULT_HOLD_MS);
+	mod_delayed_work(system_wq, &iommu->release_work,
+			 msecs_to_jiffies(RK_MMU_FAULT_HOLD_MS));
+}
+
+static void rk_iommu_release_work(struct work_struct *work)
+{
+	struct rk_iommu *iommu = container_of(to_delayed_work(work),
+					      struct rk_iommu, release_work);
+	void __iomem *base;
+	int i, ret;
+
+	ret = pm_runtime_get_if_in_use(iommu->dev);
+	if (ret <= 0) {
+		/* a runtime resume reprograms the IOMMU */
+		WRITE_ONCE(iommu->held_banks, 0);
+		return;
+	}
+
+	if (WARN_ON(clk_bulk_enable(iommu->num_clocks, iommu->clocks)))
+		goto out;
+
+	for (i = 0; i < iommu->num_mmu; i++) {
+		if (!test_and_clear_bit(i, &iommu->held_banks))
+			continue;
+
+		/* Nothing to do if the IOMMU was enabled or disabled since */
+		base = iommu->bases[i];
+		if (rk_iommu_read(base, RK_MMU_INT_MASK) ||
+		    !(rk_iommu_read(base, RK_MMU_STATUS) &
+		      RK_MMU_STATUS_PAGING_ENABLED))
+			continue;
+
+		if (rk_iommu_read(base, RK_MMU_STATUS) &
+		    RK_MMU_STATUS_PAGE_FAULT_ACTIVE) {
+			rk_iommu_base_command(base, RK_MMU_CMD_ZAP_CACHE);
+			rk_iommu_base_command(base, RK_MMU_CMD_PAGE_FAULT_DONE);
+		}
+		rk_iommu_write(base, RK_MMU_INT_MASK, RK_MMU_IRQ_MASK);
+	}
+
+	clk_bulk_disable(iommu->num_clocks, iommu->clocks);
+out:
+	pm_runtime_put(iommu->dev);
+}
+
 static irqreturn_t rk_iommu_irq(int irq, void *dev_id)
 {
 	struct rk_iommu *iommu = dev_id;
@@ -597,6 +741,7 @@ static irqreturn_t rk_iommu_irq(int irq, void *dev_id)
 	u32 int_status;
 	dma_addr_t iova;
 	irqreturn_t ret = IRQ_NONE;
+	bool print;
 	int i, err;
 
 	err = pm_runtime_get_if_in_use(iommu->dev);
@@ -621,11 +766,22 @@ static irqreturn_t rk_iommu_irq(int irq, void *dev_id)
 			flags = (status & RK_MMU_STATUS_PAGE_FAULT_IS_WRITE) ?
 					IOMMU_FAULT_WRITE : IOMMU_FAULT_READ;
 
-			dev_err(iommu->dev, "Page fault at %pad of type %s\n",
-				&iova,
-				str_write_read(flags == IOMMU_FAULT_WRITE));
-
-			log_iova(iommu, i, iova);
+			/*
+			 * PAGE_FAULT_DONE below lets the master go on, and a
+			 * master that keeps accessing unmapped addresses faults
+			 * again at once, until its own driver stops it. Printing
+			 * every one of those faults from this handler keeps the
+			 * CPU in hard interrupt context for as long as the
+			 * console takes to print them. The trace event of
+			 * report_iommu_fault() still records every fault.
+			 */
+			print = __ratelimit(&iommu->fault_rs);
+			if (print) {
+				dev_err(iommu->dev, "Page fault at %pad of type %s\n",
+					&iova,
+					str_write_read(flags == IOMMU_FAULT_WRITE));
+				log_iova(iommu, i, iova);
+			}
 
 			/*
 			 * Report page fault to any installed handlers.
@@ -635,14 +791,19 @@ static irqreturn_t rk_iommu_irq(int irq, void *dev_id)
 			if (iommu->domain != &rk_identity_domain)
 				report_iommu_fault(iommu->domain, iommu->dev, iova,
 						   flags);
-			else
+			else if (print)
 				dev_err(iommu->dev, "Page fault while iommu not attached to domain?\n");
 
-			rk_iommu_base_command(iommu->bases[i], RK_MMU_CMD_ZAP_CACHE);
-			rk_iommu_base_command(iommu->bases[i], RK_MMU_CMD_PAGE_FAULT_DONE);
+			if (rk_iommu_fault_storm(iommu)) {
+				rk_iommu_hold_fault(iommu, i);
+			} else {
+				rk_iommu_base_command(iommu->bases[i], RK_MMU_CMD_ZAP_CACHE);
+				rk_iommu_base_command(iommu->bases[i], RK_MMU_CMD_PAGE_FAULT_DONE);
+			}
 		}
 
-		if (int_status & RK_MMU_IRQ_BUS_ERROR)
+		if ((int_status & RK_MMU_IRQ_BUS_ERROR) &&
+		    __ratelimit(&iommu->fault_rs))
 			dev_err(iommu->dev, "BUS_ERROR occurred at %pad\n", &iova);
 
 		if (int_status & ~RK_MMU_IRQ_MASK)
@@ -968,6 +1129,8 @@ static int rk_iommu_enable(struct rk_iommu *iommu)
 	}
 
 	ret = rk_iommu_enable_paging(iommu);
+	/* enable_stall() acknowledged any held fault, INT_MASK is set again */
+	WRITE_ONCE(iommu->held_banks, 0);
 
 out_disable_stall:
 	rk_iommu_disable_stall(iommu);
@@ -1187,8 +1350,10 @@ static int rk_iommu_of_xlate(struct device *dev,
 	iommu_dev = of_find_device_by_node(args->np);
 
 	data = devm_kzalloc(&iommu_dev->dev, sizeof(*data), GFP_KERNEL);
-	if (!data)
+	if (!data) {
+		platform_device_put(iommu_dev);
 		return -ENOMEM;
+	}
 
 	data->iommu = platform_get_drvdata(iommu_dev);
 	dev_iommu_priv_set(dev, data);
@@ -1259,6 +1424,9 @@ static int rk_iommu_probe(struct platform_device *pdev)
 
 	iommu->reset_disabled = device_property_read_bool(dev,
 					"rockchip,disable-mmu-reset");
+	ratelimit_state_init(&iommu->fault_rs, DEFAULT_RATELIMIT_INTERVAL,
+			     DEFAULT_RATELIMIT_BURST);
+	INIT_DELAYED_WORK(&iommu->release_work, rk_iommu_release_work);
 
 	/*
 	 * Take every clock the devicetree provides.  Most IOMMU instances
@@ -1324,6 +1492,7 @@ static void rk_iommu_shutdown(struct platform_device *pdev)
 
 		devm_free_irq(iommu->dev, irq, iommu);
 	}
+	cancel_delayed_work_sync(&iommu->release_work);
 
 	pm_runtime_force_suspend(&pdev->dev);
 }

@@ -93,7 +93,7 @@ static int rga_buf_init(struct vb2_buffer *vb)
 	n_desc = DIV_ROUND_UP(size, PAGE_SIZE);
 
 	rbuf->n_desc = n_desc;
-	rbuf->dma_desc = dma_alloc_coherent(rga->dev,
+	rbuf->dma_desc = dma_alloc_coherent(rga->cores[0]->dev,
 					    rbuf->n_desc * sizeof(*rbuf->dma_desc),
 					    &rbuf->dma_desc_pa, GFP_KERNEL);
 	if (!rbuf->dma_desc)
@@ -191,7 +191,7 @@ static void rga_buf_cleanup(struct vb2_buffer *vb)
 	if (!rga_has_internal_iommu(rga))
 		return;
 
-	dma_free_coherent(rga->dev, rbuf->n_desc * sizeof(*rbuf->dma_desc),
+	dma_free_coherent(rga->cores[0]->dev, rbuf->n_desc * sizeof(*rbuf->dma_desc),
 			  rbuf->dma_desc, rbuf->dma_desc_pa);
 }
 
@@ -242,14 +242,6 @@ static int rga_buf_prepare_streaming(struct vb2_queue *q)
 static int rga_buf_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct rga_ctx *ctx = vb2_get_drv_priv(q);
-	struct rockchip_rga *rga = ctx->rga;
-	int ret;
-
-	ret = pm_runtime_resume_and_get(rga->dev);
-	if (ret < 0) {
-		rga_buf_return_buffers(q, VB2_BUF_STATE_QUEUED);
-		return ret;
-	}
 
 	if (V4L2_TYPE_IS_OUTPUT(q->type))
 		ctx->osequence = 0;
@@ -261,11 +253,7 @@ static int rga_buf_start_streaming(struct vb2_queue *q, unsigned int count)
 
 static void rga_buf_stop_streaming(struct vb2_queue *q)
 {
-	struct rga_ctx *ctx = vb2_get_drv_priv(q);
-	struct rockchip_rga *rga = ctx->rga;
-
 	rga_buf_return_buffers(q, VB2_BUF_STATE_ERROR);
-	pm_runtime_put(rga->dev);
 }
 
 const struct vb2_ops rga_qops = {

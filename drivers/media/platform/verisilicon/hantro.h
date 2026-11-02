@@ -32,6 +32,7 @@ struct hantro_codec_ops;
 struct hantro_postproc_ops;
 
 #define HANTRO_JPEG_ENCODER	BIT(0)
+#define HANTRO_H264_ENCODER	BIT(1)
 #define HANTRO_ENCODERS		0x0000ffff
 #define HANTRO_MPEG2_DECODER	BIT(16)
 #define HANTRO_VP8_DECODER	BIT(17)
@@ -46,10 +47,13 @@ struct hantro_postproc_ops;
  *
  * @name:			irq name for device tree lookup
  * @handler:			interrupt handler
+ * @enc_optional:		the irq may be missing from the device tree, in
+ *				which case the encoder is not exposed
  */
 struct hantro_irq {
 	const char *name;
 	irqreturn_t (*handler)(int irq, void *priv);
+	bool enc_optional;
 };
 
 /**
@@ -77,6 +81,8 @@ struct hantro_irq {
  * @double_buffer:		core needs double buffering
  * @legacy_regs:		core uses legacy register set
  * @late_postproc:		postproc must be set up at the end of the job
+ * @multi_core:			identical instances of this variant can be driven as
+ *				a single device, running jobs in parallel
  * @shared_devices:		an array of device ids that cannot run concurrently
  */
 struct hantro_variant {
@@ -102,6 +108,7 @@ struct hantro_variant {
 	unsigned int double_buffer : 1;
 	unsigned int legacy_regs : 1;
 	unsigned int late_postproc : 1;
+	unsigned int multi_core : 1;
 	const struct of_device_id *shared_devices;
 };
 
@@ -109,6 +116,7 @@ struct hantro_variant {
  * enum hantro_codec_mode - codec operating mode.
  * @HANTRO_MODE_NONE:  No operating mode. Used for RAW video formats.
  * @HANTRO_MODE_JPEG_ENC: JPEG encoder.
+ * @HANTRO_MODE_H264_ENC: H264 encoder.
  * @HANTRO_MODE_H264_DEC: H264 decoder.
  * @HANTRO_MODE_MPEG2_DEC: MPEG-2 decoder.
  * @HANTRO_MODE_VP8_DEC: VP8 decoder.
@@ -119,6 +127,7 @@ struct hantro_variant {
 enum hantro_codec_mode {
 	HANTRO_MODE_NONE = -1,
 	HANTRO_MODE_JPEG_ENC,
+	HANTRO_MODE_H264_ENC,
 	HANTRO_MODE_H264_DEC,
 	HANTRO_MODE_MPEG2_DEC,
 	HANTRO_MODE_VP8_DEC,
@@ -173,6 +182,21 @@ hantro_vdev_to_func(struct video_device *vdev)
 }
 
 /**
+ * enum hantro_core_role - role of a VPU instance
+ * @HANTRO_CORE_SINGLE:		Standalone instance.
+ * @HANTRO_CORE_MAIN:		Main core of a multi-core device. It exposes the
+ *				device to userspace and binds the secondary
+ *				cores.
+ * @HANTRO_CORE_SECONDARY:	Secondary core of a multi-core device, running
+ *				jobs scheduled by the main core.
+ */
+enum hantro_core_role {
+	HANTRO_CORE_SINGLE,
+	HANTRO_CORE_MAIN,
+	HANTRO_CORE_SECONDARY,
+};
+
+/**
  * struct hantro_dev - driver data
  * @v4l2_dev:		V4L2 device to register video devices for.
  * @m2m_dev:		mem2mem device associated to this device.
@@ -193,6 +217,21 @@ hantro_vdev_to_func(struct video_device *vdev)
  *			shared with interrupt handlers.
  * @variant:		Hardware variant-specific parameters.
  * @watchdog_work:	Delayed work for hardware timeout handling.
+ * @curr_ctx:		Context whose job is running on this instance, or NULL
+ *			if the instance is idle. Protected by @cores_lock of
+ *			the device the job was scheduled on.
+ * @cores:		Hardware instances the jobs of this device can be
+ *			scheduled on. The first entry is the device itself.
+ * @num_cores:		Number of entries in @cores.
+ * @cores_lock:		Spinlock protecting @cores, @num_cores and @curr_ctx
+ *			of each core.
+ * @role:		Role of this instance in a multi-core device.
+ * @attached_domain:	IOMMU domain of the main core that this secondary
+ *			core is attached to, if any.
+ * @no_encoder:		The interrupt of the encoder isn't described, the
+ *			encoder is not exposed.
+ * @empty_domain:	Empty IOMMU domain, used to reinitialize the IOMMU after
+ *			a timeout. NULL if the VPU isn't behind an IOMMU.
  */
 struct hantro_dev {
 	struct v4l2_device v4l2_dev;
@@ -213,12 +252,25 @@ struct hantro_dev {
 	spinlock_t irqlock;
 	const struct hantro_variant *variant;
 	struct delayed_work watchdog_work;
+
+	struct hantro_ctx *curr_ctx;
+	struct hantro_dev **cores;
+	unsigned int num_cores;
+	spinlock_t cores_lock; /* protects the core list and curr_ctx */
+	enum hantro_core_role role;
+	struct iommu_domain *attached_domain;
+	bool no_encoder;
+	struct iommu_domain *empty_domain;
 };
 
 /**
  * struct hantro_ctx - Context (instance) private data.
  *
  * @dev:		VPU driver data to which the context belongs.
+ * @core:		VPU instance running the current job of this context,
+ *			only valid while a job is running. Codec operations
+ *			must access the hardware through it. It is the same
+ *			as @dev unless the variant has multiple cores.
  * @fh:			V4L2 file handler.
  * @is_encoder:		Decoder or encoder context?
  *
@@ -248,6 +300,7 @@ struct hantro_dev {
  */
 struct hantro_ctx {
 	struct hantro_dev *dev;
+	struct hantro_dev *core;
 	struct v4l2_fh fh;
 	bool is_encoder;
 
@@ -260,6 +313,9 @@ struct hantro_ctx {
 	struct v4l2_pix_format_mplane dst_fmt;
 	struct v4l2_pix_format_mplane ref_fmt;
 
+	struct v4l2_fract src_timeperframe;
+	struct v4l2_fract dst_timeperframe;
+
 	struct v4l2_ctrl_handler ctrl_handler;
 	int jpeg_quality;
 	int bit_depth;
@@ -271,6 +327,7 @@ struct hantro_ctx {
 	/* Specific for particular codec modes. */
 	union {
 		struct hantro_h264_dec_hw_ctx h264_dec;
+		struct hantro_h264_enc_hw_ctx h264_enc;
 		struct hantro_mpeg2_dec_hw_ctx mpeg2_dec;
 		struct hantro_vp8_dec_hw_ctx vp8_dec;
 		struct hantro_hevc_dec_hw_ctx hevc_dec;

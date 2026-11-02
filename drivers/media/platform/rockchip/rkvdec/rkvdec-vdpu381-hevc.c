@@ -10,6 +10,7 @@
 
 #include "rkvdec.h"
 #include "rkvdec-cabac.h"
+#include "rkvdec-ccu.h"
 #include "rkvdec-rcb.h"
 #include "rkvdec-hevc-common.h"
 #include "rkvdec-vdpu381-regs.h"
@@ -114,20 +115,31 @@ struct rkvdec_hevc_priv_tbl {
 	u8 cabac_table[27456];
 };
 
-struct rkvdec_hevc_ctx {
+/* The tables of one job, see &rkvdec_job.slot */
+struct rkvdec_hevc_job_tbl {
 	struct rkvdec_aux_buf			priv_tbl;
 	struct v4l2_ctrl_hevc_scaling_matrix	scaling_matrix_cache;
 	struct v4l2_ctrl_hevc_ext_sps_st_rps	st_cache;
+};
+
+struct rkvdec_hevc_ctx {
+	struct rkvdec_hevc_job_tbl		job_tbl[RKVDEC_MAX_JOBS];
 	struct rkvdec_vdpu381_regs_hevc		regs;
 };
+
+static struct rkvdec_hevc_job_tbl *rkvdec_hevc_job_tbl(struct rkvdec_ctx *ctx)
+{
+	struct rkvdec_hevc_ctx *hevc_ctx = ctx->priv;
+
+	return &hevc_ctx->job_tbl[ctx->job->slot];
+}
 
 static void assemble_hw_pps(struct rkvdec_ctx *ctx,
 			    struct rkvdec_hevc_run *run)
 {
-	struct rkvdec_hevc_ctx *hevc_ctx = ctx->priv;
 	const struct v4l2_ctrl_hevc_sps *sps = run->sps;
 	const struct v4l2_ctrl_hevc_pps *pps = run->pps;
-	struct rkvdec_hevc_priv_tbl *priv_tbl = hevc_ctx->priv_tbl.cpu;
+	struct rkvdec_hevc_priv_tbl *priv_tbl = rkvdec_hevc_job_tbl(ctx)->priv_tbl.cpu;
 	struct rkvdec_sps_pps_packet *hw_ps;
 	bool tiles_enabled;
 	s32 max_cu_width;
@@ -358,22 +370,22 @@ static void set_ref_valid(struct rkvdec_vdpu381_regs_hevc *regs, int id, u32 val
 
 static void rkvdec_write_regs(struct rkvdec_ctx *ctx)
 {
-	struct rkvdec_dev *rkvdec = ctx->dev;
+	struct rkvdec_core *core = ctx->core;
 	struct rkvdec_hevc_ctx *hevc_ctx = ctx->priv;
 
-	rkvdec_memcpy_toio(rkvdec->regs + OFFSET_COMMON_REGS,
+	rkvdec_memcpy_toio(core->regs + OFFSET_COMMON_REGS,
 			   &hevc_ctx->regs.common,
 			   sizeof(hevc_ctx->regs.common));
-	rkvdec_memcpy_toio(rkvdec->regs + OFFSET_CODEC_PARAMS_REGS,
+	rkvdec_memcpy_toio(core->regs + OFFSET_CODEC_PARAMS_REGS,
 			   &hevc_ctx->regs.hevc_param,
 			   sizeof(hevc_ctx->regs.hevc_param));
-	rkvdec_memcpy_toio(rkvdec->regs + OFFSET_COMMON_ADDR_REGS,
+	rkvdec_memcpy_toio(core->regs + OFFSET_COMMON_ADDR_REGS,
 			   &hevc_ctx->regs.common_addr,
 			   sizeof(hevc_ctx->regs.common_addr));
-	rkvdec_memcpy_toio(rkvdec->regs + OFFSET_CODEC_ADDR_REGS,
+	rkvdec_memcpy_toio(core->regs + OFFSET_CODEC_ADDR_REGS,
 			   &hevc_ctx->regs.hevc_addr,
 			   sizeof(hevc_ctx->regs.hevc_addr));
-	rkvdec_memcpy_toio(rkvdec->regs + OFFSET_POC_HIGHBIT_REGS,
+	rkvdec_memcpy_toio(core->regs + OFFSET_POC_HIGHBIT_REGS,
 			   &hevc_ctx->regs.hevc_highpoc,
 			   sizeof(hevc_ctx->regs.hevc_highpoc));
 }
@@ -385,7 +397,7 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	const struct v4l2_hevc_dpb_entry *dpb = dec_params->dpb;
 	struct rkvdec_hevc_ctx *hevc_ctx = ctx->priv;
 	struct rkvdec_vdpu381_regs_hevc *regs = &hevc_ctx->regs;
-	dma_addr_t priv_start_addr = hevc_ctx->priv_tbl.dma;
+	dma_addr_t priv_start_addr = rkvdec_hevc_job_tbl(ctx)->priv_tbl.dma;
 	const struct v4l2_pix_format_mplane *dst_fmt;
 	struct vb2_v4l2_buffer *src_buf = run->base.bufs.src;
 	struct vb2_v4l2_buffer *dst_buf = run->base.bufs.dst;
@@ -403,6 +415,9 @@ static void config_registers(struct rkvdec_ctx *ctx,
 
 	/* Set HEVC mode */
 	regs->common.reg009_dec_mode.dec_mode = VDPU381_MODE_HEVC;
+
+	/* Store the co-located motion vectors compressed, as for H.264 */
+	regs->common.reg012_secondary_en.colmv_compress_en = 1;
 
 	/* Set config */
 	regs->common.reg011_important_en.buf_empty_en = 1;
@@ -456,14 +471,22 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	else
 		regs->common.reg032_timeout_threshold = RKVDEC_TIMEOUT_MAX;
 
+	rkvdec_vdpu381_set_ccu_regs(ctx, &regs->common);
+
 	/* Set POC val */
 	regs->hevc_param.reg065_cur_top_poc = dec_params->pic_order_cnt_val;
+	rkvdec_job_add_poc(ctx, dec_params->pic_order_cnt_val, false);
 
 	/* Set ref pic address & poc */
 	for (i = 0; i < ARRAY_SIZE(dec_params->dpb); i++) {
 		struct vb2_buffer *vb_buf = get_ref_buf(ctx, run, i);
 		dma_addr_t buf_dma = vb2_dma_contig_plane_dma_addr(vb_buf, 0);
 		u32 valid = !!(dec_params->num_active_dpb_entries > i);
+
+		if (valid) {
+			rkvdec_job_add_ref(ctx, vb_buf);
+			rkvdec_job_add_poc(ctx, dpb[i].pic_order_cnt_val, true);
+		}
 
 		/* Set reference addresses */
 		regs->hevc_addr.reg164_180_ref_base[i] = buf_dma;
@@ -542,6 +565,7 @@ static int rkvdec_hevc_start(struct rkvdec_ctx *ctx)
 	struct rkvdec_hevc_priv_tbl *priv_tbl;
 	struct rkvdec_hevc_ctx *hevc_ctx;
 	struct v4l2_ctrl *ctrl;
+	unsigned int i;
 	int ret;
 
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
@@ -557,22 +581,33 @@ static int rkvdec_hevc_start(struct rkvdec_ctx *ctx)
 	if (!hevc_ctx)
 		return -ENOMEM;
 
-	priv_tbl = dma_alloc_coherent(rkvdec->dev, sizeof(*priv_tbl),
-				      &hevc_ctx->priv_tbl.dma, GFP_KERNEL);
-	if (!priv_tbl) {
-		ret = -ENOMEM;
-		goto err_free_ctx;
-	}
+	for (i = 0; i < ctx->num_job_slots; i++) {
+		struct rkvdec_aux_buf *buf = &hevc_ctx->job_tbl[i].priv_tbl;
 
-	hevc_ctx->priv_tbl.size = sizeof(*priv_tbl);
-	hevc_ctx->priv_tbl.cpu = priv_tbl;
-	memcpy(priv_tbl->cabac_table, rkvdec_hevc_cabac_table,
-	       sizeof(rkvdec_hevc_cabac_table));
+		priv_tbl = dma_alloc_coherent(rkvdec->main_core->dev,
+					      sizeof(*priv_tbl), &buf->dma,
+					      GFP_KERNEL);
+		if (!priv_tbl) {
+			ret = -ENOMEM;
+			goto err_free_tbl;
+		}
+
+		buf->size = sizeof(*priv_tbl);
+		buf->cpu = priv_tbl;
+		memcpy(priv_tbl->cabac_table, rkvdec_hevc_cabac_table,
+		       sizeof(rkvdec_hevc_cabac_table));
+	}
 
 	ctx->priv = hevc_ctx;
 	return 0;
 
-err_free_ctx:
+err_free_tbl:
+	while (i--) {
+		struct rkvdec_aux_buf *buf = &hevc_ctx->job_tbl[i].priv_tbl;
+
+		dma_free_coherent(rkvdec->main_core->dev, buf->size, buf->cpu,
+				  buf->dma);
+	}
 	kfree(hevc_ctx);
 	return ret;
 }
@@ -581,23 +616,30 @@ static void rkvdec_hevc_stop(struct rkvdec_ctx *ctx)
 {
 	struct rkvdec_hevc_ctx *hevc_ctx = ctx->priv;
 	struct rkvdec_dev *rkvdec = ctx->dev;
+	unsigned int i;
 
-	dma_free_coherent(rkvdec->dev, hevc_ctx->priv_tbl.size,
-			  hevc_ctx->priv_tbl.cpu, hevc_ctx->priv_tbl.dma);
+	for (i = 0; i < ctx->num_job_slots; i++) {
+		struct rkvdec_aux_buf *buf = &hevc_ctx->job_tbl[i].priv_tbl;
+
+		dma_free_coherent(rkvdec->main_core->dev, buf->size, buf->cpu,
+				  buf->dma);
+	}
 	kfree(hevc_ctx);
 }
 
 static int rkvdec_hevc_run(struct rkvdec_ctx *ctx)
 {
-	struct rkvdec_dev *rkvdec = ctx->dev;
+	struct rkvdec_core *core = ctx->core;
 	struct rkvdec_hevc_run run;
 	struct rkvdec_hevc_ctx *hevc_ctx = ctx->priv;
-	struct rkvdec_hevc_priv_tbl *tbl = hevc_ctx->priv_tbl.cpu;
+	struct rkvdec_hevc_job_tbl *job_tbl = rkvdec_hevc_job_tbl(ctx);
+	struct rkvdec_hevc_priv_tbl *tbl = job_tbl->priv_tbl.cpu;
+	int ret;
 
 	rkvdec_hevc_run_preamble(ctx, &run);
 
 	rkvdec_hevc_assemble_hw_scaling_list(ctx, &run, &tbl->scaling_list,
-					     &hevc_ctx->scaling_matrix_cache);
+					     &job_tbl->scaling_matrix_cache);
 	assemble_hw_pps(ctx, &run);
 
 	/*
@@ -606,19 +648,25 @@ static int rkvdec_hevc_run(struct rkvdec_ctx *ctx)
 	 */
 	if ((!ctx->has_sps_lt_rps && run.sps->num_long_term_ref_pics_sps) ||
 	    (!ctx->has_sps_st_rps && run.sps->num_short_term_ref_pic_sets)) {
-		dev_warn_ratelimited(rkvdec->dev, "Long and short term RPS not set\n");
+		dev_warn_ratelimited(core->dev, "Long and short term RPS not set\n");
 	} else {
-		rkvdec_hevc_assemble_hw_rps(&run, &tbl->rps, &hevc_ctx->st_cache);
+		rkvdec_hevc_assemble_hw_rps(&run, &tbl->rps, &job_tbl->st_cache);
 	}
 
 	config_registers(ctx, &run);
 
 	rkvdec_run_postamble(ctx, &run.base);
 
-	rkvdec_schedule_watchdog(rkvdec, hevc_ctx->regs.common.reg032_timeout_threshold);
+	/* Before the watchdog: this may wait for the earlier frames. */
+	ret = rkvdec_job_wait_poc_alias(ctx);
+	if (ret)
+		return ret;
+
+	rkvdec_schedule_watchdog(core, hevc_ctx->regs.common.reg032_timeout_threshold);
 
 	/* Start decoding! */
-	writel(VDPU381_DEC_E_BIT, rkvdec->regs + VDPU381_REG_DEC_E);
+	rkvdec_ccu_start(ctx);
+	writel(VDPU381_DEC_E_BIT, ctx->core->regs + VDPU381_REG_DEC_E);
 
 	return 0;
 }

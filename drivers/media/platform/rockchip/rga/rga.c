@@ -5,12 +5,15 @@
  */
 
 #include <linux/clk.h>
+#include <linux/component.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/interrupt.h>
+#include <linux/iommu.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
 #include <linux/sched.h>
@@ -31,58 +34,218 @@
 static int debug;
 module_param(debug, int, 0644);
 
+/* Longest time a job may take before its core is reset */
+#define RGA_JOB_TIMEOUT_MS	2000
+
+static void rga_job_finish(struct rga_core *core, struct rga_ctx *ctx,
+			   enum vb2_buffer_state state)
+{
+	struct rockchip_rga *rga = core->rga;
+	struct vb2_v4l2_buffer *src, *dst;
+
+	src = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+	dst = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+
+	WARN_ON(!src);
+	WARN_ON(!dst);
+
+	v4l2_m2m_buf_copy_metadata(src, dst);
+
+	dst->sequence = ctx->csequence++;
+
+	v4l2_m2m_buf_done(src, state);
+	v4l2_m2m_buf_done(dst, state);
+	v4l2_m2m_job_finish(rga->m2m_dev, ctx->fh.m2m_ctx);
+
+	pm_runtime_put_autosuspend(core->dev);
+}
+
+static void rga_core_reset(struct rga_core *core)
+{
+	unsigned int i;
+
+	for (i = 0; i < RGA_NUM_RESETS; i++) {
+		reset_control_assert(core->resets[i].rstc);
+		udelay(1);
+		reset_control_deassert(core->resets[i].rstc);
+	}
+}
+
+/*
+ * Resetting a core also resets its IOMMU, which is then left in bypass while
+ * the IOMMU driver still considers it attached to its domain. Attach the
+ * empty domain and detach it again to return to the default DMA domain: the
+ * IOMMU driver then fully reinitializes the IOMMU, which keeps the mappings
+ * of the domain. A core attached to the domain of the first core is detached
+ * from it first, and attached to it again at the end.
+ */
+static void rga_core_iommu_restore(struct rga_core *core)
+{
+	int ret;
+
+	if (!core->empty_domain)
+		return;
+
+	if (core->attached_domain)
+		iommu_detach_device(core->attached_domain, core->dev);
+
+	ret = iommu_attach_device(core->empty_domain, core->dev);
+	if (ret)
+		dev_warn(core->dev, "Failed to attach the empty IOMMU domain: %d\n",
+			 ret);
+	else
+		iommu_detach_device(core->empty_domain, core->dev);
+
+	if (core->attached_domain) {
+		ret = iommu_attach_device(core->attached_domain, core->dev);
+		if (ret)
+			dev_err(core->dev, "Failed to attach back to the IOMMU domain of the first core: %d\n",
+				ret);
+	}
+}
+
+/*
+ * Runs when the job of a core timed out, or right away when the core reported
+ * an error. Either way the core may still be busy or stuck on the bus: reset
+ * it and its IOMMU before returning the buffers with an error, so that the
+ * next job starts on a clean core.
+ */
+static void rga_watchdog(struct work_struct *work)
+{
+	struct rga_core *core = container_of(to_delayed_work(work),
+					     struct rga_core, watchdog_work);
+	struct rockchip_rga *rga = core->rga;
+	struct rga_ctx *ctx = core->curr;
+	unsigned long flags;
+
+	if (WARN_ON(!ctx))
+		return;
+
+	if (READ_ONCE(core->job_failed))
+		dev_err(core->dev, "job failed, resetting the core\n");
+	else
+		dev_err(core->dev, "job timed out, resetting the core\n");
+
+	if (rga->hw->reset)
+		rga->hw->reset(core);
+	rga_core_reset(core);
+	rga_core_iommu_restore(core);
+
+	spin_lock_irqsave(&rga->cores_lock, flags);
+	WRITE_ONCE(core->job_failed, false);
+	core->curr = NULL;
+	spin_unlock_irqrestore(&rga->cores_lock, flags);
+
+	rga_job_finish(core, ctx, VB2_BUF_STATE_ERROR);
+}
+
 static void device_run(void *prv)
 {
 	struct rga_ctx *ctx = prv;
 	struct rockchip_rga *rga = ctx->rga;
+	struct rga_core *core = NULL;
 	struct vb2_v4l2_buffer *src, *dst;
 	unsigned long flags;
+	int ret;
+	unsigned int i;
+
+	spin_lock_irqsave(&rga->cores_lock, flags);
+	for (i = 0; i < rga->num_cores; i++) {
+		if (!rga->cores[i]->curr) {
+			core = rga->cores[i];
+			core->curr = ctx;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&rga->cores_lock, flags);
+
+	WARN_ONCE(!core, "No free core although max parallel jobs matches the core count!\n");
+	if (!core)
+		return;
+
+	ret = pm_runtime_resume_and_get(core->dev);
+	if (ret < 0) {
+		core->curr = NULL;
+		v4l2_m2m_buf_done_and_job_finish(rga->m2m_dev, ctx->fh.m2m_ctx,
+						 VB2_BUF_STATE_ERROR);
+		return;
+	}
 
 	spin_lock_irqsave(&rga->ctrl_lock, flags);
 	if (ctx->cmdbuf_dirty) {
 		ctx->cmdbuf_dirty = false;
+		memset(ctx->cmdbuf_virt, 0, rga->hw->cmdbuf_size);
 		rga->hw->setup_cmdbuf(ctx);
 	}
 	spin_unlock_irqrestore(&rga->ctrl_lock, flags);
-
-	rga->curr = ctx;
 
 	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 	src->sequence = ctx->osequence++;
 
 	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
 
-	rga->hw->start(rga, vb_to_rga(src), vb_to_rga(dst));
+	schedule_delayed_work(&core->watchdog_work,
+			      msecs_to_jiffies(RGA_JOB_TIMEOUT_MS));
+	rga->hw->start(core, vb_to_rga(src), vb_to_rga(dst));
+}
+
+static irqreturn_t rga_core_irq(struct rga_core *core)
+{
+	struct rockchip_rga *rga = core->rga;
+	enum rga_irq_status status;
+	struct rga_ctx *ctx;
+
+	/* ignore interrupt on an unbound core */
+	if (!rga)
+		return IRQ_HANDLED;
+
+	status = rga->hw->handle_irq(core);
+	if (status == RGA_IRQ_NONE)
+		return IRQ_NONE;
+
+	ctx = core->curr;
+	if (status == RGA_IRQ_BUSY || !ctx || READ_ONCE(core->job_failed))
+		return IRQ_HANDLED;
+
+	/*
+	 * If the watchdog isn't pending anymore, it is already resetting the
+	 * core and finishes the job itself.
+	 */
+	if (!cancel_delayed_work(&core->watchdog_work))
+		return IRQ_HANDLED;
+
+	if (status == RGA_IRQ_ERROR) {
+		/* The core must be reset, which can't be done from here */
+		WRITE_ONCE(core->job_failed, true);
+		schedule_delayed_work(&core->watchdog_work, 0);
+		return IRQ_HANDLED;
+	}
+
+	core->curr = NULL;
+	rga_job_finish(core, ctx, VB2_BUF_STATE_DONE);
+
+	return IRQ_HANDLED;
 }
 
 static irqreturn_t rga_isr(int irq, void *prv)
 {
-	struct rockchip_rga *rga = prv;
+	struct rga_core *core = prv;
+	irqreturn_t ret;
 
-	if (rga->hw->handle_irq(rga)) {
-		struct vb2_v4l2_buffer *src, *dst;
-		struct rga_ctx *ctx = rga->curr;
+	/*
+	 * The interrupt line of an RGA3 core is shared with its IOMMU, which
+	 * can raise it while the core is suspended or being suspended. Reading
+	 * the registers of a core whose clocks or power domain are off ends
+	 * in a synchronous external abort.
+	 */
+	if (!pm_runtime_get_if_active(core->dev))
+		return IRQ_NONE;
 
-		WARN_ON(!ctx);
+	ret = rga_core_irq(core);
 
-		rga->curr = NULL;
+	pm_runtime_put_autosuspend(core->dev);
 
-		src = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
-		dst = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
-
-		WARN_ON(!src);
-		WARN_ON(!dst);
-
-		v4l2_m2m_buf_copy_metadata(src, dst);
-
-		dst->sequence = ctx->csequence++;
-
-		v4l2_m2m_buf_done(src, VB2_BUF_STATE_DONE);
-		v4l2_m2m_buf_done(dst, VB2_BUF_STATE_DONE);
-		v4l2_m2m_job_finish(rga->m2m_dev, ctx->fh.m2m_ctx);
-	}
-
-	return IRQ_HANDLED;
+	return ret;
 }
 
 static const struct v4l2_m2m_ops rga_m2m_ops = {
@@ -107,7 +270,7 @@ queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 	src_vq->buf_struct_size = sizeof(struct rga_vb_buffer);
 	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	src_vq->lock = &ctx->rga->mutex;
-	src_vq->dev = ctx->rga->v4l2_dev.dev;
+	src_vq->dev = ctx->rga->cores[0]->dev;
 
 	ret = vb2_queue_init(src_vq);
 	if (ret)
@@ -125,7 +288,7 @@ queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 	dst_vq->buf_struct_size = sizeof(struct rga_vb_buffer);
 	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	dst_vq->lock = &ctx->rga->mutex;
-	dst_vq->dev = ctx->rga->v4l2_dev.dev;
+	dst_vq->dev = ctx->rga->cores[0]->dev;
 
 	return vb2_queue_init(dst_vq);
 }
@@ -264,7 +427,7 @@ static int rga_open(struct file *file)
 		return -ENOMEM;
 
 	/* Create CMD buffer */
-	ctx->cmdbuf_virt = dma_alloc_attrs(rga->dev, rga->hw->cmdbuf_size,
+	ctx->cmdbuf_virt = dma_alloc_attrs(rga->cores[0]->dev, rga->hw->cmdbuf_size,
 					   &ctx->cmdbuf_phy, GFP_KERNEL,
 					   DMA_ATTR_WRITE_COMBINE);
 	if (!ctx->cmdbuf_virt) {
@@ -311,7 +474,7 @@ static int rga_open(struct file *file)
 unlock_mutex:
 	mutex_unlock(&rga->mutex);
 rel_cmdbuf:
-	dma_free_attrs(rga->dev, rga->hw->cmdbuf_size, ctx->cmdbuf_virt,
+	dma_free_attrs(rga->cores[0]->dev, rga->hw->cmdbuf_size, ctx->cmdbuf_virt,
 		       ctx->cmdbuf_phy, DMA_ATTR_WRITE_COMBINE);
 rel_ctx:
 	kfree(ctx);
@@ -331,7 +494,7 @@ static int rga_release(struct file *file)
 	v4l2_fh_del(&ctx->fh, file);
 	v4l2_fh_exit(&ctx->fh);
 
-	dma_free_attrs(rga->dev, rga->hw->cmdbuf_size, ctx->cmdbuf_virt,
+	dma_free_attrs(rga->cores[0]->dev, rga->hw->cmdbuf_size, ctx->cmdbuf_virt,
 		       ctx->cmdbuf_phy, DMA_ATTR_WRITE_COMBINE);
 
 	kfree(ctx);
@@ -371,12 +534,14 @@ static int vidioc_enum_fmt(struct file *file, void *priv, struct v4l2_fmtdesc *f
 	if (ret != 0)
 		return ret;
 
-	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
-	    f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
-		return 0;
-
-	/* allow changing the quantization and xfer func for YUV formats */
-	if (v4l2_is_format_yuv(v4l2_format_info(f->pixelformat)))
+	/*
+	 * Allow changing the quantization and ycbcr_enc func for YUV formats
+	 * on the capture side for RGB -> YUV conversions.
+	 *
+	 * These flags are only relevant for capture devices.
+	 */
+	if (V4L2_TYPE_IS_CAPTURE(f->type) &&
+	    v4l2_is_format_yuv(v4l2_format_info(f->pixelformat)))
 		f->flags |= V4L2_FMT_FLAG_CSC_QUANTIZATION |
 			    V4L2_FMT_FLAG_CSC_YCBCR_ENC;
 
@@ -413,6 +578,16 @@ static int vidioc_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
 		.step_height = 1,
 	};
 
+	/*
+	 * Technically 4:2:2 YUV formats don't need a step_height of 2.
+	 * But for the RGA3 this is explicitly documented in  section 5.6.3
+	 * of the RK3588 TRM Part 2.
+	 * And the RGA2 vendor driver also checks that the height (and width)
+	 * is aligned to 2 when a YUV format is used.
+	 *
+	 * Therefore be safe and always align width and height to 2
+	 * when a YUV format is used.
+	 */
 	if (v4l2_is_format_yuv(v4l2_format_info(pix_fmt->pixelformat))) {
 		frmsize.step_width = 2;
 		frmsize.step_height = 2;
@@ -666,244 +841,240 @@ static const struct video_device rga_videodev = {
 	.device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING,
 };
 
-static int rga_parse_dt(struct rockchip_rga *rga)
+static int rga_parse_dt(struct rga_core *core)
 {
-	struct reset_control *core_rst, *axi_rst, *ahb_rst;
 	int ret;
 
-	core_rst = devm_reset_control_get(rga->dev, "core");
-	if (IS_ERR(core_rst)) {
-		dev_err(rga->dev, "failed to get core reset controller\n");
-		return PTR_ERR(core_rst);
+	core->resets[0].id = "core";
+	core->resets[1].id = "axi";
+	core->resets[2].id = "ahb";
+	ret = devm_reset_control_bulk_get_exclusive(core->dev, RGA_NUM_RESETS,
+						    core->resets);
+	if (ret) {
+		dev_err(core->dev, "failed to get reset controllers\n");
+		return ret;
 	}
 
-	axi_rst = devm_reset_control_get(rga->dev, "axi");
-	if (IS_ERR(axi_rst)) {
-		dev_err(rga->dev, "failed to get axi reset controller\n");
-		return PTR_ERR(axi_rst);
-	}
+	rga_core_reset(core);
 
-	ahb_rst = devm_reset_control_get(rga->dev, "ahb");
-	if (IS_ERR(ahb_rst)) {
-		dev_err(rga->dev, "failed to get ahb reset controller\n");
-		return PTR_ERR(ahb_rst);
-	}
-
-	reset_control_assert(core_rst);
-	udelay(1);
-	reset_control_deassert(core_rst);
-
-	reset_control_assert(axi_rst);
-	udelay(1);
-	reset_control_deassert(axi_rst);
-
-	reset_control_assert(ahb_rst);
-	udelay(1);
-	reset_control_deassert(ahb_rst);
-
-	ret = devm_clk_bulk_get_all(rga->dev, &rga->clks);
+	ret = devm_clk_bulk_get_all(core->dev, &core->clks);
 	if (ret < 0) {
-		dev_err(rga->dev, "failed to get clocks\n");
+		dev_err(core->dev, "failed to get clocks\n");
 		return ret;
 	}
-	rga->num_clks = ret;
+	core->num_clks = ret;
 
 	return 0;
 }
 
-/*
- * Some SoCs, like RK3588 have multiple identical RGA3 cores, but the
- * kernel is currently missing support for multi-core handling. Exposing
- * separate devices for each core to userspace is bad, since that does
- * not allow scheduling tasks properly (and creates ABI). With this workaround
- * the driver will only probe for the first core and early exit for the other
- * cores. Once the driver gains multi-core support, the same technique
- * for detecting the main core can be used to cluster all cores together.
- */
-static int rga_disable_multicore(struct device *dev)
+static int rga_core_bind(struct device *dev, struct device *master, void *data)
 {
-	struct device_node *node = NULL;
-	const char *compatible;
-	bool is_main_core;
-	int ret;
+	struct rockchip_rga *rga = data;
+	struct rga_core *core = dev_get_drvdata(dev);
+	struct rockchip_rga_version version;
+	unsigned long flags;
+	int ret = 0;
 
-	/* Intentionally ignores the fallback strings */
-	ret = of_property_read_string(dev->of_node, "compatible", &compatible);
-	if (ret)
+	core->rga = rga;
+
+	ret = pm_runtime_resume_and_get(core->dev);
+	if (ret < 0)
 		return ret;
 
-	/* The first compatible and available node found is considered the main core */
-	do {
-		node = of_find_compatible_node(node, NULL, compatible);
-		if (of_device_is_available(node))
-			break;
-	} while (node);
+	version = rga->hw->get_version(core);
 
-	if (!node)
-		return -EINVAL;
+	v4l2_info(&rga->v4l2_dev, "HW Version: 0x%02x.%02x\n",
+		  rga->version.major, rga->version.minor);
 
-	is_main_core = (dev->of_node == node);
+	if (rga->num_cores) {
+		/* Attach to the first cores iommu */
+		struct iommu_domain *domain = iommu_get_domain_for_dev(rga->cores[0]->dev);
 
-	of_node_put(node);
+		if (!domain) {
+			dev_err(core->dev, "Couldn't get domain of the first core\n");
+			return -ENODEV;
+		}
+		ret = iommu_attach_device(domain, core->dev);
+		if (ret) {
+			dev_err(core->dev, "Couldn't attach to the domain of the first core\n");
+			return ret;
+		}
+		core->attached_domain = domain;
 
-	if (!is_main_core) {
-		dev_info(dev, "missing multi-core support, ignoring this instance\n");
-		return -ENODEV;
-	}
+		/* we are not the first core, expect that we have the same version */
+		if (rga->version.major != version.major || rga->version.minor != version.minor) {
+			v4l2_err(&rga->v4l2_dev, "Detected multi-core setup with different core versions!\n");
+			return -ENODEV;
+		}
+	} else
+		rga->version = version;
+
+	pm_runtime_put(core->dev);
+
+	spin_lock_irqsave(&rga->cores_lock, flags);
+	rga->cores[rga->num_cores++] = core;
+	spin_unlock_irqrestore(&rga->cores_lock, flags);
 
 	return 0;
 }
 
-static int rga_probe(struct platform_device *pdev)
+static void rga_core_unbind(struct device *dev, struct device *master,
+			    void *data)
 {
-	struct rockchip_rga *rga;
-	struct video_device *vfd;
+	struct rga_core *core = dev_get_drvdata(dev);
+	struct rockchip_rga *rga = core->rga;
+	u8 i;
+	unsigned long flags;
+
+	/* Remove our core from the list */
+	for (i = 0; i < rga->num_cores; i++) {
+		if (rga->cores[i] != core)
+			continue;
+
+		if (i) {
+			/* Detach from the first core iommu */
+			struct iommu_domain *domain = iommu_get_domain_for_dev(rga->cores[0]->dev);
+
+			if (domain)
+				iommu_detach_device(domain, core->dev);
+			core->attached_domain = NULL;
+		}
+
+		spin_lock_irqsave(&rga->cores_lock, flags);
+		rga->cores[i] = rga->cores[rga->num_cores - 1];
+		rga->num_cores--;
+		spin_unlock_irqrestore(&rga->cores_lock, flags);
+		break;
+	}
+
+	cancel_delayed_work_sync(&core->watchdog_work);
+
+	/* make the ISR ignore this core before the m2m device is released */
+	core->rga = NULL;
+	synchronize_irq(core->irq);
+}
+
+static const struct component_ops rga_core_ops = {
+	.bind = rga_core_bind,
+	.unbind = rga_core_unbind,
+};
+
+static void rga_free_empty_domain(void *data)
+{
+	iommu_domain_free(data);
+}
+
+static int rga_alloc_empty_domain(struct rga_core *core)
+{
+	struct iommu_domain *domain;
+
+	if (!iommu_get_domain_for_dev(core->dev))
+		return 0;
+
+	domain = iommu_paging_domain_alloc(core->dev);
+	if (IS_ERR(domain)) {
+		/* Not fatal, the IOMMU just won't be restored after a reset */
+		dev_warn(core->dev, "Failed to allocate an empty IOMMU domain: %pe\n",
+			 domain);
+		return 0;
+	}
+
+	core->empty_domain = domain;
+
+	return devm_add_action_or_reset(core->dev, rga_free_empty_domain,
+					domain);
+}
+
+static int rga_core_probe(struct platform_device *pdev)
+{
+	struct rga_core *core;
+	const struct rga_hw *hw;
 	int ret = 0;
 	int irq;
 
 	if (!pdev->dev.of_node)
 		return -ENODEV;
 
-	ret = rga_disable_multicore(&pdev->dev);
-	if (ret)
-		return ret;
-
-	rga = devm_kzalloc(&pdev->dev, sizeof(*rga), GFP_KERNEL);
-	if (!rga)
-		return -ENOMEM;
-
-	rga->hw = of_device_get_match_data(&pdev->dev);
-	if (!rga->hw)
+	hw = of_device_get_match_data(&pdev->dev);
+	if (!hw)
 		return dev_err_probe(&pdev->dev, -ENODEV, "failed to get match data\n");
 
-	rga->dev = &pdev->dev;
-	spin_lock_init(&rga->ctrl_lock);
-	mutex_init(&rga->mutex);
+	core = devm_kzalloc(&pdev->dev, sizeof(*core), GFP_KERNEL);
+	if (!core)
+		return -ENOMEM;
 
-	ret = rga_parse_dt(rga);
+	core->dev = &pdev->dev;
+	INIT_DELAYED_WORK(&core->watchdog_work, rga_watchdog);
+
+	ret = rga_parse_dt(core);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "Unable to parse OF data\n");
 
-	pm_runtime_enable(rga->dev);
+	ret = rga_alloc_empty_domain(core);
+	if (ret)
+		return ret;
 
-	rga->regs = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(rga->regs)) {
-		ret = PTR_ERR(rga->regs);
-		goto err_put_clk;
-	}
+	ret = devm_pm_runtime_enable(core->dev);
+	if (ret)
+		return ret;
+
+	pm_runtime_set_autosuspend_delay(core->dev, 50);
+	pm_runtime_use_autosuspend(core->dev);
+
+	core->regs = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(core->regs))
+		return PTR_ERR(core->regs);
 
 	irq = platform_get_irq(pdev, 0);
-	if (irq < 0) {
-		ret = irq;
-		goto err_put_clk;
-	}
+	if (irq < 0)
+		return irq;
+	core->irq = irq;
 
-	ret = devm_request_irq(rga->dev, irq, rga_isr,
-			       rga_has_internal_iommu(rga) ? 0 : IRQF_SHARED,
-			       dev_name(rga->dev), rga);
-	if (ret < 0) {
-		dev_err(rga->dev, "failed to request irq\n");
-		goto err_put_clk;
-	}
-
-	ret = dma_set_mask_and_coherent(rga->dev, DMA_BIT_MASK(32));
-	if (ret) {
-		dev_err(rga->dev, "32-bit DMA not supported");
-		goto err_put_clk;
-	}
-
-	ret = v4l2_device_register(&pdev->dev, &rga->v4l2_dev);
-	if (ret)
-		goto err_put_clk;
-	vfd = video_device_alloc();
-	if (!vfd) {
-		v4l2_err(&rga->v4l2_dev, "Failed to allocate video device\n");
-		ret = -ENOMEM;
-		goto unreg_v4l2_dev;
-	}
-	*vfd = rga_videodev;
-	vfd->lock = &rga->mutex;
-	vfd->v4l2_dev = &rga->v4l2_dev;
-
-	video_set_drvdata(vfd, rga);
-	rga->vfd = vfd;
-
-	platform_set_drvdata(pdev, rga);
-	rga->m2m_dev = v4l2_m2m_init(&rga_m2m_ops);
-	if (IS_ERR(rga->m2m_dev)) {
-		v4l2_err(&rga->v4l2_dev, "Failed to init mem2mem device\n");
-		ret = PTR_ERR(rga->m2m_dev);
-		goto rel_vdev;
-	}
-
-	ret = pm_runtime_resume_and_get(rga->dev);
+	ret = devm_request_irq(core->dev, irq, rga_isr,
+			       hw->has_internal_iommu ? 0 : IRQF_SHARED,
+			       dev_name(core->dev), core);
 	if (ret < 0)
-		goto rel_m2m;
+		return dev_err_probe(core->dev, ret, "failed to request irq\n");
 
-	rga->hw->get_version(rga);
+	ret = dma_set_mask_and_coherent(core->dev, DMA_BIT_MASK(32));
+	if (ret)
+		dev_err_probe(core->dev, ret, "32-bit DMA not supported");
 
-	v4l2_info(&rga->v4l2_dev, "HW Version: 0x%02x.%02x\n",
-		  rga->version.major, rga->version.minor);
+	platform_set_drvdata(pdev, core);
 
-	pm_runtime_put(rga->dev);
-
-	ret = video_register_device(vfd, VFL_TYPE_VIDEO, -1);
-	if (ret) {
-		v4l2_err(&rga->v4l2_dev, "Failed to register video device\n");
-		goto rel_m2m;
-	}
-
-	v4l2_info(&rga->v4l2_dev, "Registered %s as /dev/%s\n",
-		  vfd->name, video_device_node_name(vfd));
-
-	return 0;
-
-rel_m2m:
-	v4l2_m2m_release(rga->m2m_dev);
-rel_vdev:
-	video_device_release(vfd);
-unreg_v4l2_dev:
-	v4l2_device_unregister(&rga->v4l2_dev);
-err_put_clk:
-	pm_runtime_disable(rga->dev);
-
-	return ret;
-}
-
-static void rga_remove(struct platform_device *pdev)
-{
-	struct rockchip_rga *rga = platform_get_drvdata(pdev);
-
-	v4l2_info(&rga->v4l2_dev, "Removing\n");
-
-	v4l2_m2m_release(rga->m2m_dev);
-	video_unregister_device(rga->vfd);
-	v4l2_device_unregister(&rga->v4l2_dev);
-
-	pm_runtime_disable(rga->dev);
-}
-
-static int __maybe_unused rga_runtime_suspend(struct device *dev)
-{
-	struct rockchip_rga *rga = dev_get_drvdata(dev);
-
-	clk_bulk_disable_unprepare(rga->num_clks, rga->clks);
+	ret = component_add(&pdev->dev, &rga_core_ops);
+	if (ret < 0)
+		return dev_err_probe(&pdev->dev, ret, "failed to register component\n");
 
 	return 0;
 }
 
-static int __maybe_unused rga_runtime_resume(struct device *dev)
+static void rga_core_remove(struct platform_device *pdev)
 {
-	struct rockchip_rga *rga = dev_get_drvdata(dev);
-
-	return clk_bulk_prepare_enable(rga->num_clks, rga->clks);
+	component_del(&pdev->dev, &rga_core_ops);
 }
 
-static const struct dev_pm_ops rga_pm = {
-	SET_RUNTIME_PM_OPS(rga_runtime_suspend,
-			   rga_runtime_resume, NULL)
+static int rga_runtime_suspend(struct device *dev)
+{
+	struct rga_core *core = dev_get_drvdata(dev);
+
+	clk_bulk_disable_unprepare(core->num_clks, core->clks);
+
+	return 0;
+}
+
+static int rga_runtime_resume(struct device *dev)
+{
+	struct rga_core *core = dev_get_drvdata(dev);
+
+	return clk_bulk_prepare_enable(core->num_clks, core->clks);
+}
+
+static const struct dev_pm_ops rga_core_pm = {
+	RUNTIME_PM_OPS(rga_runtime_suspend, rga_runtime_resume, NULL)
 };
 
+/* add new compatibles also to the rga_ids struct */
 static const struct of_device_id rockchip_rga_match[] = {
 	{
 		.compatible = "rockchip,rk3288-rga",
@@ -922,18 +1093,265 @@ static const struct of_device_id rockchip_rga_match[] = {
 
 MODULE_DEVICE_TABLE(of, rockchip_rga_match);
 
+static struct platform_driver rga_core_pdrv = {
+	.probe = rga_core_probe,
+	.remove = rga_core_remove,
+	.driver = {
+		.name = RGA_NAME "-core",
+		.pm = pm_ptr(&rga_core_pm),
+		.of_match_table = rockchip_rga_match,
+	},
+};
+
+static int rga_bind(struct device *dev)
+{
+	struct rockchip_rga *rga = dev_get_drvdata(dev);
+	struct video_device *vfd;
+	int ret;
+
+	ret = v4l2_device_register(dev, &rga->v4l2_dev);
+	if (ret)
+		return ret;
+	vfd = video_device_alloc();
+	if (!vfd) {
+		v4l2_err(&rga->v4l2_dev, "Failed to allocate video device\n");
+		ret = -ENOMEM;
+		goto unreg_v4l2_dev;
+	}
+	*vfd = rga_videodev;
+	vfd->lock = &rga->mutex;
+	vfd->v4l2_dev = &rga->v4l2_dev;
+
+	video_set_drvdata(vfd, rga);
+	rga->vfd = vfd;
+
+	rga->m2m_dev = v4l2_m2m_init(&rga_m2m_ops);
+	if (IS_ERR(rga->m2m_dev)) {
+		v4l2_err(&rga->v4l2_dev, "Failed to init mem2mem device\n");
+		ret = PTR_ERR(rga->m2m_dev);
+		goto rel_vdev;
+	}
+
+	ret = video_register_device(vfd, VFL_TYPE_VIDEO, -1);
+	if (ret) {
+		v4l2_err(&rga->v4l2_dev, "Failed to register video device\n");
+		goto rel_m2m;
+	}
+
+	ret = component_bind_all(dev, rga);
+	if (ret) {
+		dev_err(dev, "component bind failed\n");
+		goto rel_m2m;
+	}
+
+	/* after binding all cores num_cores has the proper number of cores */
+	v4l2_m2m_set_max_parallel_jobs(rga->m2m_dev, rga->num_cores);
+
+	v4l2_info(&rga->v4l2_dev, "Registered %s as /dev/%s\n",
+		  vfd->name, video_device_node_name(vfd));
+
+	return 0;
+
+rel_m2m:
+	v4l2_m2m_release(rga->m2m_dev);
+rel_vdev:
+	video_device_release(vfd);
+unreg_v4l2_dev:
+	v4l2_device_unregister(&rga->v4l2_dev);
+	dev_set_drvdata(dev, rga);
+	return ret;
+}
+
+static void rga_unbind(struct device *dev)
+{
+	struct rockchip_rga *rga = dev_get_drvdata(dev);
+
+	v4l2_info(&rga->v4l2_dev, "Removing\n");
+
+	video_unregister_device(rga->vfd);
+	component_unbind_all(dev, NULL);
+	v4l2_m2m_release(rga->m2m_dev);
+	v4l2_device_unregister(&rga->v4l2_dev);
+	/*
+	 * As &rga->v4l2_dev == rga, v4l2_device_unregister (incorrectly)
+	 * clears the drvdata. Therefore just set it again
+	 * (ensuring it's correct regardless of the struct member position)
+	 */
+	dev_set_drvdata(dev, rga);
+}
+
+struct component_master_ops rga_master_ops = {
+	.bind = rga_bind,
+	.unbind = rga_unbind,
+};
+
+static int rga_probe(struct platform_device *pdev)
+{
+	const struct of_device_id *match_desc = pdev->dev.platform_data;
+	struct device *dev = &pdev->dev;
+	struct component_match *match = NULL;
+	struct device_node *core_node;
+	struct rockchip_rga *rga;
+	u8 num_cores = 0;
+
+	if (!match_desc)
+		return dev_err_probe(dev, -ENODEV, "missing platform data\n");
+
+	for_each_compatible_node(core_node, NULL, match_desc->compatible) {
+		if (!of_device_is_available(core_node))
+			continue;
+
+		of_node_get(core_node);
+		component_match_add_release(dev, &match, component_release_of,
+					    component_compare_of, core_node);
+		num_cores++;
+	}
+
+	rga = devm_kzalloc(dev, sizeof(*rga) + num_cores * sizeof(*rga->cores), GFP_KERNEL);
+	if (!rga)
+		return -ENOMEM;
+
+	rga->hw = match_desc->data;
+	if (!rga->hw)
+		return dev_err_probe(dev, -ENODEV, "failed to get match data\n");
+
+	spin_lock_init(&rga->ctrl_lock);
+	spin_lock_init(&rga->cores_lock);
+	mutex_init(&rga->mutex);
+
+	dev_set_drvdata(dev, rga);
+
+	return component_master_add_with_match(dev, &rga_master_ops, match);
+}
+
+static void rga_remove(struct platform_device *pdev)
+{
+	component_master_del(&pdev->dev, &rga_master_ops);
+}
+
+/*
+ * Keep in sync with the compatible names of rockchip_rga_match, as we name the
+ * virtual component master platform device (allocating the /dev/video device)
+ * based on the compatible value.
+ */
+static struct platform_device_id rga_ids[] = {
+	{
+		.name = "rockchip,rk3288-rga",
+	},
+	{
+		.name = "rockchip,rk3399-rga",
+	},
+	{
+		.name = "rockchip,rk3588-rga3",
+	},
+	{},
+};
+
 static struct platform_driver rga_pdrv = {
 	.probe = rga_probe,
 	.remove = rga_remove,
 	.driver = {
 		.name = RGA_NAME,
-		.pm = &rga_pm,
-		.of_match_table = rockchip_rga_match,
 	},
+	.id_table = rga_ids,
 };
 
-module_platform_driver(rga_pdrv);
+static bool rga_of_has_available_node(const char *compat)
+{
+	struct device_node *node;
 
+	for_each_compatible_node(node, NULL, compat) {
+		if (of_device_is_available(node)) {
+			of_node_put(node);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static int rga_create_platform_device(struct platform_device **ppdev,
+				      const struct of_device_id *match)
+{
+	struct platform_device *pdev;
+	int ret;
+
+	pdev = platform_device_alloc(match->compatible, PLATFORM_DEVID_NONE);
+	if (!pdev)
+		return -ENOMEM;
+
+	ret = platform_device_add_data(pdev, match, sizeof(*match));
+	if (ret)
+		goto free_platform_device;
+
+	ret = platform_device_add(pdev);
+	if (ret)
+		goto free_platform_device;
+
+	*ppdev = pdev;
+
+	return 0;
+
+free_platform_device:
+	platform_device_put(pdev);
+	return ret;
+}
+
+static struct platform_device *master_pdevs[ARRAY_SIZE(rockchip_rga_match) - 1];
+
+static int __init rga_init(void)
+{
+	int ret;
+	unsigned int i;
+
+	ret = platform_driver_register(&rga_core_pdrv);
+	if (ret != 0)
+		return ret;
+
+	ret = platform_driver_register(&rga_pdrv);
+	if (ret != 0)
+		goto unregister_core_driver;
+
+	for (i = 0; i < ARRAY_SIZE(master_pdevs); i++) {
+		if (!rga_of_has_available_node(
+			    rockchip_rga_match[i].compatible))
+			continue;
+
+		ret = rga_create_platform_device(&master_pdevs[i],
+						 &rockchip_rga_match[i]);
+		if (ret)
+			goto unregister_platform_devices;
+	}
+
+	return 0;
+
+unregister_platform_devices:
+	for (i = 0; i < ARRAY_SIZE(master_pdevs); i++) {
+		platform_device_unregister(master_pdevs[i]);
+		master_pdevs[i] = NULL;
+	}
+	platform_driver_unregister(&rga_pdrv);
+unregister_core_driver:
+	platform_driver_unregister(&rga_core_pdrv);
+	return ret;
+}
+module_init(rga_init);
+
+static void __exit rga_exit(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(master_pdevs); i++) {
+		platform_device_unregister(master_pdevs[i]);
+		master_pdevs[i] = NULL;
+	}
+	platform_driver_unregister(&rga_pdrv);
+	platform_driver_unregister(&rga_core_pdrv);
+}
+module_exit(rga_exit);
+
+MODULE_AUTHOR("Jacob Chen <jacob-chen@iotwrt.com>");
+MODULE_DESCRIPTION("Rockchip Raster 2d Graphic Acceleration Unit");
 MODULE_AUTHOR("Jacob Chen <jacob-chen@iotwrt.com>");
 MODULE_DESCRIPTION("Rockchip Raster 2d Graphic Acceleration Unit");
 MODULE_LICENSE("GPL");
