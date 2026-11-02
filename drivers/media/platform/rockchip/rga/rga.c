@@ -82,9 +82,8 @@ static void device_run(void *prv)
 	rga->hw->start(core, vb_to_rga(src), vb_to_rga(dst));
 }
 
-static irqreturn_t rga_isr(int irq, void *prv)
+static irqreturn_t rga_core_irq(struct rga_core *core)
 {
-	struct rga_core *core = prv;
 	struct rockchip_rga *rga = core->rga;
 
 	/* ignore interrupt on an unbound core */
@@ -117,6 +116,27 @@ static irqreturn_t rga_isr(int irq, void *prv)
 	}
 
 	return IRQ_HANDLED;
+}
+
+static irqreturn_t rga_isr(int irq, void *prv)
+{
+	struct rga_core *core = prv;
+	irqreturn_t ret;
+
+	/*
+	 * The interrupt line of an RGA3 core is shared with its IOMMU, which
+	 * can raise it while the core is suspended or being suspended. Reading
+	 * the registers of a core whose clocks or power domain are off ends
+	 * in a synchronous external abort.
+	 */
+	if (!pm_runtime_get_if_active(core->dev))
+		return IRQ_NONE;
+
+	ret = rga_core_irq(core);
+
+	pm_runtime_put_autosuspend(core->dev);
+
+	return ret;
 }
 
 static const struct v4l2_m2m_ops rga_m2m_ops = {
