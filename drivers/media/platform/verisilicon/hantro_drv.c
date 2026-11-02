@@ -259,6 +259,12 @@ static void device_run(void *priv)
 	src = hantro_get_src_buf(ctx);
 	dst = hantro_get_dst_buf(ctx);
 
+	/*
+	 * Copy the timestamp before anything can fail: userspace matches a
+	 * CAPTURE buffer returned with an error to its frame by it.
+	 */
+	v4l2_m2m_buf_copy_metadata(src, dst);
+
 	core = hantro_acquire_core(ctx);
 	if (WARN_ON_ONCE(!core))
 		goto err_cancel_job;
@@ -270,8 +276,6 @@ static void device_run(void *priv)
 	ret = clk_bulk_enable(core->variant->num_clocks, core->clocks);
 	if (ret)
 		goto err_pm_put;
-
-	v4l2_m2m_buf_copy_metadata(src, dst);
 
 	if (ctx->codec_ops->run(ctx))
 		goto err_clk_disable;
