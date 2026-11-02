@@ -88,6 +88,25 @@
 		};
 	};
 
+	/*
+	 * One of the USB 2.0 Type-A ports has no data lines of its own: its
+	 * D+/D- are wired straight to those of the USB-C connector (no
+	 * switch), and its VBUS is always on. A device in it can only work
+	 * while the USB 3.0 OTG controller is the host on those lines and
+	 * the USB-C port doesn't use them.
+	 */
+	usb2_con: connector-usb2 {
+		compatible = "usb-a-connector";
+		label = "USB2 (USB-C data lines)";
+		vbus-supply = <&vcc5v0_sys>;
+
+		port {
+			usb2_con_hs: endpoint {
+				remote-endpoint = <&usb_host0_xhci_hs_typea>;
+			};
+		};
+	};
+
 	vbus_typec: regulator-vbus-typec {
 		compatible = "regulator-fixed";
 		enable-active-high;
@@ -290,9 +309,17 @@
 
 		port@0 {
 			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
 
-			usb_host0_xhci_hs: endpoint {
+			usb_host0_xhci_hs: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&usbc0_hs>;
+			};
+
+			usb_host0_xhci_hs_typea: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&usb2_con_hs>;
 			};
 		};
 
