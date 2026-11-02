@@ -109,7 +109,6 @@ struct rockchip_hdmi_qp {
 	int hpd_irq;
 	int port_id;
 	const struct rockchip_hdmi_qp_ctrl_ops *ctrl_ops;
-	unsigned long long tmds_char_rate;
 	unsigned int phy_bpc;
 };
 
@@ -234,11 +233,6 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 	if (ingest_fmt < 0)
 		return -EINVAL;
 
-	if (hdmi->tmds_char_rate == conn_state->hdmi.tmds_char_rate &&
-	    s->output_bpc == conn_state->hdmi.output_bpc &&
-	    s->bus_format == ingest_fmt)
-		return 0;
-
 	switch (ingest_fmt) {
 	case MEDIA_BUS_FMT_RGB888_1X24:
 	case MEDIA_BUS_FMT_RGB101010_1X30:
@@ -293,7 +287,6 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 		return ret;
 	}
 
-	hdmi->tmds_char_rate = conn_state->hdmi.tmds_char_rate;
 	hdmi->phy_bpc = phy_cfg.hdmi.bpc;
 
 	s->output_type = DRM_MODE_CONNECTOR_HDMIA;
