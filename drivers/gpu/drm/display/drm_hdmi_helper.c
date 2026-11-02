@@ -15,6 +15,7 @@
 #include <drm/drm_modes.h>
 #include <drm/drm_modeset_lock.h>
 #include <drm/drm_print.h>
+#include <drm/drm_probe_helper.h>
 #include <drm/drm_property.h>
 
 #define DRM_HDMI_SCDC_SOURCE_VERSION	1
@@ -573,6 +574,7 @@ static int drm_connector_hdmi_try_scrambling_setup(struct drm_connector *connect
 }
 
 static void drm_connector_hdmi_frl_flt_work(struct drm_connector *connector);
+static void drm_connector_hdmi_frl_link_work(struct work_struct *work);
 
 static void drm_connector_hdmi_scdc_work(struct work_struct *work)
 {
@@ -660,6 +662,8 @@ int drm_connector_hdmi_enable_scrambling(struct drm_connector *connector,
 	if (!hdmi->scdc_work_initialized) {
 		INIT_DELAYED_WORK(&hdmi->scdc_work,
 				  drm_connector_hdmi_scdc_work);
+		INIT_WORK(&hdmi->frl_link_work,
+			  drm_connector_hdmi_frl_link_work);
 		hdmi->scdc_work_initialized = true;
 	}
 
@@ -1258,14 +1262,53 @@ static int drm_connector_hdmi_frl_ltsp(struct drm_connector *connector)
 }
 
 /*
- * FLT failed or FRL not selected, fallback to legacy TMDS mode.
+ * FRL not selected: operate the link in TMDS mode.
  */
-static void drm_connector_hdmi_frl_ltsl(struct drm_connector *connector)
+static void drm_connector_hdmi_frl_tmds(struct drm_connector *connector)
 {
 	drm_scdc_set_frl(connector, 0, 0, 0);
 	drm_scdc_writeb(connector->ddc, SCDC_UPDATE_0, SCDC_FLT_UPDATE);
 
 	connector->hdmi.funcs->frl_fallback_tmds(connector);
+}
+
+static void drm_connector_hdmi_frl_link_work(struct work_struct *work)
+{
+	struct drm_connector *connector =
+		container_of(work, struct drm_connector, hdmi.frl_link_work);
+	struct drm_device *dev = connector->dev;
+
+	mutex_lock(&dev->mode_config.mutex);
+	drm_connector_set_link_status_property(connector,
+					       DRM_MODE_LINK_STATUS_BAD);
+	mutex_unlock(&dev->mode_config.mutex);
+
+	drm_kms_helper_connector_hotplug_event(connector);
+}
+
+/*
+ * FLT failed. The PHY, the controller and any board level link setup are
+ * configured for FRL by the modeset, and only a new modeset can switch them
+ * all to TMDS: stop the link, keep FRL out of the next atomic check for this
+ * sink and ask userspace for that modeset.
+ */
+static void drm_connector_hdmi_frl_ltsl(struct drm_connector *connector)
+{
+	struct drm_connector_hdmi *hdmi = &connector->hdmi;
+
+	/* Disabled meanwhile, not a training failure */
+	if (!drm_connector_hdmi_frl_active(connector))
+		return;
+
+	hdmi->funcs->frl_tx_stop(connector);
+	drm_scdc_set_frl(connector, 0, 0, 0);
+	drm_scdc_writeb(connector->ddc, SCDC_UPDATE_0, SCDC_FLT_UPDATE);
+
+	drm_info(connector->dev, "[CONNECTOR:%d:%s] FRL link training failed, link status bad\n",
+		 connector->base.id, connector->name);
+
+	WRITE_ONCE(hdmi->frl_failed_epoch, connector->epoch_counter + 1);
+	schedule_work(&hdmi->frl_link_work);
 }
 
 static void drm_connector_hdmi_frl_flt_work(struct drm_connector *connector)
@@ -1324,7 +1367,7 @@ int drm_connector_hdmi_enable_frl(struct drm_connector *connector,
 	}
 
 	if (!conn_state->hdmi.frl_rate_per_lane || !conn_state->hdmi.frl_lanes) {
-		drm_connector_hdmi_frl_ltsl(connector);
+		drm_connector_hdmi_frl_tmds(connector);
 		return 0;
 	}
 
@@ -1338,6 +1381,8 @@ int drm_connector_hdmi_enable_frl(struct drm_connector *connector,
 	if (!hdmi->scdc_work_initialized) {
 		INIT_DELAYED_WORK(&hdmi->scdc_work,
 				  drm_connector_hdmi_scdc_work);
+		INIT_WORK(&hdmi->frl_link_work,
+			  drm_connector_hdmi_frl_link_work);
 		hdmi->scdc_work_initialized = true;
 	}
 
