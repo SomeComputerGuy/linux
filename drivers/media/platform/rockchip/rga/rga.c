@@ -884,7 +884,7 @@ static int rga_core_bind(struct device *dev, struct device *master, void *data)
 	version = rga->hw->get_version(core);
 
 	v4l2_info(&rga->v4l2_dev, "HW Version: 0x%02x.%02x\n",
-		  rga->version.major, rga->version.minor);
+		  version.major, version.minor);
 
 	if (rga->num_cores) {
 		struct iommu_domain *domain;
