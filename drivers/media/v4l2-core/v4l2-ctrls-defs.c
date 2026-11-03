@@ -1249,6 +1249,9 @@ const char *v4l2_ctrl_get_name(u32 id)
 	case V4L2_CID_STATELESS_AVS2_PICTURE:			return "AVS2 Picture Header";
 	case V4L2_CID_STATELESS_AVS2_WEIGHT_QUANT:	return "AVS2 Weight Quant Matrices";
 	case V4L2_CID_STATELESS_AVS2_ALF:			return "AVS2 Adaptive Loop Filter";
+	case V4L2_CID_STATELESS_AVS_SEQUENCE:			return "AVS Sequence Header";
+	case V4L2_CID_STATELESS_AVS_PICTURE:			return "AVS Picture Header";
+	case V4L2_CID_STATELESS_AVS_WEIGHT_QUANT:	return "AVS Weight Quant Parameters";
 
 	/* Colorimetry controls */
 	/* Keep the order of the 'case's the same as in v4l2-controls.h! */
@@ -1640,6 +1643,15 @@ void v4l2_ctrl_fill(u32 id, const char **name, enum v4l2_ctrl_type *type,
 		break;
 	case V4L2_CID_STATELESS_AVS2_ALF:
 		*type = V4L2_CTRL_TYPE_AVS2_ALF;
+		break;
+	case V4L2_CID_STATELESS_AVS_SEQUENCE:
+		*type = V4L2_CTRL_TYPE_AVS_SEQUENCE;
+		break;
+	case V4L2_CID_STATELESS_AVS_PICTURE:
+		*type = V4L2_CTRL_TYPE_AVS_PICTURE;
+		break;
+	case V4L2_CID_STATELESS_AVS_WEIGHT_QUANT:
+		*type = V4L2_CTRL_TYPE_AVS_WEIGHT_QUANT;
 		break;
 	case V4L2_CID_UNIT_CELL_SIZE:
 		*type = V4L2_CTRL_TYPE_AREA;
