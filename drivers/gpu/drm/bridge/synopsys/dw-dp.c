@@ -1270,10 +1270,18 @@ static int dw_dp_send_vsc_sdp(struct dw_dp *dp)
 
 	switch (state->colorspace) {
 	case DRM_MODE_COLORIMETRY_BT2020_RGB:
-		vsc.colorimetry = DP_COLORIMETRY_BT2020_RGB;
-		break;
 	case DRM_MODE_COLORIMETRY_BT2020_YCC:
-		vsc.colorimetry = DP_COLORIMETRY_BT2020_YCC;
+		/*
+		 * The two variants are equivalent: signal the one that matches
+		 * the output encoding. For a YCbCr pixel encoding the value of
+		 * DP_COLORIMETRY_BT2020_RGB means constant luminance
+		 * BT.2020 Y'cC'bcC'rc, not the non-constant luminance Y'C'bC'r
+		 * that is sent.
+		 */
+		if (state->color_format == DRM_OUTPUT_COLOR_FORMAT_RGB444)
+			vsc.colorimetry = DP_COLORIMETRY_BT2020_RGB;
+		else
+			vsc.colorimetry = DP_COLORIMETRY_BT2020_YCC;
 		break;
 	default:
 		if (state->color_format == DRM_OUTPUT_COLOR_FORMAT_RGB444)
