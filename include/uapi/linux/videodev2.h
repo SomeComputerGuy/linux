@@ -776,6 +776,7 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_HEVC_SLICE v4l2_fourcc('S', '2', '6', '5') /* HEVC parsed slices */
 #define V4L2_PIX_FMT_AV1_FRAME v4l2_fourcc('A', 'V', '1', 'F') /* AV1 parsed frame */
 #define V4L2_PIX_FMT_AVS2_FRAME v4l2_fourcc('A', 'V', 'S', '2') /* AVS2 parsed frame */
+#define V4L2_PIX_FMT_AVS_FRAME v4l2_fourcc('A', 'V', 'S', 'F') /* AVS1/AVS+ parsed frame */
 #define V4L2_PIX_FMT_AV1      v4l2_fourcc('A', 'V', '0', '1') /* AV1 */
 #define V4L2_PIX_FMT_SPK      v4l2_fourcc('S', 'P', 'K', '0') /* Sorenson Spark */
 #define V4L2_PIX_FMT_RV30     v4l2_fourcc('R', 'V', '3', '0') /* RealVideo 8 */
@@ -2006,6 +2007,10 @@ enum v4l2_ctrl_type {
 	V4L2_CTRL_TYPE_AVS2_PICTURE		= 0x02c1,
 	V4L2_CTRL_TYPE_AVS2_WEIGHT_QUANT	= 0x02c2,
 	V4L2_CTRL_TYPE_AVS2_ALF			= 0x02c3,
+
+	V4L2_CTRL_TYPE_AVS_SEQUENCE		= 0x02d0,
+	V4L2_CTRL_TYPE_AVS_PICTURE		= 0x02d1,
+	V4L2_CTRL_TYPE_AVS_WEIGHT_QUANT		= 0x02d2,
 };
 
 /*  Used in the VIDIOC_QUERYCTRL ioctl for querying controls */

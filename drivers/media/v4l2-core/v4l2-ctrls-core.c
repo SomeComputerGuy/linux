@@ -136,6 +136,7 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 	struct v4l2_ctrl_hevc_sps *p_hevc_sps;
 	struct v4l2_ctrl_avs2_sequence *p_avs2_sequence;
 	struct v4l2_ctrl_avs2_weight_quant *p_avs2_weight_quant;
+	struct v4l2_ctrl_avs_sequence *p_avs_sequence;
 	void *p = ptr.p + idx * ctrl->elem_size;
 
 	if (ctrl->p_def.p_const)
@@ -214,6 +215,16 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 		       sizeof(p_avs2_weight_quant->matrix_4x4));
 		memset(p_avs2_weight_quant->matrix_8x8, 64,
 		       sizeof(p_avs2_weight_quant->matrix_8x8));
+		break;
+	case V4L2_CTRL_TYPE_AVS_SEQUENCE:
+		p_avs_sequence = p;
+
+		/* 8-bit 4:2:0 progressive JiZhun profile */
+		p_avs_sequence->profile_id = V4L2_AVS_PROFILE_JIZHUN;
+		p_avs_sequence->chroma_format = 1;
+		p_avs_sequence->sample_precision = 1;
+		p_avs_sequence->flags =
+			V4L2_AVS_SEQUENCE_FLAG_PROGRESSIVE_SEQUENCE;
 		break;
 	case V4L2_CTRL_TYPE_FWHT_PARAMS:
 		p_fwht_params = p;
@@ -535,6 +546,15 @@ void v4l2_ctrl_type_op_log(const struct v4l2_ctrl *ctrl)
 		break;
 	case V4L2_CTRL_TYPE_AVS2_ALF:
 		pr_cont("AVS2_ALF");
+		break;
+	case V4L2_CTRL_TYPE_AVS_SEQUENCE:
+		pr_cont("AVS_SEQUENCE");
+		break;
+	case V4L2_CTRL_TYPE_AVS_PICTURE:
+		pr_cont("AVS_PICTURE");
+		break;
+	case V4L2_CTRL_TYPE_AVS_WEIGHT_QUANT:
+		pr_cont("AVS_WEIGHT_QUANT");
 		break;
 	case V4L2_CTRL_TYPE_RECT:
 		pr_cont("(%d,%d)/%ux%u",
@@ -1176,6 +1196,116 @@ static int validate_avs2_alf(struct v4l2_ctrl_avs2_alf *alf)
 	}
 
 	zero_reserved(*alf);
+
+	return 0;
+}
+
+#define V4L2_AVS_SEQUENCE_FLAGS_ALL \
+	(V4L2_AVS_SEQUENCE_FLAG_PROGRESSIVE_SEQUENCE | \
+	 V4L2_AVS_SEQUENCE_FLAG_LOW_DELAY)
+
+static int validate_avs_sequence(struct v4l2_ctrl_avs_sequence *seq)
+{
+	if (seq->flags & ~V4L2_AVS_SEQUENCE_FLAGS_ALL)
+		return -EINVAL;
+
+	if (seq->profile_id != V4L2_AVS_PROFILE_JIZHUN &&
+	    seq->profile_id != V4L2_AVS_PROFILE_GUANGDIAN)
+		return -EINVAL;
+
+	/* 4:2:0 (1) and 4:2:2 (2) are the only chroma formats */
+	if (seq->chroma_format < 1 || seq->chroma_format > 2)
+		return -EINVAL;
+
+	/* 8-bit (1) is the only sample precision of both profiles */
+	if (seq->sample_precision != 1)
+		return -EINVAL;
+
+	if (!seq->horizontal_size || !seq->vertical_size ||
+	    seq->horizontal_size >= BIT(14) || seq->vertical_size >= BIT(14))
+		return -EINVAL;
+
+	if (seq->aspect_ratio >= BIT(4) || seq->frame_rate_code >= BIT(4))
+		return -EINVAL;
+
+	zero_reserved(*seq);
+
+	return 0;
+}
+
+#define V4L2_AVS_PICTURE_FLAGS_ALL \
+	(V4L2_AVS_PICTURE_FLAG_AEC * 2 - 1)
+
+#define V4L2_AVS_REF_FLAGS_ALL \
+	(V4L2_AVS_REF_FLAG_TOP_FIELD_FIRST * 2 - 1)
+
+static int validate_avs_picture(struct v4l2_ctrl_avs_picture *pic)
+{
+	unsigned int i;
+
+	if (pic->flags & ~V4L2_AVS_PICTURE_FLAGS_ALL)
+		return -EINVAL;
+
+	if (pic->picture_type > V4L2_AVS_PICTURE_TYPE_B)
+		return -EINVAL;
+
+	/* picture_qp is a 6-bit field */
+	if (pic->picture_qp >= BIT(6))
+		return -EINVAL;
+
+	/* alpha_c_offset and beta_offset are -8 to 8 */
+	if (pic->alpha_c_offset < -8 || pic->alpha_c_offset > 8 ||
+	    pic->beta_offset < -8 || pic->beta_offset > 8)
+		return -EINVAL;
+
+	/* A progressive frame is frame coded */
+	if ((pic->flags & V4L2_AVS_PICTURE_FLAG_PROGRESSIVE_FRAME) &&
+	    !(pic->flags & V4L2_AVS_PICTURE_FLAG_PICTURE_STRUCTURE))
+		return -EINVAL;
+
+	for (i = 0; i < V4L2_AVS_NUM_REFS; i++) {
+		struct v4l2_avs_ref_pic *ref = &pic->refs[i];
+
+		if (ref->flags & ~V4L2_AVS_REF_FLAGS_ALL)
+			return -EINVAL;
+
+		zero_reserved(*ref);
+	}
+
+	/* P pictures need their forward and B pictures both references */
+	if (pic->picture_type != V4L2_AVS_PICTURE_TYPE_I &&
+	    !(pic->refs[V4L2_AVS_REF_FORWARD].flags & V4L2_AVS_REF_FLAG_VALID))
+		return -EINVAL;
+
+	if (pic->picture_type == V4L2_AVS_PICTURE_TYPE_B &&
+	    !(pic->refs[V4L2_AVS_REF_BACKWARD].flags & V4L2_AVS_REF_FLAG_VALID))
+		return -EINVAL;
+
+	zero_reserved(*pic);
+
+	return 0;
+}
+
+static int validate_avs_weight_quant(struct v4l2_ctrl_avs_weight_quant *wq)
+{
+	if (wq->flags & ~V4L2_AVS_WEIGHT_QUANT_FLAG_CHROMA_QUANT_PARAM_DISABLE)
+		return -EINVAL;
+
+	if (wq->weighting_quant_param_index > 2 ||
+	    wq->weighting_quant_model > 3)
+		return -EINVAL;
+
+	if (wq->flags & V4L2_AVS_WEIGHT_QUANT_FLAG_CHROMA_QUANT_PARAM_DISABLE) {
+		wq->chroma_quant_param_delta_cb = 0;
+		wq->chroma_quant_param_delta_cr = 0;
+	}
+
+	/* chroma_quant_param_delta_cb/cr fit in 6 bits */
+	if (wq->chroma_quant_param_delta_cb < -32 ||
+	    wq->chroma_quant_param_delta_cb > 31 ||
+	    wq->chroma_quant_param_delta_cr < -32 ||
+	    wq->chroma_quant_param_delta_cr > 31)
+		return -EINVAL;
 
 	return 0;
 }
@@ -1837,6 +1967,12 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 		break;
 	case V4L2_CTRL_TYPE_AVS2_ALF:
 		return validate_avs2_alf(p);
+	case V4L2_CTRL_TYPE_AVS_SEQUENCE:
+		return validate_avs_sequence(p);
+	case V4L2_CTRL_TYPE_AVS_PICTURE:
+		return validate_avs_picture(p);
+	case V4L2_CTRL_TYPE_AVS_WEIGHT_QUANT:
+		return validate_avs_weight_quant(p);
 
 	case V4L2_CTRL_TYPE_AREA:
 		area = p;
@@ -2581,6 +2717,15 @@ static struct v4l2_ctrl *v4l2_ctrl_new(struct v4l2_ctrl_handler *hdl,
 		break;
 	case V4L2_CTRL_TYPE_AVS2_ALF:
 		elem_size = sizeof(struct v4l2_ctrl_avs2_alf);
+		break;
+	case V4L2_CTRL_TYPE_AVS_SEQUENCE:
+		elem_size = sizeof(struct v4l2_ctrl_avs_sequence);
+		break;
+	case V4L2_CTRL_TYPE_AVS_PICTURE:
+		elem_size = sizeof(struct v4l2_ctrl_avs_picture);
+		break;
+	case V4L2_CTRL_TYPE_AVS_WEIGHT_QUANT:
+		elem_size = sizeof(struct v4l2_ctrl_avs_weight_quant);
 		break;
 	case V4L2_CTRL_TYPE_AREA:
 		elem_size = sizeof(struct v4l2_area);

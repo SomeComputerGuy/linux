@@ -295,6 +295,26 @@ Compressed Formats
 	its picture header and all its slices, with their start codes, as found
 	in the elementary stream. Sequence headers, extensions and user data may
 	precede the picture header.
+    * .. _V4L2-PIX-FMT-AVS-FRAME:
+
+      - ``V4L2_PIX_FMT_AVS_FRAME``
+      - 'AVSF'
+      - AVS1 or AVS+ parsed frame, as extracted from the :ref:`avs1` or
+	:ref:`avsplus` bitstream. This format is adapted for stateless video
+	decoders that implement an AVS1 pipeline with the
+	:ref:`stateless_decoder`. Metadata associated with the picture to
+	decode is required to be passed through the
+	``V4L2_CID_STATELESS_AVS_SEQUENCE`` and
+	``V4L2_CID_STATELESS_AVS_PICTURE`` controls, and for AVS+ pictures with
+	weighting quantization the ``V4L2_CID_STATELESS_AVS_WEIGHT_QUANT``
+	control. See the :ref:`associated Codec Control IDs
+	<v4l2-codec-stateless-avs>`. Exactly one output and one capture buffer
+	must be provided for use with this pixel format. The output buffer must
+	contain exactly one coded picture: its picture header and all its
+	slices, of both fields for a field coded picture, with their start
+	codes, as found in the elementary stream (pseudo start codes not
+	removed). Sequence headers, extensions and user data may precede the
+	picture header.
     * .. _V4L2-PIX-FMT-AV1:
 
       - ``V4L2_PIX_FMT_AV1``

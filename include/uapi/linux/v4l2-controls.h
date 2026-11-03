@@ -3999,6 +3999,174 @@ struct v4l2_ctrl_avs2_alf {
 	__u8	reserved[6];
 };
 
+/* Stateless AVS1 (GB/T 20090.2) and AVS+ (GY/T 257.1) decoder controls */
+
+#define V4L2_AVS_PROFILE_JIZHUN				0x20
+#define V4L2_AVS_PROFILE_GUANGDIAN			0x48
+
+#define V4L2_AVS_SEQUENCE_FLAG_PROGRESSIVE_SEQUENCE	0x00000001
+#define V4L2_AVS_SEQUENCE_FLAG_LOW_DELAY		0x00000002
+
+#define V4L2_CID_STATELESS_AVS_SEQUENCE		(V4L2_CID_CODEC_STATELESS_BASE + 1000)
+/**
+ * struct v4l2_ctrl_avs_sequence - AVS1 / AVS+ sequence header
+ *
+ * Syntax elements of video_sequence_header(), GB/T 20090.2 section 7.1.2.2.
+ *
+ * @flags: see V4L2_AVS_SEQUENCE_FLAG_{}.
+ * @horizontal_size: horizontal_size, the width of the picture in luma
+ *	samples.
+ * @vertical_size: vertical_size, the height of the picture in luma samples.
+ * @profile_id: profile_id, see V4L2_AVS_PROFILE_{}.
+ * @level_id: level_id.
+ * @chroma_format: chroma_format, 1 for 4:2:0.
+ * @sample_precision: sample_precision, 1 for 8-bit samples.
+ * @aspect_ratio: aspect_ratio.
+ * @frame_rate_code: frame_rate_code.
+ * @reserved: padding field. Should be zeroed by applications.
+ */
+struct v4l2_ctrl_avs_sequence {
+	__u32	flags;
+	__u16	horizontal_size;
+	__u16	vertical_size;
+	__u8	profile_id;
+	__u8	level_id;
+	__u8	chroma_format;
+	__u8	sample_precision;
+	__u8	aspect_ratio;
+	__u8	frame_rate_code;
+	__u8	reserved[2];
+};
+
+#define V4L2_AVS_PICTURE_TYPE_I				0
+#define V4L2_AVS_PICTURE_TYPE_P				1
+#define V4L2_AVS_PICTURE_TYPE_B				2
+
+#define V4L2_AVS_PICTURE_FLAG_PROGRESSIVE_FRAME		0x00000001
+#define V4L2_AVS_PICTURE_FLAG_PICTURE_STRUCTURE		0x00000002
+#define V4L2_AVS_PICTURE_FLAG_TOP_FIELD_FIRST		0x00000004
+#define V4L2_AVS_PICTURE_FLAG_REPEAT_FIRST_FIELD	0x00000008
+#define V4L2_AVS_PICTURE_FLAG_FIXED_PICTURE_QP		0x00000010
+#define V4L2_AVS_PICTURE_FLAG_PICTURE_REFERENCE		0x00000020
+#define V4L2_AVS_PICTURE_FLAG_SKIP_MODE			0x00000040
+#define V4L2_AVS_PICTURE_FLAG_ADVANCED_PRED_MODE_DISABLE 0x00000080
+#define V4L2_AVS_PICTURE_FLAG_LOOP_FILTER_DISABLE	0x00000100
+#define V4L2_AVS_PICTURE_FLAG_NO_FORWARD_REFERENCE	0x00000200
+#define V4L2_AVS_PICTURE_FLAG_PB_FIELD_ENHANCED		0x00000400
+#define V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT		0x00000800
+#define V4L2_AVS_PICTURE_FLAG_AEC			0x00001000
+
+#define V4L2_AVS_REF_FORWARD				0
+#define V4L2_AVS_REF_SECOND_FORWARD			1
+#define V4L2_AVS_REF_BACKWARD				2
+#define V4L2_AVS_NUM_REFS				3
+
+#define V4L2_AVS_REF_FLAG_VALID				0x01
+#define V4L2_AVS_REF_FLAG_INTRA				0x02
+#define V4L2_AVS_REF_FLAG_PICTURE_STRUCTURE		0x04
+#define V4L2_AVS_REF_FLAG_TOP_FIELD_FIRST		0x08
+
+/**
+ * struct v4l2_avs_ref_pic - AVS1 / AVS+ reference picture
+ *
+ * @timestamp: timestamp of the V4L2 capture buffer holding the reference
+ *	picture. See note in struct v4l2_ctrl_avs_picture.
+ * @picture_distance: picture_distance of the reference picture, as coded
+ *	in its picture header.
+ * @flags: see V4L2_AVS_REF_FLAG_{}. The entry is unused unless VALID is
+ *	set. INTRA is set when the reference was an I picture,
+ *	PICTURE_STRUCTURE and TOP_FIELD_FIRST are the picture_structure and
+ *	top_field_first of its picture header.
+ * @reserved: padding field. Should be zeroed by applications.
+ */
+struct v4l2_avs_ref_pic {
+	__u64	timestamp;
+	__u8	picture_distance;
+	__u8	flags;
+	__u8	reserved[6];
+};
+
+#define V4L2_CID_STATELESS_AVS_PICTURE		(V4L2_CID_CODEC_STATELESS_BASE + 1001)
+/**
+ * struct v4l2_ctrl_avs_picture - AVS1 / AVS+ picture header and references
+ *
+ * Syntax elements of i_picture_header() or pb_picture_header(), GB/T
+ * 20090.2 sections 7.1.3.1 and 7.1.3.2, and the reference pictures.
+ *
+ * The OUTPUT buffer holds one coded picture: its picture header and all its
+ * slices (of both fields for a field coded picture), in decoding order,
+ * with their start codes and as found in the elementary stream (pseudo
+ * start code bits not removed). Sequence headers, extensions and user data
+ * may precede the picture header.
+ *
+ * Only I and P pictures are references. Let R0 be the I or P picture
+ * decoded last, R1 the one before it and R2 the one before R1. An I or P
+ * picture refers to R0 (FORWARD) and R1 (SECOND_FORWARD), a B picture to
+ * R1 (FORWARD) and R0 (BACKWARD), with R2 in SECOND_FORWARD, of which only
+ * picture_distance and flags are used. The references of an I picture are
+ * used by the second field of a field coded I picture.
+ *
+ * @refs: the references, indexed by V4L2_AVS_REF_{}.
+ * @data_offset: offset in bytes from the start of the OUTPUT buffer to the
+ *	first byte of the start code prefix of the first slice.
+ * @flags: see V4L2_AVS_PICTURE_FLAG_{}.
+ * @picture_type: V4L2_AVS_PICTURE_TYPE_I for i_picture_header(),
+ *	otherwise picture_coding_type.
+ * @picture_distance: picture_distance.
+ * @picture_qp: picture_qp.
+ * @alpha_c_offset: alpha_c_offset, 0 unless loop_filter_parameter_flag.
+ * @beta_offset: beta_offset, 0 unless loop_filter_parameter_flag.
+ * @reserved: padding field. Should be zeroed by applications.
+ *
+ * Note: the timestamp refers to the timestamp field in struct v4l2_buffer.
+ * Use v4l2_timeval_to_ns() to convert the struct timeval to a __u64.
+ */
+struct v4l2_ctrl_avs_picture {
+	struct v4l2_avs_ref_pic refs[V4L2_AVS_NUM_REFS];
+	__u32	data_offset;
+	__u32	flags;
+	__u8	picture_type;
+	__u8	picture_distance;
+	__u8	picture_qp;
+	__s8	alpha_c_offset;
+	__s8	beta_offset;
+	__u8	reserved[3];
+};
+
+#define V4L2_AVS_WEIGHT_QUANT_FLAG_CHROMA_QUANT_PARAM_DISABLE 0x00000001
+
+#define V4L2_AVS_WEIGHT_QUANT_NUM_PARAMS		6
+
+#define V4L2_CID_STATELESS_AVS_WEIGHT_QUANT	(V4L2_CID_CODEC_STATELESS_BASE + 1002)
+/**
+ * struct v4l2_ctrl_avs_weight_quant - AVS+ weighting quantization parameters
+ *
+ * The weighting quantization syntax elements of the picture header of an
+ * AVS+ (GY/T 257.1) picture, as coded. Only used when the picture has
+ * V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT.
+ *
+ * @flags: see V4L2_AVS_WEIGHT_QUANT_FLAG_{}.
+ * @chroma_quant_param_delta_cb: chroma_quant_param_delta_cb, 0 when
+ *	chroma_quant_param_disable is set.
+ * @chroma_quant_param_delta_cr: chroma_quant_param_delta_cr, 0 when
+ *	chroma_quant_param_disable is set.
+ * @weighting_quant_param_index: weighting_quant_param_index, 0 to 2.
+ * @weighting_quant_model: weighting_quant_model, 0 to 3.
+ * @weighting_quant_param_delta1: weighting_quant_param_delta1[], used when
+ *	@weighting_quant_param_index is 1.
+ * @weighting_quant_param_delta2: weighting_quant_param_delta2[], used when
+ *	@weighting_quant_param_index is 2.
+ */
+struct v4l2_ctrl_avs_weight_quant {
+	__u32	flags;
+	__s8	chroma_quant_param_delta_cb;
+	__s8	chroma_quant_param_delta_cr;
+	__u8	weighting_quant_param_index;
+	__u8	weighting_quant_model;
+	__s16	weighting_quant_param_delta1[V4L2_AVS_WEIGHT_QUANT_NUM_PARAMS];
+	__s16	weighting_quant_param_delta2[V4L2_AVS_WEIGHT_QUANT_NUM_PARAMS];
+};
+
 /* MPEG-compression definitions kept for backwards compatibility */
 #ifndef __KERNEL__
 #define V4L2_CTRL_CLASS_MPEG            V4L2_CTRL_CLASS_CODEC
