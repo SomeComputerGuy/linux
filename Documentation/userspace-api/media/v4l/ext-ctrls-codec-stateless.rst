@@ -5056,3 +5056,265 @@ AV1 Tx mode as described in section 6.8.21 "TX mode semantics" of :ref:`av1`.
     * - __u8
       - ``reserved[6]``
       - Applications and drivers must set this to zero.
+
+.. _v4l2-codec-stateless-avs:
+
+``V4L2_CID_STATELESS_AVS_SEQUENCE (struct)``
+    Specifies the sequence header parameters (as extracted from the
+    bitstream) for the associated AVS1 or AVS+ picture, as defined by section
+    7.1.2.2 "Video sequence header" of :ref:`avs1` and :ref:`avsplus`.
+
+.. c:type:: v4l2_ctrl_avs_sequence
+
+.. cssclass:: longtable
+
+.. tabularcolumns:: |p{1.4cm}|p{6.5cm}|p{9.4cm}|
+
+.. flat-table:: struct v4l2_ctrl_avs_sequence
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - __u32
+      - ``flags``
+      - ``V4L2_AVS_SEQUENCE_FLAG_PROGRESSIVE_SEQUENCE`` (0x00000001):
+	progressive_sequence. ``V4L2_AVS_SEQUENCE_FLAG_LOW_DELAY``
+	(0x00000002): low_delay.
+    * - __u16
+      - ``horizontal_size``
+      - horizontal_size, the width of the picture in luma samples.
+    * - __u16
+      - ``vertical_size``
+      - vertical_size, the height of the picture in luma samples.
+    * - __u8
+      - ``profile_id``
+      - profile_id: ``V4L2_AVS_PROFILE_JIZHUN`` (0x20) or
+	``V4L2_AVS_PROFILE_GUANGDIAN`` (0x48, AVS+).
+    * - __u8
+      - ``level_id``
+      - level_id.
+    * - __u8
+      - ``chroma_format``
+      - chroma_format, 1 for 4:2:0.
+    * - __u8
+      - ``sample_precision``
+      - sample_precision, 1 for 8-bit samples.
+    * - __u8
+      - ``aspect_ratio``
+      - aspect_ratio.
+    * - __u8
+      - ``frame_rate_code``
+      - frame_rate_code.
+    * - __u8
+      - ``reserved[2]``
+      - Applications and drivers must set this to zero.
+
+``V4L2_CID_STATELESS_AVS_PICTURE (struct)``
+    Specifies the picture header parameters (as extracted from the bitstream)
+    and the reference pictures of the associated AVS1 or AVS+ picture, as
+    defined by sections 7.1.3.1 "I picture header" and 7.1.3.2 "P and B
+    picture header" of :ref:`avs1` and :ref:`avsplus`.
+
+    Only I and P pictures are references. With R0 the I or P picture decoded
+    last, R1 the one decoded before R0 and R2 the one decoded before R1:
+
+    * an I or P picture uses R0 as ``V4L2_AVS_REF_FORWARD`` and R1 as
+      ``V4L2_AVS_REF_SECOND_FORWARD``. The references of an I picture are
+      used by the second field of a field coded I picture;
+    * a B picture uses R1 as ``V4L2_AVS_REF_FORWARD``, R0 as
+      ``V4L2_AVS_REF_BACKWARD`` and R2 as ``V4L2_AVS_REF_SECOND_FORWARD``. Of
+      R2 only ``picture_distance`` and ``flags`` are used.
+
+    Entries without ``V4L2_AVS_REF_FLAG_VALID`` are unused. P pictures must
+    have a valid ``V4L2_AVS_REF_FORWARD`` entry, B pictures valid
+    ``V4L2_AVS_REF_FORWARD`` and ``V4L2_AVS_REF_BACKWARD`` entries.
+
+.. c:type:: v4l2_ctrl_avs_picture
+
+.. cssclass:: longtable
+
+.. tabularcolumns:: |p{1.4cm}|p{6.5cm}|p{9.4cm}|
+
+.. flat-table:: struct v4l2_ctrl_avs_picture
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - struct :c:type:`v4l2_avs_ref_pic`
+      - ``refs[3]``
+      - The reference pictures, indexed by ``V4L2_AVS_REF_FORWARD`` (0),
+	``V4L2_AVS_REF_SECOND_FORWARD`` (1) and ``V4L2_AVS_REF_BACKWARD`` (2).
+    * - __u32
+      - ``data_offset``
+      - Offset in bytes from the start of the output buffer to the first byte
+	of the start code prefix of the first slice.
+    * - __u32
+      - ``flags``
+      - See :ref:`AVS Picture Flags <avs_picture_flags>`.
+    * - __u8
+      - ``picture_type``
+      - ``V4L2_AVS_PICTURE_TYPE_I`` (0) for i_picture_header(), otherwise the
+	picture_coding_type of pb_picture_header(): ``V4L2_AVS_PICTURE_TYPE_P``
+	(1) or ``V4L2_AVS_PICTURE_TYPE_B`` (2).
+    * - __u8
+      - ``picture_distance``
+      - picture_distance.
+    * - __u8
+      - ``picture_qp``
+      - picture_qp.
+    * - __s8
+      - ``alpha_c_offset``
+      - alpha_c_offset, 0 when absent.
+    * - __s8
+      - ``beta_offset``
+      - beta_offset, 0 when absent.
+    * - __u8
+      - ``reserved[3]``
+      - Applications and drivers must set this to zero.
+
+.. c:type:: v4l2_avs_ref_pic
+
+.. cssclass:: longtable
+
+.. tabularcolumns:: |p{1.4cm}|p{6.5cm}|p{9.4cm}|
+
+.. flat-table:: struct v4l2_avs_ref_pic
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - __u64
+      - ``timestamp``
+      - Timestamp of the V4L2 capture buffer which holds the reference picture.
+	The timestamp refers to the ``timestamp`` field in struct
+	:c:type:`v4l2_buffer`. Use the :c:func:`v4l2_timeval_to_ns()` function
+	to convert the struct :c:type:`timeval` in struct :c:type:`v4l2_buffer`
+	to a __u64.
+    * - __u8
+      - ``picture_distance``
+      - picture_distance of the reference picture, as coded in its picture
+	header.
+    * - __u8
+      - ``flags``
+      - See :ref:`AVS Reference Flags <avs_ref_flags>`.
+    * - __u8
+      - ``reserved[6]``
+      - Applications and drivers must set this to zero.
+
+.. _avs_ref_flags:
+
+``AVS Reference Flags``
+
+.. cssclass:: longtable
+
+.. flat-table::
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - ``V4L2_AVS_REF_FLAG_VALID``
+      - 0x01
+      - The entry describes a reference picture.
+    * - ``V4L2_AVS_REF_FLAG_INTRA``
+      - 0x02
+      - The reference picture is an I picture.
+    * - ``V4L2_AVS_REF_FLAG_PICTURE_STRUCTURE``
+      - 0x04
+      - picture_structure of the reference picture (set for a frame coded
+	picture).
+    * - ``V4L2_AVS_REF_FLAG_TOP_FIELD_FIRST``
+      - 0x08
+      - top_field_first of the reference picture.
+
+.. _avs_picture_flags:
+
+``AVS Picture Flags``
+
+.. cssclass:: longtable
+
+.. flat-table::
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - ``V4L2_AVS_PICTURE_FLAG_PROGRESSIVE_FRAME``
+      - 0x00000001
+      - progressive_frame.
+    * - ``V4L2_AVS_PICTURE_FLAG_PICTURE_STRUCTURE``
+      - 0x00000002
+      - picture_structure (set for a frame coded picture), 1 when absent.
+    * - ``V4L2_AVS_PICTURE_FLAG_TOP_FIELD_FIRST``
+      - 0x00000004
+      - top_field_first.
+    * - ``V4L2_AVS_PICTURE_FLAG_REPEAT_FIRST_FIELD``
+      - 0x00000008
+      - repeat_first_field.
+    * - ``V4L2_AVS_PICTURE_FLAG_FIXED_PICTURE_QP``
+      - 0x00000010
+      - fixed_picture_qp.
+    * - ``V4L2_AVS_PICTURE_FLAG_PICTURE_REFERENCE``
+      - 0x00000020
+      - picture_reference_flag, 1 when absent (frame coded B pictures).
+    * - ``V4L2_AVS_PICTURE_FLAG_SKIP_MODE``
+      - 0x00000040
+      - skip_mode_flag.
+    * - ``V4L2_AVS_PICTURE_FLAG_ADVANCED_PRED_MODE_DISABLE``
+      - 0x00000080
+      - advanced_pred_mode_disable.
+    * - ``V4L2_AVS_PICTURE_FLAG_LOOP_FILTER_DISABLE``
+      - 0x00000100
+      - loop_filter_disable.
+    * - ``V4L2_AVS_PICTURE_FLAG_NO_FORWARD_REFERENCE``
+      - 0x00000200
+      - no_forward_reference_flag (AVS+).
+    * - ``V4L2_AVS_PICTURE_FLAG_PB_FIELD_ENHANCED``
+      - 0x00000400
+      - pb_field_enhanced_flag (AVS+).
+    * - ``V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT``
+      - 0x00000800
+      - weighting_quant_flag (AVS+). The parameters are passed with
+	``V4L2_CID_STATELESS_AVS_WEIGHT_QUANT``.
+    * - ``V4L2_AVS_PICTURE_FLAG_AEC``
+      - 0x00001000
+      - aec_enable (AVS+).
+
+``V4L2_CID_STATELESS_AVS_WEIGHT_QUANT (struct)``
+    Specifies the weighting quantization parameters of the picture header of
+    the associated AVS+ picture, as coded, as defined by :ref:`avsplus`. Only
+    used when the picture has ``V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT``.
+
+.. c:type:: v4l2_ctrl_avs_weight_quant
+
+.. cssclass:: longtable
+
+.. tabularcolumns:: |p{1.4cm}|p{6.5cm}|p{9.4cm}|
+
+.. flat-table:: struct v4l2_ctrl_avs_weight_quant
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - __u32
+      - ``flags``
+      - ``V4L2_AVS_WEIGHT_QUANT_FLAG_CHROMA_QUANT_PARAM_DISABLE``
+	(0x00000001): chroma_quant_param_disable.
+    * - __s8
+      - ``chroma_quant_param_delta_cb``
+      - chroma_quant_param_delta_cb, 0 when absent.
+    * - __s8
+      - ``chroma_quant_param_delta_cr``
+      - chroma_quant_param_delta_cr, 0 when absent.
+    * - __u8
+      - ``weighting_quant_param_index``
+      - weighting_quant_param_index, 0 to 2.
+    * - __u8
+      - ``weighting_quant_model``
+      - weighting_quant_model, 0 to 3.
+    * - __s16
+      - ``weighting_quant_param_delta1[6]``
+      - weighting_quant_param_delta1, used when ``weighting_quant_param_index``
+	is 1.
+    * - __s16
+      - ``weighting_quant_param_delta2[6]``
+      - weighting_quant_param_delta2, used when ``weighting_quant_param_index``
+	is 2.

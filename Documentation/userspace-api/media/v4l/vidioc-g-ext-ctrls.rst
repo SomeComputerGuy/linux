@@ -326,6 +326,18 @@ still cause this situation.
       - ``p_avs2_alf``
       - A pointer to a struct :c:type:`v4l2_ctrl_avs2_alf`. Valid if this control is
         of type ``V4L2_CTRL_TYPE_AVS2_ALF``.
+    * - struct :c:type:`v4l2_ctrl_avs_sequence` *
+      - ``p_avs_sequence``
+      - A pointer to a struct :c:type:`v4l2_ctrl_avs_sequence`. Valid if this control is
+        of type ``V4L2_CTRL_TYPE_AVS_SEQUENCE``.
+    * - struct :c:type:`v4l2_ctrl_avs_picture` *
+      - ``p_avs_picture``
+      - A pointer to a struct :c:type:`v4l2_ctrl_avs_picture`. Valid if this control is
+        of type ``V4L2_CTRL_TYPE_AVS_PICTURE``.
+    * - struct :c:type:`v4l2_ctrl_avs_weight_quant` *
+      - ``p_avs_weight_quant``
+      - A pointer to a struct :c:type:`v4l2_ctrl_avs_weight_quant`. Valid if this control is
+        of type ``V4L2_CTRL_TYPE_AVS_WEIGHT_QUANT``.
     * - struct :c:type:`v4l2_ctrl_hdr10_cll_info` *
       - ``p_hdr10_cll_info``
       - A pointer to a struct :c:type:`v4l2_ctrl_hdr10_cll_info`. Valid if this control is
