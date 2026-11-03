@@ -1132,12 +1132,6 @@ static int rga_bind(struct device *dev)
 		goto rel_vdev;
 	}
 
-	ret = video_register_device(vfd, VFL_TYPE_VIDEO, -1);
-	if (ret) {
-		v4l2_err(&rga->v4l2_dev, "Failed to register video device\n");
-		goto rel_m2m;
-	}
-
 	ret = component_bind_all(dev, rga);
 	if (ret) {
 		dev_err(dev, "component bind failed\n");
@@ -1147,11 +1141,24 @@ static int rga_bind(struct device *dev)
 	/* after binding all cores num_cores has the proper number of cores */
 	v4l2_m2m_set_max_parallel_jobs(rga->m2m_dev, rga->num_cores);
 
+	/*
+	 * Register the video device last, once all cores are bound: a
+	 * registered video device must not be freed with
+	 * video_device_release().
+	 */
+	ret = video_register_device(vfd, VFL_TYPE_VIDEO, -1);
+	if (ret) {
+		v4l2_err(&rga->v4l2_dev, "Failed to register video device\n");
+		goto unbind_cores;
+	}
+
 	v4l2_info(&rga->v4l2_dev, "Registered %s as /dev/%s\n",
 		  vfd->name, video_device_node_name(vfd));
 
 	return 0;
 
+unbind_cores:
+	component_unbind_all(dev, NULL);
 rel_m2m:
 	v4l2_m2m_release(rga->m2m_dev);
 rel_vdev:
