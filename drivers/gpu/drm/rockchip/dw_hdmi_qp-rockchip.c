@@ -111,6 +111,7 @@ struct rockchip_hdmi_qp {
 	int port_id;
 	const struct rockchip_hdmi_qp_ctrl_ops *ctrl_ops;
 	unsigned int phy_bpc;
+	bool limited_range_rgb;
 };
 
 struct rockchip_hdmi_qp_ctrl_ops {
@@ -330,6 +331,9 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 	s->output_type = DRM_MODE_CONNECTOR_HDMIA;
 	s->output_bpc = conn_state->hdmi.output_bpc;
 	s->bus_format = ingest_fmt;
+	s->rgb_limited_range = hdmi->limited_range_rgb &&
+			       conn_state->hdmi.output_format == DRM_OUTPUT_COLOR_FORMAT_RGB444 &&
+			       conn_state->hdmi.is_limited_range;
 
 	ret = dw_hdmi_qp_rockchip_set_color_space(s, conn_state);
 	if (ret) {
@@ -740,6 +744,8 @@ struct rockchip_hdmi_qp_cfg {
 	u8 min_frl_lanes;
 	u8 max_frl_rate_per_lane;
 	u8 max_frl_lanes;
+	/* The VOP can compress RGB to the limited quantization range */
+	bool limited_range_rgb;
 };
 
 static const struct rockchip_hdmi_qp_cfg rk3576_hdmi_cfg = {
@@ -761,6 +767,7 @@ static const struct rockchip_hdmi_qp_cfg rk3588_hdmi_cfg = {
 	.phy_ops = &rk3588_hdmi_phy_ops,
 	/* FIXME: Screen flickering above 10 Gbps/lane, cap until root-caused */
 	.max_frl_rate_per_lane = 10,
+	.limited_range_rgb = true,
 };
 
 static const struct of_device_id dw_hdmi_qp_rockchip_dt_ids[] = {
@@ -810,6 +817,7 @@ static int dw_hdmi_qp_rockchip_bind(struct device *dev, struct device *master,
 		return dev_err_probe(dev, -ENODEV, "Missing platform ctrl ops\n");
 
 	hdmi->ctrl_ops = cfg->ctrl_ops;
+	hdmi->limited_range_rgb = cfg->limited_range_rgb;
 	hdmi->dev = dev;
 	hdmi->port_id = -ENODEV;
 
@@ -931,6 +939,12 @@ static int dw_hdmi_qp_rockchip_bind(struct device *dev, struct device *master,
 		return ret;
 
 	drm_connector_attach_colorspace_property(connector);
+
+	if (hdmi->limited_range_rgb) {
+		ret = drm_connector_attach_broadcast_rgb_property(connector);
+		if (ret)
+			return ret;
+	}
 
 	platform_set_drvdata(pdev, hdmi);
 
