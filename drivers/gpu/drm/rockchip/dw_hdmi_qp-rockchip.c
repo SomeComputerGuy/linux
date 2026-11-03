@@ -18,6 +18,7 @@
 #include <linux/phy/phy.h>
 #include <linux/phy/phy-hdmi.h>
 #include <linux/regmap.h>
+#include <linux/videodev2.h>
 #include <linux/workqueue.h>
 
 #include <drm/bridge/dw_hdmi_qp.h>
@@ -250,6 +251,34 @@ dw_hdmi_qp_rockchip_phy_cfg(struct rockchip_crtc_state *s,
 	return PHY_HDMI_MODE_TMDS;
 }
 
+/*
+ * The AVI InfoFrame signals the colorimetry of the Colorspace property, so for
+ * YCbCr output the VOP2 has to convert with the matching matrix. It has BT.601,
+ * BT.709 and BT.2020 non-constant luminance R'G'B' to Y'C'bC'r matrices; RGB
+ * output is passed through as is.
+ */
+static int
+dw_hdmi_qp_rockchip_set_color_space(struct rockchip_crtc_state *s,
+				    const struct drm_connector_state *conn_state)
+{
+	s->color_space = V4L2_COLORSPACE_DEFAULT;
+
+	if (conn_state->hdmi.output_format == DRM_OUTPUT_COLOR_FORMAT_RGB444)
+		return 0;
+
+	switch (conn_state->colorspace) {
+	case DRM_MODE_COLORIMETRY_BT2020_RGB:
+	case DRM_MODE_COLORIMETRY_BT2020_YCC:
+		s->color_space = V4L2_COLORSPACE_BT2020;
+		return 0;
+	case DRM_MODE_COLORIMETRY_BT2020_CYCC:
+		/* No constant luminance encoder */
+		return -EINVAL;
+	default:
+		return 0;
+	}
+}
+
 static int
 dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 					 struct drm_crtc_state *crtc_state,
@@ -301,6 +330,13 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 	s->output_type = DRM_MODE_CONNECTOR_HDMIA;
 	s->output_bpc = conn_state->hdmi.output_bpc;
 	s->bus_format = ingest_fmt;
+
+	ret = dw_hdmi_qp_rockchip_set_color_space(s, conn_state);
+	if (ret) {
+		dev_dbg(hdmi->dev, "VOP2 can't encode colorspace %d\n",
+			conn_state->colorspace);
+		return ret;
+	}
 
 	return 0;
 }
