@@ -13,6 +13,8 @@
 /* Hardware limits */
 #define MAX_WIDTH 8192
 #define MAX_HEIGHT 8192
+#define MAX_DST_WIDTH 4096
+#define MAX_DST_HEIGHT 4096
 
 #define MIN_WIDTH 34
 #define MIN_HEIGHT 34

@@ -197,6 +197,8 @@ struct rga_hw {
 	size_t cmdbuf_size;
 	u32 min_width, min_height;
 	u32 max_width, max_height;
+	/* Destination (CAPTURE) limit, can be smaller than the source one */
+	u32 max_dst_width, max_dst_height;
 	u8 max_scaling_factor;
 	u8 stride_alignment;
 	u8 features;
