@@ -1317,6 +1317,17 @@ FWHT Flags
       - 0x01
       - Indication that all the frames for the sequence are progressive instead
 	of interlaced.
+    * - ``V4L2_MPEG2_SEQ_FLAG_MPEG1``
+      - 0x02
+      - The sequence is an ISO/IEC 11172-2 (MPEG-1) sequence: the inverse
+	quantisation uses the MPEG-1 mismatch control, motion vectors may be
+	full pel and pictures may be D-pictures. MPEG-1 has no sequence or
+	picture extensions: applications set the fields as ISO/IEC 13818-2
+	defines them for MPEG-1 bitstreams (chroma_format 1,
+	V4L2_MPEG2_SEQ_FLAG_PROGRESSIVE, frame pictures with
+	V4L2_MPEG2_PIC_FLAG_FRAME_PRED_DCT and V4L2_MPEG2_PIC_FLAG_PROGRESSIVE,
+	intra_dc_precision 0, both components of ``f_code[0]`` set to
+	forward_f_code and of ``f_code[1]`` to backward_f_code).
 
 .. raw:: latex
 
@@ -1366,8 +1377,9 @@ FWHT Flags
     * - __u8
       - ``picture_coding_type``
       - Picture coding type for the frame covered by the current slice
-	(V4L2_MPEG2_PIC_CODING_TYPE_I, V4L2_MPEG2_PIC_CODING_TYPE_P or
-	V4L2_MPEG2_PIC_CODING_TYPE_B).
+	(V4L2_MPEG2_PIC_CODING_TYPE_I, V4L2_MPEG2_PIC_CODING_TYPE_P,
+	V4L2_MPEG2_PIC_CODING_TYPE_B, or V4L2_MPEG2_PIC_CODING_TYPE_D in MPEG-1
+	sequences).
     * - __u8
       - ``picture_structure``
       - Picture structure (1: interlaced top field, 2: interlaced bottom field,
@@ -1415,6 +1427,16 @@ FWHT Flags
     * - ``V4L2_MPEG2_PIC_FLAG_PROGRESSIVE``
       - 0x00000080
       - Indicates whether the current frame is progressive.
+    * - ``V4L2_MPEG2_PIC_FLAG_FULL_PEL_FORWARD``
+      - 0x00000100
+      - full_pel_forward_vector of an MPEG-1 picture header: the forward
+	motion vectors are in full pel units. Only valid with
+	V4L2_MPEG2_SEQ_FLAG_MPEG1.
+    * - ``V4L2_MPEG2_PIC_FLAG_FULL_PEL_BACKWARD``
+      - 0x00000200
+      - full_pel_backward_vector of an MPEG-1 picture header: the backward
+	motion vectors are in full pel units. Only valid with
+	V4L2_MPEG2_SEQ_FLAG_MPEG1.
 
 .. raw:: latex
 
