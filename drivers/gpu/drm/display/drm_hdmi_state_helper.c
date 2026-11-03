@@ -948,6 +948,10 @@ hdmi_generate_infoframes(const struct drm_connector *connector,
  * Checks that a desired connector update is valid, and updates various
  * fields of derived state.
  *
+ * The InfoFrames are only written when the encoder is enabled, so a change of
+ * the output configuration, the Colorspace property or the HDR output metadata
+ * forces a modeset on the connector's CRTC.
+ *
  * RETURNS:
  * Zero on success, or an errno code otherwise.
  */
@@ -979,7 +983,9 @@ int drm_atomic_helper_connector_hdmi_check(struct drm_connector *connector,
 	    old_conn_state->hdmi.output_bpc != new_conn_state->hdmi.output_bpc ||
 	    old_conn_state->hdmi.output_format != new_conn_state->hdmi.output_format ||
 	    old_conn_state->hdmi.frl_rate_per_lane != new_conn_state->hdmi.frl_rate_per_lane ||
-	    old_conn_state->hdmi.frl_lanes != new_conn_state->hdmi.frl_lanes) {
+	    old_conn_state->hdmi.frl_lanes != new_conn_state->hdmi.frl_lanes ||
+	    old_conn_state->colorspace != new_conn_state->colorspace ||
+	    !drm_connector_atomic_hdr_metadata_equal(old_conn_state, new_conn_state)) {
 		struct drm_crtc *crtc = new_conn_state->crtc;
 		struct drm_crtc_state *crtc_state;
 
