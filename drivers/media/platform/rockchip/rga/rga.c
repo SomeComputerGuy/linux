@@ -413,8 +413,8 @@ static int rga_open(struct file *file)
 	struct rockchip_rga *rga = video_drvdata(file);
 	struct rga_ctx *ctx = NULL;
 	int ret = 0;
-	u32 def_width = clamp(DEFAULT_WIDTH, rga->hw->min_width, rga->hw->max_width);
-	u32 def_height = clamp(DEFAULT_HEIGHT, rga->hw->min_height, rga->hw->max_height);
+	u32 def_width = clamp(DEFAULT_WIDTH, rga->hw->min_width, rga->hw->max_dst_width);
+	u32 def_height = clamp(DEFAULT_HEIGHT, rga->hw->min_height, rga->hw->max_dst_height);
 	struct rga_frame def_frame = {
 		.crop.left = 0,
 		.crop.top = 0,
@@ -595,6 +595,9 @@ static int vidioc_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
 
 	if (V4L2_TYPE_IS_CAPTURE(f->type)) {
 		const struct rga_frame *frm;
+
+		frmsize.max_width = hw->max_dst_width;
+		frmsize.max_height = hw->max_dst_height;
 
 		frm = rga_get_frame(ctx, f->type);
 		if (IS_ERR(frm))
