@@ -57,6 +57,8 @@ struct rockchip_crtc_state {
 	u32 bus_format;
 	u32 bus_flags;
 	int color_space;
+	/* RGB output in the limited quantization range (16-235 for 8 bpc) */
+	bool rgb_limited_range;
 	bool frl_enabled;
 	/* VOP2: rate to program into the dedicated video PLL for the DCLK, 0 if none */
 	unsigned long dclk_pll_rate;
