@@ -887,25 +887,28 @@ static int rga_core_bind(struct device *dev, struct device *master, void *data)
 		  rga->version.major, rga->version.minor);
 
 	if (rga->num_cores) {
-		/* Attach to the first cores iommu */
-		struct iommu_domain *domain = iommu_get_domain_for_dev(rga->cores[0]->dev);
-
-		if (!domain) {
-			dev_err(core->dev, "Couldn't get domain of the first core\n");
-			return -ENODEV;
-		}
-		ret = iommu_attach_device(domain, core->dev);
-		if (ret) {
-			dev_err(core->dev, "Couldn't attach to the domain of the first core\n");
-			return ret;
-		}
-		core->attached_domain = domain;
+		struct iommu_domain *domain;
 
 		/* we are not the first core, expect that we have the same version */
 		if (rga->version.major != version.major || rga->version.minor != version.minor) {
 			v4l2_err(&rga->v4l2_dev, "Detected multi-core setup with different core versions!\n");
-			return -ENODEV;
+			ret = -ENODEV;
+			goto err_put;
 		}
+
+		/* Attach to the first cores iommu */
+		domain = iommu_get_domain_for_dev(rga->cores[0]->dev);
+		if (!domain) {
+			dev_err(core->dev, "Couldn't get domain of the first core\n");
+			ret = -ENODEV;
+			goto err_put;
+		}
+		ret = iommu_attach_device(domain, core->dev);
+		if (ret) {
+			dev_err(core->dev, "Couldn't attach to the domain of the first core\n");
+			goto err_put;
+		}
+		core->attached_domain = domain;
 	} else
 		rga->version = version;
 
@@ -916,6 +919,10 @@ static int rga_core_bind(struct device *dev, struct device *master, void *data)
 	spin_unlock_irqrestore(&rga->cores_lock, flags);
 
 	return 0;
+
+err_put:
+	pm_runtime_put(core->dev);
+	return ret;
 }
 
 static void rga_core_unbind(struct device *dev, struct device *master,
