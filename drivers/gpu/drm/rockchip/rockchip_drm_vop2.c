@@ -2294,6 +2294,59 @@ static void vop2_crtc_protect_dclk_pll(struct vop2_video_port *vp)
 		vp->pll_v0_held = true;
 }
 
+/*
+ * The VP post-processing BCSH (brightness, contrast, saturation, hue) block
+ * works on Y'CbCr, between an optional R'G'B' to Y'CbCr (R2Y) and Y'CbCr to
+ * R'G'B' (Y2R) conversion. With the same conversion on both sides, scaling
+ * Y' and CbCr by 219/255 and lifting Y' by 16/255 maps full range R'G'B' to
+ * the limited quantization range: R' = 16 + R * 219 / 255. The conversions
+ * have to be limited range ones: full range puts the chroma of saturated red
+ * and blue at the very end of the code range, which wraps around with 10 bit
+ * windows. Only the RK3568 and RK3588 video ports have that block at these
+ * offsets.
+ */
+static bool vop2_vp_has_bcsh(struct vop2_video_port *vp)
+{
+	return vp->vop2->version == VOP_VERSION_RK3568 ||
+	       vp->vop2->version == VOP_VERSION_RK3588;
+}
+
+static void vop2_bcsh_setup(struct vop2_video_port *vp,
+			    struct rockchip_crtc_state *vcstate)
+{
+	const struct vop2_video_port_data *vp_data = &vp->vop2->data->vp[vp->id];
+	/* Contrast and saturation are 1.8 fixed point, brightness in output LSBs */
+	u32 gain = DIV_ROUND_CLOSEST(219 * 256, 255);
+	int brightness;
+
+	if (!vop2_vp_has_bcsh(vp))
+		return;
+
+	if (!vcstate->rgb_limited_range || vcstate->yuv_overlay) {
+		vop2_vp_write(vp, RK3568_VP_BCSH_COLOR_BAR, 0);
+		vop2_vp_write(vp, RK3568_VP_BCSH_CTRL, 0);
+		return;
+	}
+
+	brightness = vp_data->feature & VOP2_VP_FEATURE_OUTPUT_10BIT ? 64 : 16;
+
+	vop2_vp_write(vp, RK3568_VP_BCSH_CTRL,
+		      FIELD_PREP(RK3568_VP_BCSH_CTRL__R2Y_CSC_MODE, CSC_BT709L) |
+		      RK3568_VP_BCSH_CTRL__R2Y_EN |
+		      FIELD_PREP(RK3568_VP_BCSH_CTRL__Y2R_CSC_MODE, CSC_BT709L) |
+		      RK3568_VP_BCSH_CTRL__Y2R_EN);
+	vop2_vp_write(vp, RK3568_VP_BCSH_BCS,
+		      FIELD_PREP(RK3568_VP_BCSH_BCS__OUT_MODE, BCSH_OUT_MODE_NORMAL_VIDEO) |
+		      FIELD_PREP(RK3568_VP_BCSH_BCS__SAT_CON, gain) |
+		      FIELD_PREP(RK3568_VP_BCSH_BCS__CONTRAST, gain) |
+		      FIELD_PREP(RK3568_VP_BCSH_BCS__BRIGHTNESS, brightness));
+	vop2_vp_write(vp, RK3568_VP_BCSH_H,
+		      FIELD_PREP(RK3568_VP_BCSH_H__COS_HUE, 0x100) |
+		      FIELD_PREP(RK3568_VP_BCSH_H__SIN_HUE, 0));
+	vop2_vp_write(vp, RK3568_VP_BCSH_COLOR_BAR,
+		      RK3568_VP_BCSH_COLOR_BAR__BCSH_EN);
+}
+
 static void vop2_crtc_atomic_enable(struct drm_crtc *crtc,
 				    struct drm_atomic_commit *state)
 {
@@ -2473,6 +2526,7 @@ static void vop2_crtc_atomic_enable(struct drm_crtc *crtc,
 	vop2_crtc_protect_dclk_pll(vp);
 
 	vop2_post_config(crtc, true, crtc_state, old_crtc_state);
+	vop2_bcsh_setup(vp, vcstate);
 
 	vop2_cfg_done(vp);
 
@@ -3311,6 +3365,9 @@ static struct drm_crtc_state *vop2_crtc_duplicate_state(struct drm_crtc *crtc)
 		return NULL;
 
 	__drm_atomic_helper_crtc_duplicate_state(crtc, &vcstate->base);
+
+	/* Set by the encoder's atomic_check, which runs for every modeset */
+	vcstate->rgb_limited_range = false;
 
 	return &vcstate->base;
 }
