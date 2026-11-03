@@ -63,6 +63,9 @@ struct video_device;
  * @p_avs2_picture:		Pointer to an AVS2 picture header structure.
  * @p_avs2_weight_quant:	Pointer to an AVS2 weighting quantization structure.
  * @p_avs2_alf:		Pointer to an AVS2 adaptive loop filter structure.
+ * @p_avs_sequence:		Pointer to an AVS1/AVS+ sequence header structure.
+ * @p_avs_picture:		Pointer to an AVS1/AVS+ picture header structure.
+ * @p_avs_weight_quant:	Pointer to an AVS+ weighting quantization structure.
  * @p_rect:			Pointer to a rectangle.
  * @p:				Pointer to a compound value.
  * @p_const:			Pointer to a constant compound value.
@@ -104,6 +107,9 @@ union v4l2_ctrl_ptr {
 	struct v4l2_ctrl_avs2_picture *p_avs2_picture;
 	struct v4l2_ctrl_avs2_weight_quant *p_avs2_weight_quant;
 	struct v4l2_ctrl_avs2_alf *p_avs2_alf;
+	struct v4l2_ctrl_avs_sequence *p_avs_sequence;
+	struct v4l2_ctrl_avs_picture *p_avs_picture;
+	struct v4l2_ctrl_avs_weight_quant *p_avs_weight_quant;
 	struct v4l2_rect *p_rect;
 	void *p;
 	const void *p_const;

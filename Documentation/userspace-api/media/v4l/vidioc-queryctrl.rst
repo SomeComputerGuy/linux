@@ -615,6 +615,24 @@ See also the examples in :ref:`control`.
       - n/a
       - A struct :c:type:`v4l2_ctrl_avs2_alf`, containing the AVS2
 	adaptive loop filter parameters for stateless video decoders.
+    * - ``V4L2_CTRL_TYPE_AVS_SEQUENCE``
+      - n/a
+      - n/a
+      - n/a
+      - A struct :c:type:`v4l2_ctrl_avs_sequence`, containing the AVS1/AVS+
+	sequence header for stateless video decoders.
+    * - ``V4L2_CTRL_TYPE_AVS_PICTURE``
+      - n/a
+      - n/a
+      - n/a
+      - A struct :c:type:`v4l2_ctrl_avs_picture`, containing the AVS1/AVS+
+	picture header and references for stateless video decoders.
+    * - ``V4L2_CTRL_TYPE_AVS_WEIGHT_QUANT``
+      - n/a
+      - n/a
+      - n/a
+      - A struct :c:type:`v4l2_ctrl_avs_weight_quant`, containing the AVS+
+	weighting quantization parameters for stateless video decoders.
 
 .. raw:: latex
 
