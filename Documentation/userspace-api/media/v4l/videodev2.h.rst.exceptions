@@ -178,6 +178,9 @@ replace symbol V4L2_CTRL_TYPE_AVS2_SEQUENCE :c:type:`V4L.v4l2_ctrl_type`
 replace symbol V4L2_CTRL_TYPE_AVS2_PICTURE :c:type:`V4L.v4l2_ctrl_type`
 replace symbol V4L2_CTRL_TYPE_AVS2_WEIGHT_QUANT :c:type:`V4L.v4l2_ctrl_type`
 replace symbol V4L2_CTRL_TYPE_AVS2_ALF :c:type:`V4L.v4l2_ctrl_type`
+replace symbol V4L2_CTRL_TYPE_AVS_SEQUENCE :c:type:`V4L.v4l2_ctrl_type`
+replace symbol V4L2_CTRL_TYPE_AVS_PICTURE :c:type:`V4L.v4l2_ctrl_type`
+replace symbol V4L2_CTRL_TYPE_AVS_WEIGHT_QUANT :c:type:`V4L.v4l2_ctrl_type`
 
 # V4L2 capability defines
 replace define V4L2_CAP_VIDEO_CAPTURE device-capabilities

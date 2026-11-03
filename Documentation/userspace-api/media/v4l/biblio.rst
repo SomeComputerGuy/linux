@@ -450,6 +450,26 @@ GB/T 33475.2
 
 :author:    Standardization Administration of China (http://www.sac.gov.cn)
 
+.. _avs1:
+
+GB/T 20090.2
+============
+
+
+:title:     GB/T 20090.2-2013 "Information technology --- Advanced coding of audio and video --- Part 2: Video"
+
+:author:    Standardization Administration of China (http://www.sac.gov.cn)
+
+.. _avsplus:
+
+GY/T 257.1
+==========
+
+
+:title:     GY/T 257.1-2012 "Advanced coding of audio and video for broadcasting --- Part 1: Video" (AVS+, also AVS1-P16)
+
+:author:    State Administration of Radio, Film and Television of China
+
 .. _av1:
 
 AV1
