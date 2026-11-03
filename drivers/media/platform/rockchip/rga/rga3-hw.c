@@ -536,6 +536,8 @@ const struct rga_hw rga3_hw = {
 	/* use output size, as it's a bit smaller than the input size */
 	.max_width = RGA3_MAX_OUTPUT_WIDTH,
 	.max_height = RGA3_MAX_OUTPUT_HEIGHT,
+	.max_dst_width = RGA3_MAX_OUTPUT_WIDTH,
+	.max_dst_height = RGA3_MAX_OUTPUT_HEIGHT,
 	.max_scaling_factor = RGA3_MAX_SCALING_FACTOR,
 	.stride_alignment = 16,
 	.features = 0,
