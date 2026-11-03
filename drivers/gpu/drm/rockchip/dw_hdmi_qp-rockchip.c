@@ -256,10 +256,13 @@ dw_hdmi_qp_rockchip_phy_cfg(struct rockchip_crtc_state *s,
  * The AVI InfoFrame signals the colorimetry of the Colorspace property, so for
  * YCbCr output the VOP2 has to convert with the matching matrix. It has BT.601,
  * BT.709 and BT.2020 non-constant luminance R'G'B' to Y'C'bC'r matrices; RGB
- * output is passed through as is.
+ * output is passed through as is. With the default Colorspace the InfoFrame
+ * carries no colorimetry, and CTA-861 has the sink assume BT.601 for SD (up to
+ * 576 lines) and BT.709 for HD video formats.
  */
 static int
 dw_hdmi_qp_rockchip_set_color_space(struct rockchip_crtc_state *s,
+				    const struct drm_crtc_state *crtc_state,
 				    const struct drm_connector_state *conn_state)
 {
 	s->color_space = V4L2_COLORSPACE_DEFAULT;
@@ -268,6 +271,16 @@ dw_hdmi_qp_rockchip_set_color_space(struct rockchip_crtc_state *s,
 		return 0;
 
 	switch (conn_state->colorspace) {
+	case DRM_MODE_COLORIMETRY_DEFAULT:
+		if (crtc_state->adjusted_mode.vdisplay <= 576)
+			s->color_space = V4L2_COLORSPACE_SMPTE170M;
+		return 0;
+	case DRM_MODE_COLORIMETRY_SMPTE_170M_YCC:
+	case DRM_MODE_COLORIMETRY_XVYCC_601:
+	case DRM_MODE_COLORIMETRY_SYCC_601:
+	case DRM_MODE_COLORIMETRY_OPYCC_601:
+		s->color_space = V4L2_COLORSPACE_SMPTE170M;
+		return 0;
 	case DRM_MODE_COLORIMETRY_BT2020_RGB:
 	case DRM_MODE_COLORIMETRY_BT2020_YCC:
 		s->color_space = V4L2_COLORSPACE_BT2020;
@@ -335,7 +348,7 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 			       conn_state->hdmi.output_format == DRM_OUTPUT_COLOR_FORMAT_RGB444 &&
 			       conn_state->hdmi.is_limited_range;
 
-	ret = dw_hdmi_qp_rockchip_set_color_space(s, conn_state);
+	ret = dw_hdmi_qp_rockchip_set_color_space(s, crtc_state, conn_state);
 	if (ret) {
 		dev_dbg(hdmi->dev, "VOP2 can't encode colorspace %d\n",
 			conn_state->colorspace);
