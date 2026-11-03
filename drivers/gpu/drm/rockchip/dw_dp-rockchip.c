@@ -223,6 +223,20 @@ static int dw_dp_rockchip_bind(struct device *dev, struct device *master, void *
 		return ret;
 	}
 
+	/*
+	 * The DW DP bridge applies the requested color format to its output
+	 * formats; these are the formats its output format table offers.
+	 */
+	ret = drm_connector_attach_color_format_property(connector,
+							 BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444) |
+							 BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR444) |
+							 BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR422) |
+							 BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR420));
+	if (ret) {
+		dw_dp_unbind(dp->base);
+		return ret;
+	}
+
 	drm_connector_attach_hdr_output_metadata_property(connector);
 
 	ret = drm_mode_create_dp_colorspace_property(connector,
