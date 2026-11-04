@@ -1782,7 +1782,13 @@
 			 <&cru DCLK_VOP3>,
 			 <&cru PCLK_VOP_ROOT>,
 			 <&hdptxphy0>,
-			 <&cru PLL_V0PLL>;
+			 <&cru PLL_V0PLL>,
+			 <&cru DCLK_VOP0_SRC>,
+			 <&cru DCLK_VOP1_SRC>,
+			 <&cru DCLK_VOP2_SRC>,
+			 <&cru PLL_GPLL>,
+			 <&cru PLL_CPLL>,
+			 <&cru PLL_AUPLL>;
 		clock-names = "aclk",
 			      "hclk",
 			      "dclk_vp0",
@@ -1791,7 +1797,13 @@
 			      "dclk_vp3",
 			      "pclk_vop",
 			      "pll_hdmiphy0",
-			      "pll_v0";
+			      "pll_v0",
+			      "dclk_src_vp0",
+			      "dclk_src_vp1",
+			      "dclk_src_vp2",
+			      "pll_gpll",
+			      "pll_cpll",
+			      "pll_aupll";
 		iommus = <&vop_mmu>;
 		power-domains = <&power RK3588_PD_VOP>;
 		resets = <&cru SRST_A_VOP>,
