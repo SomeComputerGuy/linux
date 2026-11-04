@@ -8,6 +8,7 @@
 #define _ROCKCHIP_DRM_VOP2_H
 
 #include <linux/regmap.h>
+#include <drm/drm_atomic.h>
 #include <drm/drm_modes.h>
 #include <dt-bindings/soc/rockchip,vop2.h>
 #include "rockchip_drm_drv.h"
@@ -243,6 +244,43 @@ struct vop2_win {
 	u8 axi_vp;
 };
 
+/**
+ * enum vop2_dclk_parent - CRU parents of the DCLK sources (RK3588)
+ *
+ * @VOP2_DCLK_GPLL: general PLL, fixed rate
+ * @VOP2_DCLK_CPLL: CPLL, fixed rate
+ * @VOP2_DCLK_AUPLL: audio PLL, fixed rate
+ * @VOP2_DCLK_V0PLL: video PLL, set to a rate all its users can divide from
+ * @VOP2_DCLK_NUM_PARENTS: number of parents
+ */
+enum vop2_dclk_parent {
+	VOP2_DCLK_GPLL,
+	VOP2_DCLK_CPLL,
+	VOP2_DCLK_AUPLL,
+	VOP2_DCLK_V0PLL,
+	VOP2_DCLK_NUM_PARENTS,
+};
+
+/**
+ * struct vop2_pll_state - atomic state of the video PLL
+ *
+ * The DCLK of a video port that no fixed PLL can make (exactly for HDMI,
+ * within the pixel clock tolerance otherwise) runs from the video PLL, which
+ * is set to one rate that all such ports can divide their DCLK from.
+ */
+struct vop2_pll_state {
+	/** @base: base private state */
+	struct drm_private_state base;
+	/** @rate: rate of the video PLL, 0 if no video port uses it */
+	unsigned long rate;
+	/** @users: video ports whose DCLK runs from the video PLL */
+	u32 users;
+	/** @exact: users that need their DCLK exactly */
+	u32 exact;
+	/** @clock: DCLK of each user */
+	unsigned long clock[ROCKCHIP_MAX_CRTC];
+};
+
 struct vop2_video_port_data {
 	unsigned int id;
 	u32 feature;
@@ -256,20 +294,22 @@ struct vop2_video_port_data {
 	 * @pixel_rate: pixel per cycle
 	 */
 	u8 pixel_rate;
+	/**
+	 * @dclk_max_div: largest divider of the CRU DCLK source, 0 if the
+	 * video PLL is not planned for this video port
+	 */
+	u8 dclk_max_div;
 };
 
 struct vop2_video_port {
 	struct drm_crtc crtc;
 	struct vop2 *vop2;
 	struct clk *dclk;
-	struct clk *dclk_src;
 	/**
-	 * @pll_v0: per-VP handle on the dedicated video PLL (RK3588 V0PLL), so
-	 * that the rate protection one VP holds also applies to the others.
+	 * @dclk_src: CRU divider in front of the @dclk mux, if the DCLK can
+	 * also come from an HDMI PHY PLL
 	 */
-	struct clk *pll_v0;
-	/** @pll_v0_held: @pll_v0 rate protected while the DCLK runs from it */
-	bool pll_v0_held;
+	struct clk *dclk_src;
 	struct reset_control *dclk_rst;
 	unsigned int id;
 	const struct vop2_video_port_data *data;
@@ -389,6 +429,28 @@ struct vop2 {
 	struct clk *pclk;
 	struct clk *pll_hdmiphy0;
 	struct clk *pll_hdmiphy1;
+	/** @pll_v0: video PLL (RK3588 V0PLL) the video ports share */
+	struct clk *pll_v0;
+	/**
+	 * @dclk_parents: CRU parents of the DCLK sources, by
+	 * &enum vop2_dclk_parent; all set (RK3588) or none
+	 */
+	struct clk *dclk_parents[VOP2_DCLK_NUM_PARENTS];
+	/** @dclk_parent_rates: rates of the fixed system PLLs among them */
+	unsigned long dclk_parent_rates[VOP2_DCLK_V0PLL];
+	/**
+	 * @pll_obj: atomic state of the video PLL (&struct vop2_pll_state),
+	 * initialized if the video ports plan it
+	 */
+	struct drm_private_obj pll_obj;
+	/** @pll_plan: the video ports plan the video PLL in atomic_check */
+	bool pll_plan;
+	/** @pll_hw_users: enabled video ports running from the video PLL */
+	u32 pll_hw_users;
+	/** @pll_hw_rate: rate the video PLL was last set to, 0 if unknown */
+	unsigned long pll_hw_rate;
+	/** @pll_held: the video PLL rate is protected for @pll_hw_users */
+	bool pll_held;
 	struct reset_control *axi_rst;
 
 	/* optional internal rgb encoder */
