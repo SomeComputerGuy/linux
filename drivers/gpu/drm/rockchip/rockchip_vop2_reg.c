@@ -1069,6 +1069,7 @@ static const struct vop2_video_port_data rk3588_vop_video_ports[] = {
 		.max_pixel_clock_rate = 600000000U * 4,
 		/* hdr2sdr sdr2hdr hdr2hdr sdr2sdr */
 		.pre_scan_max_dly = { 76, 65, 65, 54 },
+		.dclk_max_div = 128,
 		.offset = 0xc00,
 	}, {
 		.id = 1,
@@ -1078,6 +1079,7 @@ static const struct vop2_video_port_data rk3588_vop_video_ports[] = {
 		.max_output = { 4096, 2304 },
 		.max_pixel_clock_rate = 600000000U * 4,
 		.pre_scan_max_dly = { 76, 65, 65, 54 },
+		.dclk_max_div = 32,
 		.offset = 0xd00,
 	}, {
 		.id = 2,
@@ -1087,6 +1089,7 @@ static const struct vop2_video_port_data rk3588_vop_video_ports[] = {
 		.max_output = { 4096, 2304 },
 		.max_pixel_clock_rate = 600000000U * 4,
 		.pre_scan_max_dly = { 52, 52, 52, 52 },
+		.dclk_max_div = 32,
 		.offset = 0xe00,
 	}, {
 		.id = 3,
@@ -1094,6 +1097,7 @@ static const struct vop2_video_port_data rk3588_vop_video_ports[] = {
 		.max_output = { 2048, 1536 },
 		.max_pixel_clock_rate = 150000000U,
 		.pre_scan_max_dly = { 52, 52, 52, 52 },
+		.dclk_max_div = 128,
 		.offset = 0xf00,
 	},
 };

@@ -60,7 +60,12 @@ struct rockchip_crtc_state {
 	/* RGB output in the limited quantization range (16-235 for 8 bpc) */
 	bool rgb_limited_range;
 	bool frl_enabled;
-	/* VOP2: rate to program into the dedicated video PLL for the DCLK, 0 if none */
+	/*
+	 * VOP2: CRU parent of the DCLK (enum vop2_dclk_parent + 1, 0 if the
+	 * DCLK doesn't come from a CRU parent chosen by atomic_check), and the
+	 * video PLL rate if that is the parent
+	 */
+	unsigned int dclk_parent;
 	unsigned long dclk_pll_rate;
 };
 #define to_rockchip_crtc_state(s) \
@@ -107,6 +112,16 @@ extern struct platform_driver rockchip_lvds_driver;
 extern struct platform_driver vop_platform_driver;
 extern struct platform_driver rk3066_hdmi_driver;
 extern struct platform_driver vop2_platform_driver;
+
+#if IS_ENABLED(CONFIG_ROCKCHIP_VOP2)
+int vop2_atomic_check(struct drm_device *drm, struct drm_atomic_commit *state);
+#else
+static inline int vop2_atomic_check(struct drm_device *drm,
+				    struct drm_atomic_commit *state)
+{
+	return 0;
+}
+#endif
 
 static inline struct rockchip_encoder *to_rockchip_encoder(struct drm_encoder *encoder)
 {
