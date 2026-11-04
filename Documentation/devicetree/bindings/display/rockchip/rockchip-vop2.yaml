@@ -69,6 +69,12 @@ properties:
       - {}
       - {}
       - {}
+      - {}
+      - {}
+      - {}
+      - {}
+      - {}
+      - {}
 
   clock-names:
     minItems: 5
@@ -78,6 +84,12 @@ properties:
       - const: dclk_vp0
       - const: dclk_vp1
       - const: dclk_vp2
+      - {}
+      - {}
+      - {}
+      - {}
+      - {}
+      - {}
       - {}
       - {}
       - {}
@@ -262,7 +274,16 @@ allOf:
             - description: Alternative pixel clock provided by HDMI1 PHY PLL,
                 or the video PLL if there is no HDMI1 PHY.
             - description: Video PLL (V0PLL) the video ports may retune for
-                pixel clocks the system PLLs cannot divide down exactly.
+                pixel clocks the system PLLs cannot divide down exactly,
+                or the CRU pixel clock divider of video port 0.
+            - description: CRU pixel clock divider of video port 0 or 1, in
+                front of the HDMI PHY PLL mux.
+            - description: CRU pixel clock divider of video port 1 or 2.
+            - description: CRU pixel clock divider of video port 2, or GPLL.
+            - description: GPLL or CPLL, fixed parents of the CRU pixel clock
+                dividers.
+            - description: CPLL or AUPLL.
+            - description: AUPLL.
 
         clock-names:
           minItems: 7
@@ -276,7 +297,13 @@ allOf:
             - const: pclk_vop
             - const: pll_hdmiphy0
             - enum: [pll_hdmiphy1, pll_v0]
-            - const: pll_v0
+            - enum: [pll_v0, dclk_src_vp0]
+            - enum: [dclk_src_vp0, dclk_src_vp1]
+            - enum: [dclk_src_vp1, dclk_src_vp2]
+            - enum: [dclk_src_vp2, pll_gpll]
+            - enum: [pll_gpll, pll_cpll]
+            - enum: [pll_cpll, pll_aupll]
+            - const: pll_aupll
 
         resets:
           minItems: 6
