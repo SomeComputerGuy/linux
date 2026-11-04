@@ -59,9 +59,31 @@ rockchip_fb_create(struct drm_device *dev, struct drm_file *file,
 	return &afbc_fb->base;
 }
 
+/*
+ * VOP2 adds CRTCs to the state whose DCLK source changes with it, which then
+ * need the whole check as well.
+ */
+static int rockchip_drm_atomic_check(struct drm_device *dev,
+				     struct drm_atomic_commit *state)
+{
+	int i, ret;
+
+	for (i = 0; i <= ROCKCHIP_MAX_CRTC; i++) {
+		ret = drm_atomic_helper_check(dev, state);
+		if (ret)
+			return ret;
+
+		ret = vop2_atomic_check(dev, state);
+		if (ret <= 0)
+			return ret;
+	}
+
+	return -EINVAL;
+}
+
 static const struct drm_mode_config_funcs rockchip_drm_mode_config_funcs = {
 	.fb_create = rockchip_fb_create,
-	.atomic_check = drm_atomic_helper_check,
+	.atomic_check = rockchip_drm_atomic_check,
 	.atomic_commit = drm_atomic_helper_commit,
 };
 

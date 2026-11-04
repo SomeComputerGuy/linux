@@ -22,6 +22,7 @@
 
 #include <drm/drm.h>
 #include <drm/drm_atomic.h>
+#include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_atomic_uapi.h>
 #include <drm/drm_blend.h>
 #include <drm/drm_crtc.h>
@@ -1184,9 +1185,16 @@ static void vop2_crtc_atomic_disable(struct drm_crtc *crtc,
 
 	vop2_crtc_disable_irq(vp, VP_INT_DSP_HOLD_VALID);
 
-	if (vp->pll_v0_held) {
-		clk_rate_exclusive_put(vp->pll_v0);
-		vp->pll_v0_held = false;
+	if (vop2->pll_hw_users & BIT(vp->id)) {
+		vop2->pll_hw_users &= ~BIT(vp->id);
+		if (!vop2->pll_hw_users) {
+			/* Set it again for the next user (it may be lost in suspend) */
+			vop2->pll_hw_rate = 0;
+			if (vop2->pll_held) {
+				clk_rate_exclusive_put(vop2->pll_v0);
+				vop2->pll_held = false;
+			}
+		}
 	}
 
 	if (vp->dclk_src)
@@ -2272,29 +2280,6 @@ static struct clk *vop2_crtc_dclk_hdmiphy_pll(struct vop2_video_port *vp,
 }
 
 /*
- * A DCLK that ends up on the video PLL (programmed for this VP or simply
- * matching its current rate) keeps that PLL's rate protected until the VP is
- * disabled, so another VP cannot retune it underneath. A VP that needs a
- * different rate then sees the protected rate in atomic_check.
- */
-static void vop2_crtc_protect_dclk_pll(struct vop2_video_port *vp)
-{
-	struct clk *src, *pll;
-
-	if (!vp->pll_v0 || vp->pll_v0_held)
-		return;
-
-	/* dclk_vopN -> dclk_vopN_src -> V0PLL, or dclk_vop3 -> V0PLL */
-	src = clk_get_parent(vp->dclk);
-	pll = src ? clk_get_parent(src) : NULL;
-	if (!clk_is_match(src, vp->pll_v0) && !clk_is_match(pll, vp->pll_v0))
-		return;
-
-	if (!clk_rate_exclusive_get(vp->pll_v0))
-		vp->pll_v0_held = true;
-}
-
-/*
  * The VP post-processing BCSH (brightness, contrast, saturation, hue) block
  * works on Y'CbCr, between an optional R'G'B' to Y'CbCr (R2Y) and Y'CbCr to
  * R'G'B' (Y2R) conversion. With the same conversion on both sides, scaling
@@ -2345,6 +2330,44 @@ static void vop2_bcsh_setup(struct vop2_video_port *vp,
 		      FIELD_PREP(RK3568_VP_BCSH_H__SIN_HUE, 0));
 	vop2_vp_write(vp, RK3568_VP_BCSH_COLOR_BAR,
 		      RK3568_VP_BCSH_COLOR_BAR__BCSH_EN);
+}
+
+/*
+ * Switch the CRU DCLK source of a video port to the parent atomic_check
+ * chose. The video PLL is set to its planned rate by the first video port
+ * enabled from it: every port that ran from it at another rate was disabled
+ * earlier in the commit (see vop2_pll_plan()).
+ */
+static void vop2_crtc_set_dclk_parent(struct vop2_video_port *vp,
+				      const struct rockchip_crtc_state *vcstate)
+{
+	enum vop2_dclk_parent p = vcstate->dclk_parent - 1;
+	struct clk *src = vp->dclk_src ?: vp->dclk;
+	struct vop2 *vop2 = vp->vop2;
+	int ret;
+
+	if (p == VOP2_DCLK_V0PLL && vop2->pll_hw_rate != vcstate->dclk_pll_rate) {
+		WARN_ON(vop2->pll_hw_users);
+		ret = clk_set_rate(vop2->pll_v0, vcstate->dclk_pll_rate);
+		if (ret < 0 || clk_get_rate(vop2->pll_v0) != vcstate->dclk_pll_rate)
+			drm_err(vop2->drm,
+				"vp%d: failed to set the video PLL to %lu Hz: %d (%lu Hz)\n",
+				vp->id, vcstate->dclk_pll_rate, ret,
+				clk_get_rate(vop2->pll_v0));
+		vop2->pll_hw_rate = ret < 0 ? 0 : vcstate->dclk_pll_rate;
+	}
+
+	if (src != vp->dclk) {
+		ret = clk_set_parent(vp->dclk, src);
+		if (ret < 0)
+			drm_err(vop2->drm, "vp%d: failed to select the CRU DCLK: %d\n",
+				vp->id, ret);
+	}
+
+	ret = clk_set_parent(src, vop2->dclk_parents[p]);
+	if (ret < 0)
+		drm_err(vop2->drm, "vp%d: failed to set DCLK parent %d: %d\n",
+			vp->id, p, ret);
 }
 
 static void vop2_crtc_atomic_enable(struct drm_crtc *crtc,
@@ -2513,17 +2536,16 @@ static void vop2_crtc_atomic_enable(struct drm_crtc *crtc,
 				 ret);
 	}
 
-	if (vcstate->dclk_pll_rate &&
-	    vcstate->dclk_pll_rate != clk_get_rate(vp->pll_v0)) {
-		ret = clk_set_rate(vp->pll_v0, vcstate->dclk_pll_rate);
-		if (ret < 0)
-			drm_warn(vop2->drm,
-				 "vp%d: failed to set the video PLL to %lu Hz: %d\n",
-				 vp->id, vcstate->dclk_pll_rate, ret);
-	}
+	if (!pll_hdmiphy && vcstate->dclk_parent)
+		vop2_crtc_set_dclk_parent(vp, vcstate);
 
 	clk_set_rate(vp->dclk, clock);
-	vop2_crtc_protect_dclk_pll(vp);
+
+	if (vcstate->dclk_parent == VOP2_DCLK_V0PLL + 1) {
+		vop2->pll_hw_users |= BIT(vp->id);
+		if (!vop2->pll_held && !clk_rate_exclusive_get(vop2->pll_v0))
+			vop2->pll_held = true;
+	}
 
 	vop2_post_config(crtc, true, crtc_state, old_crtc_state);
 	vop2_bcsh_setup(vp, vcstate);
@@ -2593,8 +2615,8 @@ static bool vop2_dclk_rate_exact(long rate, unsigned long clock)
 }
 
 /*
- * Sinks accept a pixel clock within 0.5 % of the mode's (CTA-861, VESA DMT),
- * the tolerance DRM itself uses to match modes.
+ * Sinks accept a pixel clock within 0.5 % of the mode's: the CTA-861 and VESA
+ * DMT timings allow that much deviation of the pixel clock.
  */
 static bool vop2_dclk_rate_close(long rate, unsigned long clock)
 {
@@ -2602,123 +2624,50 @@ static bool vop2_dclk_rate_close(long rate, unsigned long clock)
 }
 
 /*
- * The CRU parents of dclk_vopN_src (GPLL, CPLL, V0PLL, AUPLL) only give
- * integer fractions of their current rates, and the narrowest of the
- * dividers behind them (dclk_vop1_src, dclk_vop2_src) has 5 bits.
+ * The CRU divides the DCLK from one of its parents, and rounds the divider
+ * to the closest rate (CLK_DIVIDER_ROUND_CLOSEST): the rate it gives from
+ * parent_rate, with a divider of at most max_div.
  */
-#define VOP2_DCLK_MAX_DIV	32
-
-/*
- * Whether a CRU DCLK rate can come from the video PLL at pll_rate: the CRU
- * divider gives DIV_ROUND_UP(parent rate, divider).
- */
-static bool vop2_dclk_rate_of_pll(unsigned long pll_rate, long rate)
+static unsigned long vop2_dclk_div_rate(unsigned long parent_rate,
+					unsigned long clock,
+					unsigned int max_div)
 {
-	unsigned long n;
+	unsigned long up, down, div;
 
-	if (rate <= 0 || !pll_rate)
-		return false;
+	if (!parent_rate || !clock)
+		return 0;
 
-	n = DIV_ROUND_CLOSEST(pll_rate, rate);
+	if (clock > parent_rate) {
+		div = 1;
+	} else {
+		up = DIV_ROUND_UP(parent_rate, clock);
+		down = parent_rate / clock;
+		div = clock - DIV_ROUND_UP(parent_rate, up) <=
+		      DIV_ROUND_UP(parent_rate, down) - clock ? up : down;
+	}
 
-	return n && DIV_ROUND_UP(pll_rate, n) == rate;
+	return DIV_ROUND_UP(parent_rate, clamp(div, 1UL, (unsigned long)max_div));
 }
 
 /*
- * Whether the DCLK is (within the mode clock's resolution) an integer
- * fraction of a video PLL rate that the CRU divider can make
+ * The DCLK a video port needs from the CRU for a state, 0 if none (inactive,
+ * no encoder, or the HDMI PHY PLL makes it). *exact is set for HDMI, which
+ * needs the exact pixel clock.
  */
-static bool vop2_dclk_pll_fraction(unsigned long pll_rate, unsigned long clock)
+static unsigned long vop2_crtc_cru_dclk(struct vop2_video_port *vp,
+					const struct drm_crtc_state *crtc_state,
+					bool *exact)
 {
-	unsigned long n = DIV_ROUND_CLOSEST(pll_rate, clock);
-
-	return n && n <= VOP2_DCLK_MAX_DIV &&
-	       vop2_dclk_rate_exact(DIV_ROUND_UP(pll_rate, n), clock);
-}
-
-/*
- * Whether the CRU can divide a DCLK within the pixel clock tolerance from a
- * video PLL rate
- */
-static bool vop2_dclk_pll_close(unsigned long pll_rate, unsigned long clock)
-{
-	unsigned long n = DIV_ROUND_CLOSEST(pll_rate, clock);
-
-	return n && n <= VOP2_DCLK_MAX_DIV &&
-	       vop2_dclk_rate_close(DIV_ROUND_UP(pll_rate, n), clock);
-}
-
-/*
- * Whether the CRU may take the DCLK from the video PLL at pll_rate rather
- * than from the parent cru_rate came from: it picks the closest rate, so it
- * does if the PLL gives at least as close a rate. The divider width is not
- * checked, so this may say yes when the CRU can't, never the other way round.
- */
-static bool vop2_dclk_pll_closer(unsigned long pll_rate, unsigned long clock,
-				 long cru_rate)
-{
-	unsigned long n = pll_rate / clock;
-	unsigned long best = abs_diff((unsigned long)cru_rate, clock);
-
-	if (n && abs_diff(DIV_ROUND_UP(pll_rate, n), clock) <= best)
-		return true;
-
-	return abs_diff(DIV_ROUND_UP(pll_rate, n + 1), clock) <= best;
-}
-
-/**
- * struct vop2_dclk_req - what a video port needs from the DCLK sources
- *
- * All video ports share the video PLL (V0PLL on RK3588), so atomic_check
- * collects this for each of them and then picks one PLL rate for all.
- */
-struct vop2_dclk_req {
-	/** @clock: DCLK to make from the CRU, 0 if none in this commit */
-	unsigned long clock;
-	/** @pinned: video PLL rate an unchanged active port runs from */
-	unsigned long pinned;
-	/** @cru_rate: closest CRU rate, with the PLL at its current rate */
-	long cru_rate;
-	/** @cru_on_pll: @cru_rate may come from the PLL's current rate */
-	bool cru_on_pll;
-	/**
-	 * @fixed_rate: a CRU rate within the pixel clock tolerance that comes
-	 * from a parent other than the PLL, 0 if none is known
-	 */
-	long fixed_rate;
-	/** @hdmi: the DCLK must be exact */
-	bool hdmi;
-	/** @num_pll_rates: number of valid @pll_rates */
-	unsigned int num_pll_rates;
-	/** @pll_rates: PLL rates the DCLK can be divided from exactly */
-	unsigned long pll_rates[6];
-};
-
-static void vop2_crtc_dclk_req(struct vop2_video_port *vp,
-			       struct drm_crtc_state *crtc_state,
-			       unsigned long pll_cur,
-			       struct vop2_dclk_req *req)
-{
-	struct rockchip_crtc_state *vcstate = to_rockchip_crtc_state(crtc_state);
 	const struct drm_display_mode *mode = &crtc_state->adjusted_mode;
 	struct vop2 *vop2 = vp->vop2;
 	struct drm_encoder *encoder;
 	unsigned long clock = 0;
-	struct clk *cru_clk;
-	unsigned int n, i;
 	bool hdmi = false;
-	long rate;
 
-	memset(req, 0, sizeof(*req));
+	*exact = false;
 
-	if (!crtc_state->active)
-		return;
-
-	/* The port keeps its DCLK, and the PLL rate it runs from */
-	if (!drm_atomic_crtc_needs_modeset(crtc_state)) {
-		req->pinned = vcstate->dclk_pll_rate;
-		return;
-	}
+	if (!vop2->ops->dclk_rate || !crtc_state->active)
+		return 0;
 
 	drm_for_each_encoder_mask(encoder, vop2->drm, crtc_state->encoder_mask) {
 		struct rockchip_encoder *rkencoder = to_rockchip_encoder(encoder);
@@ -2731,13 +2680,47 @@ static void vop2_crtc_dclk_req(struct vop2_video_port *vp,
 	}
 
 	if (!clock)
-		return;
+		return 0;
 
 	if (mode->flags & DRM_MODE_FLAG_DBLCLK)
 		clock *= 2;
 
 	if (hdmi && vop2_crtc_dclk_hdmiphy_pll(vp, crtc_state, clock))
-		return;
+		return 0;
+
+	*exact = hdmi;
+
+	return clock;
+}
+
+/*
+ * Without the video PLL planned, the DCLK is the closest rate of the CRU
+ * at its current parent rates: refuse it unless it is exact (HDMI) or
+ * within the pixel clock tolerance.
+ */
+static int vop2_crtc_atomic_check_dclk(struct vop2_video_port *vp,
+				       struct drm_crtc_state *crtc_state)
+{
+	struct rockchip_crtc_state *vcstate = to_rockchip_crtc_state(crtc_state);
+	struct vop2 *vop2 = vp->vop2;
+	unsigned long clock;
+	struct clk *cru_clk;
+	bool exact;
+	long rate;
+
+	if (vop2->pll_plan || !drm_atomic_crtc_needs_modeset(crtc_state))
+		return 0;
+
+	vcstate->dclk_parent = 0;
+	vcstate->dclk_pll_rate = 0;
+
+	/* Without an alternative PLL the CRU is the only DCLK source anyway */
+	if (!vop2->pll_hdmiphy0 && !vop2->pll_hdmiphy1)
+		return 0;
+
+	clock = vop2_crtc_cru_dclk(vp, crtc_state, &exact);
+	if (!clock)
+		return 0;
 
 	/*
 	 * A DCLK that can also run from an HDMI PHY PLL is a plain mux in front
@@ -2749,289 +2732,272 @@ static void vop2_crtc_dclk_req(struct vop2_video_port *vp,
 		cru_clk = vp->dclk_src ?: clk_get_parent(vp->dclk);
 		if (!cru_clk || clk_is_match(cru_clk, vop2->pll_hdmiphy0) ||
 		    clk_is_match(cru_clk, vop2->pll_hdmiphy1))
-			return;
+			return 0;
 	} else {
 		cru_clk = vp->dclk;
 	}
 
-	req->clock = clock;
-	req->hdmi = hdmi;
-	req->cru_rate = clk_round_rate(cru_clk, clock);
-	req->cru_on_pll = vp->pll_v0 && vop2_dclk_rate_of_pll(pll_cur, req->cru_rate);
-
-	/*
-	 * The PLL's current rate may hide a close rate of another parent that
-	 * the CRU takes once the PLL is set to another rate. Rounding the
-	 * edges of the tolerance window finds it, unless a rate of the PLL is
-	 * closer to both edges (then it is not used).
-	 */
-	if (!req->cru_on_pll) {
-		if (vop2_dclk_rate_close(req->cru_rate, clock))
-			req->fixed_rate = req->cru_rate;
-	} else if (!hdmi) {
-		for (n = 0; n < 2; n++) {
-			rate = clk_round_rate(cru_clk, n ? clock + clock / 200 :
-							   clock - clock / 200);
-			if (vop2_dclk_rate_close(rate, clock) &&
-			    !vop2_dclk_rate_of_pll(pll_cur, rate) &&
-			    (!req->fixed_rate ||
-			     abs_diff((unsigned long)rate, clock) <
-			     abs_diff((unsigned long)req->fixed_rate, clock)))
-				req->fixed_rate = rate;
-		}
-	}
-
-	if (!vp->pll_v0 ||
-	    (vop2_dclk_rate_exact(req->cru_rate, clock) && !req->cru_on_pll))
-		return;
-
-	/*
-	 * Integer multiples of the DCLK the PLL can be set to. While another
-	 * port holds the PLL's rate, clk_round_rate() returns that rate.
-	 */
-	for (n = 1; n <= VOP2_DCLK_MAX_DIV; n <<= 1) {
-		rate = clk_round_rate(vp->pll_v0, clock * n);
-		if (rate <= 0 || !vop2_dclk_rate_exact(DIV_ROUND_CLOSEST(rate, n), clock))
-			continue;
-
-		for (i = 0; i < req->num_pll_rates; i++)
-			if (req->pll_rates[i] == rate)
-				break;
-		if (i == req->num_pll_rates)
-			req->pll_rates[req->num_pll_rates++] = rate;
-	}
-}
-
-/*
- * Whether a port gets its DCLK with the video PLL at pll_rate (pll_cur is its
- * current rate), and the PLL rate it then runs from (0 for none) in *pin.
- * HDMI needs the exact pixel clock, the other outputs get the closest CRU
- * rate if no exact one is available, within the pixel clock tolerance.
- */
-static bool vop2_dclk_req_met(const struct vop2_dclk_req *req,
-			      unsigned long pll_rate, unsigned long pll_cur,
-			      unsigned long *pin)
-{
-	bool cru_usable = !req->cru_on_pll || pll_rate == pll_cur;
-
-	*pin = 0;
-
-	if (req->pinned) {
-		*pin = req->pinned;
-		return pll_rate == req->pinned;
-	}
-
-	if (!req->clock)
-		return true;
-
-	if (cru_usable && vop2_dclk_rate_exact(req->cru_rate, req->clock))
-		goto cru;
-
-	if (vop2_dclk_pll_fraction(pll_rate, req->clock)) {
-		*pin = pll_rate;
-		return true;
-	}
-
-	if (cru_usable && !req->hdmi &&
-	    vop2_dclk_rate_close(req->cru_rate, req->clock))
-		goto cru;
-
-	/*
-	 * Another parent gives a close rate: the CRU takes that, or a closer
-	 * rate of the PLL at its new rate. The PLL must have its new rate
-	 * before the DCLK is set (see vop2_dclk_plan()).
-	 */
-	if (!req->hdmi && req->fixed_rate) {
-		if (vop2_dclk_pll_closer(pll_rate, req->clock, req->fixed_rate))
-			*pin = pll_rate;
-		return true;
-	}
-
-	/* The CRU picks the PLL at its new rate, or a closer parent */
-	if (!req->hdmi && vop2_dclk_pll_close(pll_rate, req->clock)) {
-		*pin = pll_rate;
-		return true;
-	}
-
-	return false;
-
-cru:
-	/*
-	 * The CRU picks the closest of its parents when the DCLK is set, which
-	 * may be the PLL at its new rate: the port then holds the PLL's rate
-	 * as well (see vop2_crtc_protect_dclk_pll()).
-	 */
-	if (req->cru_on_pll ||
-	    (pll_rate != pll_cur &&
-	     vop2_dclk_pll_closer(pll_rate, req->clock, req->cru_rate)))
-		*pin = pll_rate;
-
-	return true;
-}
-
-/*
- * Plan the DCLKs of all video ports that can use the video PLL, for the new
- * state: find one PLL rate that every active port gets its DCLK with, and
- * record in each CRTC state the PLL rate the port runs from, which
- * vop2_crtc_atomic_enable() programs, so that the commit doesn't need
- * anything the check didn't account for.
- *
- * A port that stays as it is keeps its DCLK and so the PLL rate it runs
- * from. Disabled ports and ports that are switched to a new mode release the
- * PLL before any port is enabled, and ports are enabled in index order. The
- * current PLL rate is tried first, then the rates the ports would set it to,
- * in port order. The result only depends on the new state and the current
- * clock rates, so a test-only commit and the real one agree.
- */
-static int vop2_dclk_plan(struct vop2 *vop2, struct drm_atomic_commit *state)
-{
-	struct drm_crtc_state *crtc_states[ROCKCHIP_MAX_CRTC] = {};
-	struct vop2_dclk_req reqs[ROCKCHIP_MAX_CRTC];
-	unsigned long pins[ROCKCHIP_MAX_CRTC];
-	unsigned long cands[1 + ROCKCHIP_MAX_CRTC * (1 + ARRAY_SIZE(reqs[0].pll_rates))];
-	unsigned long pll_cur = 0;
-	int nr_vps = vop2->data->nr_vps;
-	unsigned int num_cands = 0, j;
-	struct vop2_video_port *vp;
-	int i;
-
-	for (i = 0; i < nr_vps; i++) {
-		struct drm_crtc_state *crtc_state;
-
-		vp = &vop2->vps[i];
-		if (!vp->crtc.port || !vp->pll_v0)
-			continue;
-
-		/* Ports that stay as they are constrain the PLL too */
-		crtc_state = drm_atomic_get_crtc_state(state, &vp->crtc);
-		if (IS_ERR(crtc_state))
-			return PTR_ERR(crtc_state);
-
-		crtc_states[i] = crtc_state;
-		if (!pll_cur)
-			pll_cur = clk_get_rate(vp->pll_v0);
-	}
-
-	for (i = 0; i < nr_vps; i++)
-		if (crtc_states[i])
-			vop2_crtc_dclk_req(&vop2->vps[i], crtc_states[i], pll_cur,
-					   &reqs[i]);
-
-	/* The current rate first, then the rates the ports run from or ask for */
-	cands[num_cands++] = pll_cur;
-	for (i = 0; i < nr_vps; i++) {
-		if (!crtc_states[i])
-			continue;
-
-		if (reqs[i].pinned)
-			cands[num_cands++] = reqs[i].pinned;
-		for (j = 0; j < reqs[i].num_pll_rates; j++)
-			cands[num_cands++] = reqs[i].pll_rates[j];
-	}
-
-	for (j = 0; j < num_cands; j++) {
-		for (i = 0; i < nr_vps; i++)
-			if (crtc_states[i] &&
-			    !vop2_dclk_req_met(&reqs[i], cands[j], pll_cur, &pins[i]))
-				break;
-		if (i == nr_vps)
-			goto found;
-	}
-
-	for (i = 0; i < nr_vps; i++)
-		if (crtc_states[i] && reqs[i].clock)
-			drm_dbg_kms(vop2->drm,
-				    "vp%d: DCLK %lu Hz (closest CRU rate %ld Hz) doesn't fit the video PLL rates of the other ports\n",
-				    i, reqs[i].clock, reqs[i].cru_rate);
-
-	return -EINVAL;
-
-found:
-	for (i = 0; i < nr_vps; i++) {
-		if (!crtc_states[i] || reqs[i].pinned)
-			continue;
-
-		/*
-		 * A port whose closest CRU rate is the PLL's old rate takes a
-		 * rate of another parent only if the PLL has its new rate when
-		 * the port is enabled: unless a port enabled before it sets
-		 * the PLL, it does so itself.
-		 */
-		if (reqs[i].cru_on_pll && !pins[i] && cands[j] != pll_cur) {
-			int k;
-
-			for (k = 0; k < i; k++)
-				if (crtc_states[k] && !reqs[k].pinned &&
-				    pins[k] == cands[j])
-					break;
-			if (k == i)
-				pins[i] = cands[j];
-		}
-
-		to_rockchip_crtc_state(crtc_states[i])->dclk_pll_rate = pins[i];
-		if (pins[i])
-			drm_dbg_kms(vop2->drm,
-				    "vp%d: DCLK %lu Hz with the video PLL at %lu Hz\n",
-				    i, reqs[i].clock, pins[i]);
-	}
-
-	return 0;
-}
-
-/*
- * HDMI needs the exact pixel clock. The HDMI PHY PLL can generate any rate
- * the PHY supports, but when the DCLK has to come from the system CRU (FRL
- * mode, or rates beyond the PHY PLL), it is derived by integer division
- * from a few fixed PLLs, and the clock framework silently picks the closest
- * rate: e.g. 3840x2160@59.94Hz (593.407 MHz) would run at 594 MHz.
- * Use the video PLL for such a rate when it is available (for any output).
- * Otherwise refuse the configuration instead of scanning out at a wrong
- * rate: HDMI unless the CRU rate is exact, the other outputs unless it is
- * within the pixel clock tolerance.
- */
-static int vop2_crtc_atomic_check_dclk(struct vop2_video_port *vp,
-				       struct drm_crtc_state *crtc_state)
-{
-	struct drm_atomic_commit *state = crtc_state->state;
-	struct vop2 *vop2 = vp->vop2;
-	struct vop2_dclk_req req;
-	unsigned long pin;
-	int i;
-
-	if (!vop2->ops->dclk_rate || !crtc_state->active ||
-	    !drm_atomic_crtc_needs_modeset(crtc_state))
-		return 0;
-
-	if (vp->pll_v0) {
-		/* One plan for all ports, made by the first one with a modeset */
-		for (i = 0; &vop2->vps[i] != vp; i++) {
-			struct vop2_video_port *other = &vop2->vps[i];
-			struct drm_crtc_state *s;
-
-			if (!other->crtc.port || !other->pll_v0)
-				continue;
-
-			s = drm_atomic_get_new_crtc_state(state, &other->crtc);
-			if (s && s->active && drm_atomic_crtc_needs_modeset(s))
-				return 0;
-		}
-
-		return vop2_dclk_plan(vop2, state);
-	}
-
-	/* Without an alternative PLL the CRU is the only DCLK source anyway */
-	if (!vop2->pll_hdmiphy0 && !vop2->pll_hdmiphy1)
-		return 0;
-
-	vop2_crtc_dclk_req(vp, crtc_state, 0, &req);
-	if (vop2_dclk_req_met(&req, 0, 0, &pin))
+	rate = clk_round_rate(cru_clk, clock);
+	if (vop2_dclk_rate_exact(rate, clock) ||
+	    (!exact && vop2_dclk_rate_close(rate, clock)))
 		return 0;
 
 	drm_dbg_kms(vop2->drm,
 		    "vp%d: DCLK %lu Hz not available from the CRU (closest %ld Hz)\n",
-		    vp->id, req.clock, req.cru_rate);
+		    vp->id, clock, rate);
 
 	return -EINVAL;
+}
+
+/*
+ * Highest video PLL rate to divide a DCLK from: four times the highest
+ * DCLK (600 MHz) and twice the highest fixed parent rate.
+ */
+#define VOP2_PLL_MAX_RATE	2400000000UL
+
+/* Error of a DCLK rate in ppm of the clock it should have */
+static unsigned long vop2_dclk_ppm(unsigned long rate, unsigned long clock)
+{
+	return div64_ul((u64)abs_diff(rate, clock) * 1000000, clock);
+}
+
+/*
+ * The video PLL rate for a set of users: of the rates the PLL can make
+ * that are an integer multiple of a user's DCLK (up to the divider of that
+ * user), the one that gives every user its DCLK (exactly where it must be
+ * exact, within the pixel clock tolerance otherwise), most of them exactly,
+ * with the smallest worst error, lowest rate first. 0 if there is none.
+ * The result only depends on the users and their DCLKs, never on the
+ * current rate of the PLL, so it is the same in whichever order and from
+ * whichever previous state the users are set.
+ */
+static unsigned long vop2_pll_rate(struct vop2 *vop2,
+				   const struct vop2_pll_state *pstate)
+{
+	unsigned long best = 0, best_ppm = ULONG_MAX;
+	unsigned int best_exact = 0;
+	int i, j;
+
+	for (i = 0; i < vop2->data->nr_vps; i++) {
+		unsigned int max_div = vop2->data->vp[i].dclk_max_div;
+		unsigned long clock = pstate->clock[i];
+		unsigned int n;
+
+		if (!(pstate->users & BIT(i)))
+			continue;
+
+		for (n = 1; n <= max_div && clock * n <= VOP2_PLL_MAX_RATE; n++) {
+			unsigned long ppm = 0, rate;
+			unsigned int num_exact = 0;
+			long pll_rate;
+
+			pll_rate = clk_round_rate(vop2->pll_v0, clock * n);
+			if (pll_rate <= 0)
+				continue;
+
+			for (j = 0; j < vop2->data->nr_vps; j++) {
+				if (!(pstate->users & BIT(j)))
+					continue;
+
+				rate = vop2_dclk_div_rate(pll_rate, pstate->clock[j],
+							  vop2->data->vp[j].dclk_max_div);
+				if (vop2_dclk_rate_exact(rate, pstate->clock[j])) {
+					num_exact++;
+					continue;
+				}
+
+				if ((pstate->exact & BIT(j)) ||
+				    !vop2_dclk_rate_close(rate, pstate->clock[j]))
+					break;
+
+				ppm = max(ppm, vop2_dclk_ppm(rate, pstate->clock[j]));
+			}
+			if (j < vop2->data->nr_vps)
+				continue;
+
+			if (num_exact > best_exact ||
+			    (num_exact == best_exact &&
+			     (ppm < best_ppm ||
+			      (ppm == best_ppm && pll_rate < best)))) {
+				best = pll_rate;
+				best_ppm = ppm;
+				best_exact = num_exact;
+			}
+		}
+	}
+
+	return best;
+}
+
+/*
+ * The best fixed CRU parent for a DCLK: the closest rate, the first parent
+ * on a tie. Returns the parent, and its rate in *rate.
+ */
+static enum vop2_dclk_parent vop2_dclk_fixed_parent(struct vop2 *vop2,
+						    unsigned int max_div,
+						    unsigned long clock,
+						    unsigned long *rate)
+{
+	enum vop2_dclk_parent p, best = VOP2_DCLK_GPLL;
+	unsigned long r;
+
+	*rate = 0;
+	for (p = VOP2_DCLK_GPLL; p < VOP2_DCLK_V0PLL; p++) {
+		r = vop2_dclk_div_rate(vop2->dclk_parent_rates[p], clock, max_div);
+		if (r && (!*rate || abs_diff(r, clock) < abs_diff(*rate, clock))) {
+			*rate = r;
+			best = p;
+		}
+	}
+
+	return best;
+}
+
+static struct vop2_pll_state *to_vop2_pll_state(struct drm_private_state *state)
+{
+	return container_of(state, struct vop2_pll_state, base);
+}
+
+/*
+ * Plan the DCLK sources of all video ports for the new state, with no
+ * hardware readout, so that the result only depends on the new state:
+ *
+ * - HDMI takes its DCLK from the HDMI PHY PLL when it can (TMDS).
+ * - Otherwise a fixed system PLL (GPLL, CPLL, AUPLL) gives the DCLK if it
+ *   can do so exactly, or, for outputs other than HDMI, within the pixel
+ *   clock tolerance (0.5 %, CTA-861 and VESA DMT).
+ * - The other video ports share the video PLL, which is set to a rate all
+ *   of them can divide their DCLK from (see vop2_pll_rate()), or the state
+ *   is refused.
+ *
+ * The video PLL rate only depends on its users. If it changes while a user
+ * keeps running, that video port is added to the commit for a modeset, and
+ * the state must be checked again (returns 1). The commit then disables the
+ * video ports first, sets the PLL once, and enables the video ports.
+ */
+static int vop2_pll_plan(struct vop2 *vop2, struct drm_atomic_commit *state)
+{
+	const struct vop2_pll_state *old;
+	struct drm_private_state *priv;
+	struct vop2_pll_state *new;
+	u32 modeset = 0, keep;
+	int i;
+
+	for (i = 0; i < vop2->data->nr_vps; i++) {
+		struct drm_crtc_state *crtc_state;
+
+		if (!vop2->vps[i].crtc.port)
+			continue;
+
+		crtc_state = drm_atomic_get_new_crtc_state(state, &vop2->vps[i].crtc);
+		if (crtc_state && drm_atomic_crtc_needs_modeset(crtc_state))
+			modeset |= BIT(i);
+	}
+
+	if (!modeset)
+		return 0;
+
+	priv = drm_atomic_get_private_obj_state(state, &vop2->pll_obj);
+	if (IS_ERR(priv))
+		return PTR_ERR(priv);
+
+	new = to_vop2_pll_state(priv);
+	old = to_vop2_pll_state(drm_atomic_get_old_private_obj_state(state,
+								     &vop2->pll_obj));
+
+	/* Video ports without a modeset keep their DCLK */
+	keep = old->users & ~modeset;
+	new->users = keep;
+	new->exact = old->exact & keep;
+	for (i = 0; i < ROCKCHIP_MAX_CRTC; i++)
+		new->clock[i] = keep & BIT(i) ? old->clock[i] : 0;
+
+	for (i = 0; i < vop2->data->nr_vps; i++) {
+		struct vop2_video_port *vp = &vop2->vps[i];
+		struct rockchip_crtc_state *vcstate;
+		struct drm_crtc_state *crtc_state;
+		enum vop2_dclk_parent p;
+		unsigned long clock, rate;
+		bool exact;
+
+		if (!(modeset & BIT(i)))
+			continue;
+
+		crtc_state = drm_atomic_get_new_crtc_state(state, &vp->crtc);
+		vcstate = to_rockchip_crtc_state(crtc_state);
+		vcstate->dclk_parent = 0;
+		vcstate->dclk_pll_rate = 0;
+
+		clock = vop2_crtc_cru_dclk(vp, crtc_state, &exact);
+		if (!clock)
+			continue;
+
+		p = vop2_dclk_fixed_parent(vop2, vp->data->dclk_max_div, clock, &rate);
+		if (vop2_dclk_rate_exact(rate, clock) ||
+		    (!exact && vop2_dclk_rate_close(rate, clock))) {
+			vcstate->dclk_parent = p + 1;
+			drm_dbg_kms(vop2->drm, "vp%d: DCLK %lu Hz: %lu Hz from fixed PLL %d\n",
+				    i, clock, rate, p);
+			continue;
+		}
+
+		new->users |= BIT(i);
+		new->clock[i] = clock;
+		if (exact)
+			new->exact |= BIT(i);
+	}
+
+	new->rate = new->users ? vop2_pll_rate(vop2, new) : 0;
+	if (new->users && !new->rate) {
+		for (i = 0; i < vop2->data->nr_vps; i++)
+			if (new->users & BIT(i))
+				drm_dbg_kms(vop2->drm,
+					    "vp%d: DCLK %lu Hz%s: no video PLL rate for all its users (0x%x)\n",
+					    i, new->clock[i],
+					    new->exact & BIT(i) ? " (exact)" : "",
+					    new->users);
+		return -EINVAL;
+	}
+
+	/* Users that keep running need a modeset to follow a new rate */
+	if (keep && new->rate != old->rate) {
+		if (!state->allow_modeset)
+			return -EINVAL;
+
+		for (i = 0; i < vop2->data->nr_vps; i++) {
+			struct drm_crtc_state *crtc_state;
+
+			if (!(keep & BIT(i)))
+				continue;
+
+			crtc_state = drm_atomic_get_crtc_state(state, &vop2->vps[i].crtc);
+			if (IS_ERR(crtc_state))
+				return PTR_ERR(crtc_state);
+
+			drm_dbg_kms(vop2->drm,
+				    "vp%d: video PLL %lu -> %lu Hz, adding a modeset\n",
+				    i, old->rate, new->rate);
+			crtc_state->mode_changed = true;
+		}
+
+		return 1;
+	}
+
+	for (i = 0; i < vop2->data->nr_vps; i++) {
+		struct rockchip_crtc_state *vcstate;
+
+		if (!(new->users & modeset & BIT(i)))
+			continue;
+
+		vcstate = to_rockchip_crtc_state(drm_atomic_get_new_crtc_state(state,
+								&vop2->vps[i].crtc));
+		vcstate->dclk_parent = VOP2_DCLK_V0PLL + 1;
+		vcstate->dclk_pll_rate = new->rate;
+		drm_dbg_kms(vop2->drm, "vp%d: DCLK %lu Hz from the video PLL at %lu Hz\n",
+			    i, new->clock[i], new->rate);
+	}
+
+	return 0;
 }
 
 static int vop2_crtc_atomic_check(struct drm_crtc *crtc,
@@ -3406,6 +3372,72 @@ static const struct drm_crtc_funcs vop2_crtc_funcs = {
 	.late_register = vop2_crtc_late_register,
 };
 
+/**
+ * vop2_atomic_check - check the resources the VOP2 video ports share
+ * @drm: DRM device
+ * @state: atomic state, after drm_atomic_helper_check()
+ *
+ * Returns 0 if the state is valid, 1 if CRTCs were added to the state for a
+ * modeset (check it again), or a negative error code.
+ */
+int vop2_atomic_check(struct drm_device *drm, struct drm_atomic_commit *state)
+{
+	struct drm_crtc_state *crtc_state;
+	struct drm_crtc *crtc;
+	int i;
+
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+		struct vop2 *vop2;
+
+		if (crtc->funcs != &vop2_crtc_funcs)
+			continue;
+
+		vop2 = to_vop2_video_port(crtc)->vop2;
+
+		return vop2->pll_plan ? vop2_pll_plan(vop2, state) : 0;
+	}
+
+	return 0;
+}
+
+static struct drm_private_state *vop2_pll_duplicate_state(struct drm_private_obj *obj)
+{
+	struct vop2_pll_state *state;
+
+	state = kmemdup(to_vop2_pll_state(obj->state), sizeof(*state), GFP_KERNEL);
+	if (!state)
+		return NULL;
+
+	__drm_atomic_helper_private_obj_duplicate_state(obj, &state->base);
+
+	return &state->base;
+}
+
+static void vop2_pll_destroy_state(struct drm_private_obj *obj,
+				   struct drm_private_state *state)
+{
+	kfree(to_vop2_pll_state(state));
+}
+
+static struct drm_private_state *vop2_pll_create_state(struct drm_private_obj *obj)
+{
+	struct vop2_pll_state *state;
+
+	state = kzalloc_obj(*state);
+	if (!state)
+		return ERR_PTR(-ENOMEM);
+
+	__drm_atomic_helper_private_obj_create_state(obj, &state->base);
+
+	return &state->base;
+}
+
+static const struct drm_private_state_funcs vop2_pll_state_funcs = {
+	.atomic_create_state = vop2_pll_create_state,
+	.atomic_duplicate_state = vop2_pll_duplicate_state,
+	.atomic_destroy_state = vop2_pll_destroy_state,
+};
+
 static irqreturn_t rk3576_vp_isr(int irq, void *data)
 {
 	struct vop2_video_port *vp = data;
@@ -3602,7 +3634,7 @@ static int vop2_create_crtcs(struct vop2 *vop2)
 	for (i = 0; i < vop2_data->nr_vps; i++) {
 		const struct vop2_video_port_data *vp_data;
 		struct device_node *np;
-		char dclk_name[9];
+		char dclk_name[13];
 
 		vp_data = &vop2_data->vp[i];
 		vp = &vop2->vps[i];
@@ -3616,10 +3648,12 @@ static int vop2_create_crtcs(struct vop2 *vop2)
 			return dev_err_probe(drm->dev, PTR_ERR(vp->dclk),
 					     "failed to get %s\n", dclk_name);
 
-		vp->pll_v0 = devm_clk_get_optional(vop2->dev, "pll_v0");
-		if (IS_ERR(vp->pll_v0))
-			return dev_err_probe(drm->dev, PTR_ERR(vp->pll_v0),
-					     "failed to get pll_v0\n");
+		snprintf(dclk_name, sizeof(dclk_name), "dclk_src_vp%d", vp->id);
+		vp->dclk_src = devm_clk_get_optional(vop2->dev, dclk_name);
+		if (IS_ERR(vp->dclk_src))
+			return dev_err_probe(drm->dev, PTR_ERR(vp->dclk_src),
+					     "failed to get %s\n", dclk_name);
+		snprintf(dclk_name, sizeof(dclk_name), "dclk_vp%d", vp->id);
 
 		vp->dclk_rst = devm_reset_control_get_optional_exclusive(vop2->dev,
 									 dclk_name);
@@ -3874,6 +3908,45 @@ static const struct regmap_config vop2_regmap_config = {
 	.cache_type	= REGCACHE_MAPLE,
 };
 
+/*
+ * The video PLL is planned for all video ports if the DCLK source of each
+ * of them can be switched between all CRU parents.
+ */
+static int vop2_pll_init(struct vop2 *vop2)
+{
+	int i, ret;
+
+	for (i = 0; i < VOP2_DCLK_NUM_PARENTS; i++)
+		if (!vop2->dclk_parents[i] ||
+		    (i < VOP2_DCLK_V0PLL && !vop2->dclk_parent_rates[i]))
+			return 0;
+
+	for (i = 0; i < vop2->data->nr_vps; i++) {
+		struct vop2_video_port *vp = &vop2->vps[i];
+		struct clk *src = vp->dclk_src ?: vp->dclk;
+		int p;
+
+		if (!vp->crtc.port)
+			continue;
+
+		if (!vp->data->dclk_max_div)
+			return 0;
+
+		for (p = 0; p < VOP2_DCLK_NUM_PARENTS; p++)
+			if (!clk_has_parent(src, vop2->dclk_parents[p]))
+				return 0;
+	}
+
+	ret = drm_atomic_private_obj_init(vop2->drm, &vop2->pll_obj,
+					  &vop2_pll_state_funcs);
+	if (ret)
+		return ret;
+
+	vop2->pll_plan = true;
+
+	return 0;
+}
+
 static int vop2_bind(struct device *dev, struct device *master, void *data)
 {
 	struct platform_device *pdev = to_platform_device(dev);
@@ -3986,6 +4059,23 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 		return dev_err_probe(drm->dev, PTR_ERR(vop2->pll_hdmiphy1),
 				     "failed to get pll_hdmiphy1\n");
 
+	for (i = 0; i < VOP2_DCLK_NUM_PARENTS; i++) {
+		static const char * const names[VOP2_DCLK_NUM_PARENTS] = {
+			[VOP2_DCLK_GPLL] = "pll_gpll",
+			[VOP2_DCLK_CPLL] = "pll_cpll",
+			[VOP2_DCLK_AUPLL] = "pll_aupll",
+			[VOP2_DCLK_V0PLL] = "pll_v0",
+		};
+
+		vop2->dclk_parents[i] = devm_clk_get_optional(vop2->dev, names[i]);
+		if (IS_ERR(vop2->dclk_parents[i]))
+			return dev_err_probe(drm->dev, PTR_ERR(vop2->dclk_parents[i]),
+					     "failed to get %s\n", names[i]);
+		if (i < VOP2_DCLK_V0PLL)
+			vop2->dclk_parent_rates[i] = clk_get_rate(vop2->dclk_parents[i]);
+	}
+	vop2->pll_v0 = vop2->dclk_parents[VOP2_DCLK_V0PLL];
+
 	vop2->axi_rst = devm_reset_control_get_optional_exclusive(vop2->dev, "axi");
 	if (IS_ERR(vop2->axi_rst))
 		return dev_err_probe(drm->dev, PTR_ERR(vop2->axi_rst),
@@ -4010,6 +4100,10 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 	ret = vop2_create_crtcs(vop2);
 	if (ret)
 		return ret;
+
+	ret = vop2_pll_init(vop2);
+	if (ret)
+		goto err_crtcs;
 
 	if (vop2->version >= VOP_VERSION_RK3576) {
 		struct drm_crtc *crtc;
@@ -4070,6 +4164,9 @@ static void vop2_unbind(struct device *dev, struct device *master, void *data)
 		rockchip_rgb_fini(vop2->rgb);
 
 	vop2_destroy_crtcs(vop2);
+
+	if (vop2->pll_plan)
+		drm_atomic_private_obj_fini(&vop2->pll_obj);
 }
 
 const struct component_ops vop2_component_ops = {
