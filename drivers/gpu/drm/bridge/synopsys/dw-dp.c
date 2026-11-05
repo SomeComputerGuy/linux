@@ -2411,6 +2411,34 @@ static const struct drm_edid *dw_dp_bridge_edid_read(struct drm_bridge *bridge,
 	return edid;
 }
 
+/*
+ * The bridge chain bus format negotiation matches the connector "color
+ * format" against the output formats of the last bridge only. When the DP
+ * controller is followed by a bridge without bus format support (a DP or
+ * USB-C connector, an AUX HPD bridge), that bridge reports
+ * MEDIA_BUS_FMT_FIXED and the request would never be checked. Apply it to the
+ * DP output formats directly, which is correct for either position in the
+ * chain.
+ */
+static bool dw_dp_color_format_requested(const struct drm_connector_state *conn_state,
+					 enum drm_output_color_format color_format)
+{
+	switch (drm_connector_get_color_format(conn_state)) {
+	case DRM_CONNECTOR_COLOR_FORMAT_AUTO:
+		return true;
+	case DRM_CONNECTOR_COLOR_FORMAT_RGB444:
+		return color_format == DRM_OUTPUT_COLOR_FORMAT_RGB444;
+	case DRM_CONNECTOR_COLOR_FORMAT_YCBCR444:
+		return color_format == DRM_OUTPUT_COLOR_FORMAT_YCBCR444;
+	case DRM_CONNECTOR_COLOR_FORMAT_YCBCR422:
+		return color_format == DRM_OUTPUT_COLOR_FORMAT_YCBCR422;
+	case DRM_CONNECTOR_COLOR_FORMAT_YCBCR420:
+		return color_format == DRM_OUTPUT_COLOR_FORMAT_YCBCR420;
+	default:
+		return false;
+	}
+}
+
 static u32 *dw_dp_bridge_atomic_get_output_bus_fmts(struct drm_bridge *bridge,
 						    struct drm_bridge_state *bridge_state,
 						    struct drm_crtc_state *crtc_state,
@@ -2433,6 +2461,9 @@ static u32 *dw_dp_bridge_atomic_get_output_bus_fmts(struct drm_bridge *bridge,
 
 	for (i = 0; i < ARRAY_SIZE(dw_dp_output_formats); i++) {
 		fmt = &dw_dp_output_formats[i];
+
+		if (!dw_dp_color_format_requested(conn_state, fmt->color_format))
+			continue;
 
 		if (fmt->bpc > conn_state->max_bpc)
 			continue;
