@@ -2444,7 +2444,7 @@ static u32 *dw_dp_bridge_atomic_get_output_bus_fmts(struct drm_bridge *bridge,
 			continue;
 
 		if (fmt->color_format == DRM_OUTPUT_COLOR_FORMAT_YCBCR420 &&
-		    !dw_dp_ycbcr_420_ok(dp))
+		    (!dw_dp_ycbcr_420_ok(dp) || !drm_mode_is_420(di, &mode)))
 			continue;
 
 		if (fmt->color_format != DRM_OUTPUT_COLOR_FORMAT_YCBCR420 &&
