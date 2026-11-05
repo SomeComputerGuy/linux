@@ -219,8 +219,10 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 	case V4L2_CTRL_TYPE_AVS_SEQUENCE:
 		p_avs_sequence = p;
 
-		/* 8-bit 4:2:0 progressive JiZhun profile */
+		/* 8-bit 4:2:0 progressive JiZhun profile, QCIF */
 		p_avs_sequence->profile_id = V4L2_AVS_PROFILE_JIZHUN;
+		p_avs_sequence->horizontal_size = 176;
+		p_avs_sequence->vertical_size = 144;
 		p_avs_sequence->chroma_format = 1;
 		p_avs_sequence->sample_precision = 1;
 		p_avs_sequence->flags =
