@@ -60,6 +60,7 @@ config V4L2_HEVC_ENC_RBSP
 # Used by drivers that need v4l2-hevc-enc.ko
 config V4L2_HEVC_ENC
 	tristate
+	select V4L2_ENC_CBR
 	select V4L2_HEVC_ENC_RBSP
 
 config V4L2_HEVC_ENC_RBSP_KUNIT_TEST
