@@ -223,6 +223,9 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 		p_avs_sequence->profile_id = V4L2_AVS_PROFILE_JIZHUN;
 		p_avs_sequence->chroma_format = 1;
 		p_avs_sequence->sample_precision = 1;
+		/* QCIF, the smallest standard picture size */
+		p_avs_sequence->horizontal_size = 176;
+		p_avs_sequence->vertical_size = 144;
 		p_avs_sequence->flags =
 			V4L2_AVS_SEQUENCE_FLAG_PROGRESSIVE_SEQUENCE;
 		break;
