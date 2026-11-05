@@ -44,6 +44,8 @@ struct video_device;
  * @p_h264_decode_params:	Pointer to a struct v4l2_ctrl_h264_decode_params.
  * @p_h264_encode_params:	Pointer to a struct v4l2_ctrl_h264_encode_params.
  * @p_h264_pred_weights:	Pointer to a struct v4l2_ctrl_h264_pred_weights.
+ * @p_h264_mvc_view:		Pointer to a struct v4l2_h264_mvc_view.
+ * @p_h264_mvc_decode_params:	Pointer to a struct v4l2_ctrl_h264_mvc_decode_params.
  * @p_vp8_frame:		Pointer to a VP8 frame params structure.
  * @p_vp9_compressed_hdr_probs:	Pointer to a VP9 frame compressed header probs structure.
  * @p_vp9_frame:		Pointer to a VP9 frame params structure.
@@ -85,6 +87,8 @@ union v4l2_ctrl_ptr {
 	struct v4l2_ctrl_h264_decode_params *p_h264_decode_params;
 	struct v4l2_ctrl_h264_encode_params *p_h264_encode_params;
 	struct v4l2_ctrl_h264_pred_weights *p_h264_pred_weights;
+	struct v4l2_h264_mvc_view *p_h264_mvc_view;
+	struct v4l2_ctrl_h264_mvc_decode_params *p_h264_mvc_decode_params;
 	struct v4l2_ctrl_vp8_frame *p_vp8_frame;
 	struct v4l2_ctrl_hevc_sps *p_hevc_sps;
 	struct v4l2_ctrl_hevc_pps *p_hevc_pps;
