@@ -440,6 +440,16 @@ VP9
 
 :author:    Adrian Grange (Google), Peter de Rivaz (Argon Design), Jonathan Hunt (Argon Design)
 
+.. _avs2:
+
+GB/T 33475.2
+============
+
+
+:title:     GB/T 33475.2-2016 "Information technology --- High efficiency media coding --- Part 2: Video" (also IEEE 1857.4)
+
+:author:    Standardization Administration of China (http://www.sac.gov.cn)
+
 .. _av1:
 
 AV1
