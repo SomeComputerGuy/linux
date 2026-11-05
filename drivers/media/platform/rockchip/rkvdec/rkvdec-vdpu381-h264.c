@@ -36,9 +36,19 @@ struct rkvdec_sps {
 	u16 direct_8x8_inference_flag:			1;
 	u16 mvc_extension_enable:			1;
 	u16 num_views:					2;
+	u16 view_id0:					10;
+	u16 view_id1:					10;
+	u16 num_anchor_refs_l0:				1;
+	u16 anchor_ref_l0:				10;
+	u16 num_anchor_refs_l1:				1;
+	u16 anchor_ref_l1:				10;
+	u16 num_non_anchor_refs_l0:			1;
+	u16 non_anchor_ref_l0:				10;
+	u16 num_non_anchor_refs_l1:			1;
+	u16 non_anchor_ref_l1:				10;
 
 	u16 reserved_bits:				12;
-	u16 reserved[11];
+	u16 reserved[7];
 } __packed;
 
 struct rkvdec_pps {
@@ -61,8 +71,9 @@ struct rkvdec_pps {
 	u16 scaling_list_enable_flag:				1;
 	u32 scaling_list_address;
 	u16 is_longterm;
+	u16 view_index;
 
-	u8 reserved[3];
+	u8 reserved[1];
 } __packed;
 
 struct rkvdec_sps_pps {
@@ -133,6 +144,26 @@ static void assemble_hw_pps(struct rkvdec_ctx *ctx,
 		!!(sps->flags & V4L2_H264_SPS_FLAG_DELTA_PIC_ORDER_ALWAYS_ZERO);
 	hw_ps->sps.mvc_extension_enable = 1;
 	hw_ps->sps.num_views = 1;
+	if (rkvdec_h264_is_mvc(run)) {
+		/*
+		 * Stereo: the hardware takes the two views and the inter-view
+		 * references of the second one. It reads the view of the
+		 * picture from the NAL unit header of its slices.
+		 */
+		const struct v4l2_h264_mvc_view *view = &run->mvc_views[1];
+
+		hw_ps->sps.num_views = 2;
+		hw_ps->sps.view_id0 = run->mvc_views[0].view_id;
+		hw_ps->sps.view_id1 = view->view_id;
+		hw_ps->sps.num_anchor_refs_l0 = view->num_anchor_refs_l0;
+		hw_ps->sps.anchor_ref_l0 = view->anchor_ref_l0[0];
+		hw_ps->sps.num_anchor_refs_l1 = view->num_anchor_refs_l1;
+		hw_ps->sps.anchor_ref_l1 = view->anchor_ref_l1[0];
+		hw_ps->sps.num_non_anchor_refs_l0 = view->num_non_anchor_refs_l0;
+		hw_ps->sps.non_anchor_ref_l0 = view->non_anchor_ref_l0[0];
+		hw_ps->sps.num_non_anchor_refs_l1 = view->num_non_anchor_refs_l1;
+		hw_ps->sps.non_anchor_ref_l1 = view->non_anchor_ref_l1[0];
+	}
 
 	/*
 	 * Use the SPS values since they are already in macroblocks
@@ -189,6 +220,10 @@ static void assemble_hw_pps(struct rkvdec_ctx *ctx,
 	for (i = 0; i < ARRAY_SIZE(dec_params->dpb); i++) {
 		if (dpb[i].flags & V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM)
 			hw_ps->pps.is_longterm |= (1 << i);
+		/* MVC: the view of the entry, 0 for the base view. */
+		if ((dpb[i].flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE) &&
+		    dpb[i].view_order_idx)
+			hw_ps->pps.view_index |= (1 << i);
 	}
 }
 
@@ -264,9 +299,15 @@ static void config_registers(struct rkvdec_ctx *ctx,
 	 */
 	regs->common.reg012_secondary_en.scanlist_addr_valid_en = 1;
 
-	/* Set IDR flag */
+	/*
+	 * Set IDR flag. The hardware only takes it for an IDR picture of the
+	 * base view (NAL unit type 5): with it set, it uses no references, but
+	 * an IDR view component of a non-base view (H.7.4.1.1, non_idr_flag 0)
+	 * may still use inter-view references.
+	 */
 	regs->common.reg013_en_mode_set.cur_pic_is_idr =
-		!!(dec_params->flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC);
+		!!(dec_params->flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC) &&
+		!(rkvdec_h264_is_mvc(run) && run->mvc_decode_params->view_order_idx);
 
 	/* Set input stream length */
 	regs->common.reg016_stream_len = vb2_get_plane_payload(&src_buf->vb2_buf, 0);
@@ -504,6 +545,10 @@ static int rkvdec_h264_run(struct rkvdec_ctx *ctx)
 	v4l2_h264_build_p_ref_list(&reflist_builder, h264_ctx->reflists.p);
 	v4l2_h264_build_b_ref_lists(&reflist_builder, h264_ctx->reflists.b0,
 				    h264_ctx->reflists.b1);
+	ret = rkvdec_h264_append_inter_view_refs(&reflist_builder, &run,
+						 &h264_ctx->reflists);
+	if (ret)
+		return ret;
 
 	assemble_hw_scaling_list(&run, &tbl->scaling_list);
 	assemble_hw_pps(ctx, &run);
@@ -532,6 +577,9 @@ static int rkvdec_h264_try_ctrl(struct rkvdec_ctx *ctx, struct v4l2_ctrl *ctrl)
 {
 	if (ctrl->id == V4L2_CID_STATELESS_H264_SPS)
 		return rkvdec_h264_validate_sps(ctx, ctrl->p_new.p_h264_sps);
+	if (ctrl->id == V4L2_CID_STATELESS_H264_MVC_VIEWS)
+		return rkvdec_h264_validate_mvc_views(ctrl->p_new.p_h264_mvc_view,
+						      ctrl->new_elems);
 
 	return 0;
 }
