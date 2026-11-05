@@ -69,6 +69,16 @@ struct rockchip_crtc_state {
 	 */
 	unsigned int dclk_parent;
 	unsigned long dclk_pll_rate;
+	/*
+	 * VOP2: the video port of the CRTC shows the left half of the active
+	 * area and its splice video port the right half, decided on a modeset
+	 */
+	bool splice;
+	/*
+	 * VOP2 splice: the window that shows the right half of the plane of
+	 * each window (index in &vop2.win + 1, 0 if none)
+	 */
+	u8 splice_win[ROCKCHIP_VOP2_MAX_WINS];
 };
 #define to_rockchip_crtc_state(s) \
 		container_of(s, struct rockchip_crtc_state, base)
