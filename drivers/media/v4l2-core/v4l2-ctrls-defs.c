@@ -1245,6 +1245,10 @@ const char *v4l2_ctrl_get_name(u32 id)
 	case V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY:		return "AV1 Tile Group Entry";
 	case V4L2_CID_STATELESS_AV1_FRAME:			return "AV1 Frame Parameters";
 	case V4L2_CID_STATELESS_AV1_FILM_GRAIN:			return "AV1 Film Grain";
+	case V4L2_CID_STATELESS_AVS2_SEQUENCE:			return "AVS2 Sequence Header";
+	case V4L2_CID_STATELESS_AVS2_PICTURE:			return "AVS2 Picture Header";
+	case V4L2_CID_STATELESS_AVS2_WEIGHT_QUANT:	return "AVS2 Weight Quant Matrices";
+	case V4L2_CID_STATELESS_AVS2_ALF:			return "AVS2 Adaptive Loop Filter";
 
 	/* Colorimetry controls */
 	/* Keep the order of the 'case's the same as in v4l2-controls.h! */
@@ -1624,6 +1628,18 @@ void v4l2_ctrl_fill(u32 id, const char **name, enum v4l2_ctrl_type *type,
 		break;
 	case V4L2_CID_STATELESS_AV1_FILM_GRAIN:
 		*type = V4L2_CTRL_TYPE_AV1_FILM_GRAIN;
+		break;
+	case V4L2_CID_STATELESS_AVS2_SEQUENCE:
+		*type = V4L2_CTRL_TYPE_AVS2_SEQUENCE;
+		break;
+	case V4L2_CID_STATELESS_AVS2_PICTURE:
+		*type = V4L2_CTRL_TYPE_AVS2_PICTURE;
+		break;
+	case V4L2_CID_STATELESS_AVS2_WEIGHT_QUANT:
+		*type = V4L2_CTRL_TYPE_AVS2_WEIGHT_QUANT;
+		break;
+	case V4L2_CID_STATELESS_AVS2_ALF:
+		*type = V4L2_CTRL_TYPE_AVS2_ALF;
 		break;
 	case V4L2_CID_UNIT_CELL_SIZE:
 		*type = V4L2_CTRL_TYPE_AREA;

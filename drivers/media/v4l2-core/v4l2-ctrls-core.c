@@ -134,6 +134,8 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 	struct v4l2_ctrl_hevc_encode_params *p_hevc_enc_params;
 	struct v4l2_ctrl_hevc_encode_feedback *p_hevc_enc_feedback;
 	struct v4l2_ctrl_hevc_sps *p_hevc_sps;
+	struct v4l2_ctrl_avs2_sequence *p_avs2_sequence;
+	struct v4l2_ctrl_avs2_weight_quant *p_avs2_weight_quant;
 	void *p = ptr.p + idx * ctrl->elem_size;
 
 	if (ctrl->p_def.p_const)
@@ -189,6 +191,29 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 		p_av1_sequence->bit_depth = 8;
 		p_av1_sequence->flags |= V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
 					 V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;
+		break;
+	case V4L2_CTRL_TYPE_AVS2_SEQUENCE:
+		p_avs2_sequence = p;
+
+		/* 8-bit 4:2:0 Main profile, 64x64 LCUs, QCIF */
+		p_avs2_sequence->profile_id = V4L2_AVS2_PROFILE_MAIN;
+		p_avs2_sequence->horizontal_size = 176;
+		p_avs2_sequence->vertical_size = 144;
+		p_avs2_sequence->chroma_format = 1;
+		p_avs2_sequence->sample_precision = 1;
+		p_avs2_sequence->encoding_precision = 1;
+		p_avs2_sequence->lcu_size = 6;
+		p_avs2_sequence->flags =
+			V4L2_AVS2_SEQUENCE_FLAG_PROGRESSIVE_SEQUENCE;
+		break;
+	case V4L2_CTRL_TYPE_AVS2_WEIGHT_QUANT:
+		p_avs2_weight_quant = p;
+
+		/* flat matrices: no weighting */
+		memset(p_avs2_weight_quant->matrix_4x4, 64,
+		       sizeof(p_avs2_weight_quant->matrix_4x4));
+		memset(p_avs2_weight_quant->matrix_8x8, 64,
+		       sizeof(p_avs2_weight_quant->matrix_8x8));
 		break;
 	case V4L2_CTRL_TYPE_FWHT_PARAMS:
 		p_fwht_params = p;
@@ -498,6 +523,18 @@ void v4l2_ctrl_type_op_log(const struct v4l2_ctrl *ctrl)
 		break;
 	case V4L2_CTRL_TYPE_AV1_FILM_GRAIN:
 		pr_cont("AV1_FILM_GRAIN");
+		break;
+	case V4L2_CTRL_TYPE_AVS2_SEQUENCE:
+		pr_cont("AVS2_SEQUENCE");
+		break;
+	case V4L2_CTRL_TYPE_AVS2_PICTURE:
+		pr_cont("AVS2_PICTURE");
+		break;
+	case V4L2_CTRL_TYPE_AVS2_WEIGHT_QUANT:
+		pr_cont("AVS2_WEIGHT_QUANT");
+		break;
+	case V4L2_CTRL_TYPE_AVS2_ALF:
+		pr_cont("AVS2_ALF");
 		break;
 	case V4L2_CTRL_TYPE_RECT:
 		pr_cont("(%d,%d)/%ux%u",
@@ -1017,6 +1054,128 @@ static int validate_av1_sequence(struct v4l2_ctrl_av1_sequence *s)
 		}
 		break;
 	}
+
+	return 0;
+}
+
+#define V4L2_AVS2_SEQUENCE_FLAGS_ALL \
+	(V4L2_AVS2_SEQUENCE_FLAG_BCBR_ENABLE * 2 - 1)
+
+static int validate_avs2_sequence(struct v4l2_ctrl_avs2_sequence *seq)
+{
+	if (seq->flags & ~V4L2_AVS2_SEQUENCE_FLAGS_ALL)
+		return -EINVAL;
+
+	/* 4:2:0 (1) and 4:2:2 (2) are the only chroma formats */
+	if (seq->chroma_format < 1 || seq->chroma_format > 2)
+		return -EINVAL;
+
+	/* 8-bit (1) or 10-bit (2) */
+	if (seq->sample_precision < 1 || seq->sample_precision > 2 ||
+	    seq->encoding_precision < 1 || seq->encoding_precision > 2)
+		return -EINVAL;
+
+	/* LCU of 16x16 to 64x64 */
+	if (seq->lcu_size < 4 || seq->lcu_size > 6)
+		return -EINVAL;
+
+	if (!seq->horizontal_size || !seq->vertical_size ||
+	    seq->horizontal_size >= BIT(14) || seq->vertical_size >= BIT(14))
+		return -EINVAL;
+
+	if (seq->picture_reorder_delay >= BIT(5))
+		return -EINVAL;
+
+	zero_reserved(*seq);
+
+	return 0;
+}
+
+#define V4L2_AVS2_PICTURE_FLAGS_ALL \
+	(V4L2_AVS2_PICTURE_FLAG_WEIGHT_QUANT_ENABLE * 2 - 1)
+
+static int validate_avs2_picture(struct v4l2_ctrl_avs2_picture *pic)
+{
+	unsigned int i;
+
+	if (pic->flags & ~V4L2_AVS2_PICTURE_FLAGS_ALL)
+		return -EINVAL;
+
+	if (pic->picture_type > V4L2_AVS2_PICTURE_TYPE_F)
+		return -EINVAL;
+
+	if (pic->num_ref_pics > V4L2_AVS2_MAX_REF_PICS)
+		return -EINVAL;
+
+	/* picture_qp is a 7-bit field, temporal_id a 3-bit one */
+	if (pic->picture_qp >= BIT(7) || pic->temporal_id >= BIT(3))
+		return -EINVAL;
+
+	/* alpha_c_offset and beta_offset are -8 to 8 */
+	if (pic->alpha_c_offset < -8 || pic->alpha_c_offset > 8 ||
+	    pic->beta_offset < -8 || pic->beta_offset > 8)
+		return -EINVAL;
+
+	/* chroma_quant_param_delta_cb/cr are -16 to 16 */
+	if (pic->chroma_quant_param_delta_cb < -16 ||
+	    pic->chroma_quant_param_delta_cb > 16 ||
+	    pic->chroma_quant_param_delta_cr < -16 ||
+	    pic->chroma_quant_param_delta_cr > 16)
+		return -EINVAL;
+
+	if (pic->picture_type == V4L2_AVS2_PICTURE_TYPE_I &&
+	    (pic->flags & (V4L2_AVS2_PICTURE_FLAG_BACKGROUND_PRED |
+			   V4L2_AVS2_PICTURE_FLAG_BACKGROUND_REFERENCE)))
+		return -EINVAL;
+
+	if (pic->picture_type != V4L2_AVS2_PICTURE_TYPE_I &&
+	    (pic->flags & (V4L2_AVS2_PICTURE_FLAG_BACKGROUND_PICTURE |
+			   V4L2_AVS2_PICTURE_FLAG_BACKGROUND_PICTURE_OUTPUT)))
+		return -EINVAL;
+
+	for (i = 0; i < V4L2_AVS2_MAX_REF_PICS; i++) {
+		struct v4l2_avs2_ref_pic *ref = &pic->ref_pics[i];
+
+		if (ref->picture_type > V4L2_AVS2_PICTURE_TYPE_F ||
+		    ref->num_ref_pics > V4L2_AVS2_MAX_REF_PICS ||
+		    ref->flags & ~V4L2_AVS2_REF_PIC_FLAG_BACKGROUND)
+			return -EINVAL;
+
+		zero_reserved(*ref);
+	}
+
+	zero_reserved(*pic);
+
+	return 0;
+}
+
+static int validate_avs2_alf(struct v4l2_ctrl_avs2_alf *alf)
+{
+	unsigned int i;
+
+	if (alf->flags & ~(V4L2_AVS2_ALF_FLAG_LUMA_ENABLE |
+			   V4L2_AVS2_ALF_FLAG_CB_ENABLE |
+			   V4L2_AVS2_ALF_FLAG_CR_ENABLE))
+		return -EINVAL;
+
+	if (alf->num_luma_filters > V4L2_AVS2_ALF_MAX_LUMA_FILTERS)
+		return -EINVAL;
+
+	if ((alf->flags & V4L2_AVS2_ALF_FLAG_LUMA_ENABLE) &&
+	    !alf->num_luma_filters)
+		return -EINVAL;
+
+	for (i = 0; i < V4L2_AVS2_ALF_MAX_LUMA_FILTERS; i++) {
+		/* the filter index of a region never decreases */
+		if (alf->luma_region_filter[i] >= V4L2_AVS2_ALF_MAX_LUMA_FILTERS ||
+		    (alf->num_luma_filters &&
+		     alf->luma_region_filter[i] >= alf->num_luma_filters) ||
+		    (i && alf->luma_region_filter[i] <
+			  alf->luma_region_filter[i - 1]))
+			return -EINVAL;
+	}
+
+	zero_reserved(*alf);
 
 	return 0;
 }
@@ -1670,6 +1829,14 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 		break;
 	case V4L2_CTRL_TYPE_AV1_FILM_GRAIN:
 		return validate_av1_film_grain(p);
+	case V4L2_CTRL_TYPE_AVS2_SEQUENCE:
+		return validate_avs2_sequence(p);
+	case V4L2_CTRL_TYPE_AVS2_PICTURE:
+		return validate_avs2_picture(p);
+	case V4L2_CTRL_TYPE_AVS2_WEIGHT_QUANT:
+		break;
+	case V4L2_CTRL_TYPE_AVS2_ALF:
+		return validate_avs2_alf(p);
 
 	case V4L2_CTRL_TYPE_AREA:
 		area = p;
@@ -2402,6 +2569,18 @@ static struct v4l2_ctrl *v4l2_ctrl_new(struct v4l2_ctrl_handler *hdl,
 		break;
 	case V4L2_CTRL_TYPE_AV1_FILM_GRAIN:
 		elem_size = sizeof(struct v4l2_ctrl_av1_film_grain);
+		break;
+	case V4L2_CTRL_TYPE_AVS2_SEQUENCE:
+		elem_size = sizeof(struct v4l2_ctrl_avs2_sequence);
+		break;
+	case V4L2_CTRL_TYPE_AVS2_PICTURE:
+		elem_size = sizeof(struct v4l2_ctrl_avs2_picture);
+		break;
+	case V4L2_CTRL_TYPE_AVS2_WEIGHT_QUANT:
+		elem_size = sizeof(struct v4l2_ctrl_avs2_weight_quant);
+		break;
+	case V4L2_CTRL_TYPE_AVS2_ALF:
+		elem_size = sizeof(struct v4l2_ctrl_avs2_alf);
 		break;
 	case V4L2_CTRL_TYPE_AREA:
 		elem_size = sizeof(struct v4l2_area);

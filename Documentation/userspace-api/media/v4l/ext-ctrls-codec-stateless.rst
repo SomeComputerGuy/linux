@@ -4698,3 +4698,361 @@ AV1 Tx mode as described in section 6.8.21 "TX mode semantics" of :ref:`av1`.
         (see the semantics for color_range for an explanation of studio swing).
         If not set, indicates that clipping to the full range shall be applied
         to the sample values after adding the film grain.
+
+.. _v4l2-codec-stateless-avs2:
+
+``V4L2_CID_STATELESS_AVS2_SEQUENCE (struct)``
+    Specifies the sequence header parameters (as extracted from the
+    bitstream) for the associated AVS2 picture, as defined by section 7.1.2.2
+    "Sequence header" of :ref:`avs2`. The reference configuration sets and
+    the weighting quantization matrices of the sequence header are not part of
+    this control: they are resolved by the application for each picture and
+    passed with ``V4L2_CID_STATELESS_AVS2_PICTURE`` and
+    ``V4L2_CID_STATELESS_AVS2_WEIGHT_QUANT``.
+
+.. c:type:: v4l2_ctrl_avs2_sequence
+
+.. cssclass:: longtable
+
+.. tabularcolumns:: |p{1.4cm}|p{6.5cm}|p{9.4cm}|
+
+.. flat-table:: struct v4l2_ctrl_avs2_sequence
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - __u32
+      - ``flags``
+      - See :ref:`AVS2 Sequence Flags <avs2_sequence_flags>`.
+    * - __u16
+      - ``horizontal_size``
+      - horizontal_size, the width of the picture in luma samples.
+    * - __u16
+      - ``vertical_size``
+      - vertical_size, the height of the picture in luma samples.
+    * - __u8
+      - ``profile_id``
+      - profile_id: ``V4L2_AVS2_PROFILE_MAIN_PICTURE`` (0x12),
+	``V4L2_AVS2_PROFILE_MAIN`` (0x20) or ``V4L2_AVS2_PROFILE_MAIN10`` (0x22).
+    * - __u8
+      - ``level_id``
+      - level_id.
+    * - __u8
+      - ``chroma_format``
+      - chroma_format, 1 for 4:2:0.
+    * - __u8
+      - ``sample_precision``
+      - sample_precision: 1 for 8-bit and 2 for 10-bit samples.
+    * - __u8
+      - ``encoding_precision``
+      - encoding_precision: 1 for 8-bit and 2 for 10-bit coding. Set to 1
+	when the profile has no encoding_precision.
+    * - __u8
+      - ``lcu_size``
+      - lcu_size, the base 2 logarithm of the largest coding unit size, 4
+	to 6.
+    * - __u8
+      - ``picture_reorder_delay``
+      - picture_reorder_delay, 0 when the sequence is low delay.
+    * - __u8
+      - ``reserved[5]``
+      - Applications and drivers must set this to zero.
+
+.. _avs2_sequence_flags:
+
+``AVS2 Sequence Flags``
+
+.. cssclass:: longtable
+
+.. flat-table::
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_PROGRESSIVE_SEQUENCE``
+      - 0x00000001
+      - progressive_sequence.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_FIELD_CODED_SEQUENCE``
+      - 0x00000002
+      - field_coded_sequence.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_LOW_DELAY``
+      - 0x00000004
+      - low_delay.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_TEMPORAL_ID_ENABLE``
+      - 0x00000008
+      - temporal_id_enable_flag.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_WEIGHT_QUANT_ENABLE``
+      - 0x00000010
+      - weight_quant_enable_flag.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_BACKGROUND_PICTURE_ENABLE``
+      - 0x00000020
+      - Set when background_picture_disable is 0.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_MHP_SKIP_ENABLE``
+      - 0x00000040
+      - mhpskip_enable_flag.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_DHP_ENABLE``
+      - 0x00000080
+      - dhp_enable_flag.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_WSM_ENABLE``
+      - 0x00000100
+      - wsm_enable_flag.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_AMP_ENABLE``
+      - 0x00000200
+      - asymmetric_motion_partitions_enable_flag.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_NSQT_ENABLE``
+      - 0x00000400
+      - nonsquare_quadtree_transform_enable_flag.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_NSIP_ENABLE``
+      - 0x00000800
+      - nonsquare_intra_prediction_enable_flag.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_SECONDARY_TRANSFORM_ENABLE``
+      - 0x00001000
+      - secondary_transform_enable_flag.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_SAO_ENABLE``
+      - 0x00002000
+      - sample_adaptive_offset_enable_flag.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_ALF_ENABLE``
+      - 0x00004000
+      - adaptive_loop_filter_enable_flag.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_PMVR_ENABLE``
+      - 0x00008000
+      - pmvr_enable_flag.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_CROSS_SLICE_LOOPFILTER_ENABLE``
+      - 0x00010000
+      - cross_slice_loopfilter_enable_flag.
+    * - ``V4L2_AVS2_SEQUENCE_FLAG_BCBR_ENABLE``
+      - 0x00020000
+      - bcbr_enable_flag, 0 when absent.
+
+``V4L2_CID_STATELESS_AVS2_PICTURE (struct)``
+    Specifies the picture header parameters (as extracted from the bitstream)
+    and the reference picture list of the associated AVS2 picture, as defined
+    by sections 7.1.3.1 "Intra picture header" and 7.1.3.2 "Inter picture
+    header" of :ref:`avs2`.
+
+.. c:type:: v4l2_ctrl_avs2_picture
+
+.. cssclass:: longtable
+
+.. tabularcolumns:: |p{1.4cm}|p{6.5cm}|p{9.4cm}|
+
+.. flat-table:: struct v4l2_ctrl_avs2_picture
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - struct :c:type:`v4l2_avs2_ref_pic`
+      - ``ref_pics[7]``
+      - The reference pictures, in the order of the reference configuration
+	set of the picture. For a P or F picture with ``BACKGROUND_REFERENCE``,
+	the last entry is the background picture. For an S picture (a P picture
+	with ``BACKGROUND_PRED``), the first entry is the background picture.
+    * - __u32
+      - ``data_offset``
+      - Offset in bytes from the start of the output buffer to the first byte
+	of the start code prefix of the first slice.
+    * - __u32
+      - ``flags``
+      - See :ref:`AVS2 Picture Flags <avs2_picture_flags>`.
+    * - __s32
+      - ``poc``
+      - Picture order count: decode_order_index, made monotonic across its
+	8-bit wrap around, plus picture_output_delay minus
+	picture_reorder_delay (decode_order_index alone for low delay
+	sequences).
+    * - __u8
+      - ``picture_type``
+      - ``V4L2_AVS2_PICTURE_TYPE_I`` (0) for intra_picture_header(), otherwise
+	the picture_coding_type of inter_picture_header():
+	``V4L2_AVS2_PICTURE_TYPE_P`` (1), ``V4L2_AVS2_PICTURE_TYPE_B`` (2) or
+	``V4L2_AVS2_PICTURE_TYPE_F`` (3).
+    * - __u8
+      - ``num_ref_pics``
+      - num_of_reference_picture of the reference configuration set of the
+	picture, the number of valid entries in ``ref_pics``.
+    * - __u8
+      - ``decode_order_index``
+      - decode_order_index.
+    * - __u8
+      - ``temporal_id``
+      - temporal_id, 0 when absent.
+    * - __u8
+      - ``picture_output_delay``
+      - picture_output_delay, 0 when absent.
+    * - __u8
+      - ``picture_qp``
+      - picture_qp.
+    * - __s8
+      - ``alpha_c_offset``
+      - alpha_c_offset, 0 when absent.
+    * - __s8
+      - ``beta_offset``
+      - beta_offset, 0 when absent.
+    * - __s8
+      - ``chroma_quant_param_delta_cb``
+      - chroma_quant_param_delta_cb, 0 when absent.
+    * - __s8
+      - ``chroma_quant_param_delta_cr``
+      - chroma_quant_param_delta_cr, 0 when absent.
+    * - __u8
+      - ``reserved[2]``
+      - Applications and drivers must set this to zero.
+
+.. c:type:: v4l2_avs2_ref_pic
+
+.. cssclass:: longtable
+
+.. tabularcolumns:: |p{1.4cm}|p{6.5cm}|p{9.4cm}|
+
+.. flat-table:: struct v4l2_avs2_ref_pic
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - __u64
+      - ``timestamp``
+      - Timestamp of the V4L2 capture buffer which holds the reference picture.
+	The timestamp refers to the ``timestamp`` field in struct
+	:c:type:`v4l2_buffer`. Use the :c:func:`v4l2_timeval_to_ns()` function
+	to convert the struct :c:type:`timeval` in struct :c:type:`v4l2_buffer`
+	to a __u64.
+    * - __s32
+      - ``poc``
+      - Picture order count of the reference picture, as passed in ``poc``
+	when it was decoded.
+    * - __s32
+      - ``ref_poc[7]``
+      - Picture order counts of the reference pictures of the reference
+	picture, in the order of its own ``ref_pics``. The decoder needs them for
+	the temporal motion vector prediction.
+    * - __u8
+      - ``picture_type``
+      - ``picture_type`` of the reference picture when it was decoded.
+    * - __u8
+      - ``num_ref_pics``
+      - Number of valid entries in ``ref_poc``.
+    * - __u8
+      - ``flags``
+      - ``V4L2_AVS2_REF_PIC_FLAG_BACKGROUND`` (0x01) for a background picture.
+    * - __u8
+      - ``reserved[5]``
+      - Applications and drivers must set this to zero.
+
+.. _avs2_picture_flags:
+
+``AVS2 Picture Flags``
+
+.. cssclass:: longtable
+
+.. flat-table::
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - ``V4L2_AVS2_PICTURE_FLAG_PROGRESSIVE_FRAME``
+      - 0x00000001
+      - progressive_frame.
+    * - ``V4L2_AVS2_PICTURE_FLAG_PICTURE_STRUCTURE``
+      - 0x00000002
+      - picture_structure.
+    * - ``V4L2_AVS2_PICTURE_FLAG_TOP_FIELD_FIRST``
+      - 0x00000004
+      - top_field_first.
+    * - ``V4L2_AVS2_PICTURE_FLAG_REPEAT_FIRST_FIELD``
+      - 0x00000008
+      - repeat_first_field.
+    * - ``V4L2_AVS2_PICTURE_FLAG_IS_TOP_FIELD``
+      - 0x00000010
+      - is_top_field, for field coded sequences.
+    * - ``V4L2_AVS2_PICTURE_FLAG_FIXED_PICTURE_QP``
+      - 0x00000020
+      - fixed_picture_qp_flag.
+    * - ``V4L2_AVS2_PICTURE_FLAG_LOOP_FILTER_DISABLE``
+      - 0x00000040
+      - loop_filter_disable_flag.
+    * - ``V4L2_AVS2_PICTURE_FLAG_REFERED_BY_OTHERS``
+      - 0x00000080
+      - refered_by_others_flag of the reference configuration set of the picture.
+    * - ``V4L2_AVS2_PICTURE_FLAG_BACKGROUND_PICTURE``
+      - 0x00000100
+      - background_picture_flag (intra pictures).
+    * - ``V4L2_AVS2_PICTURE_FLAG_BACKGROUND_PICTURE_OUTPUT``
+      - 0x00000200
+      - background_picture_output_flag (intra pictures).
+    * - ``V4L2_AVS2_PICTURE_FLAG_BACKGROUND_PRED``
+      - 0x00000400
+      - background_pred_flag: the P picture is an S picture.
+    * - ``V4L2_AVS2_PICTURE_FLAG_BACKGROUND_REFERENCE``
+      - 0x00000800
+      - background_reference_flag (P and F pictures).
+    * - ``V4L2_AVS2_PICTURE_FLAG_RANDOM_ACCESS_DECODABLE``
+      - 0x00001000
+      - random_access_decodable_flag.
+    * - ``V4L2_AVS2_PICTURE_FLAG_WEIGHT_QUANT_ENABLE``
+      - 0x00002000
+      - pic_weight_quant_enable_flag.
+
+``V4L2_CID_STATELESS_AVS2_WEIGHT_QUANT (struct)``
+    Specifies the weighting quantization matrices WeightQuantMatrix4x4 and
+    WeightQuantMatrix8x8 which apply to the associated AVS2 picture, as
+    defined by section 9.2.4 of :ref:`avs2`. The application resolves them
+    from the default matrices, the matrices of the sequence header and the
+    matrices or parameters of the picture header. Every entry is 64 when
+    weighting quantization is disabled for the picture.
+
+.. c:type:: v4l2_ctrl_avs2_weight_quant
+
+.. cssclass:: longtable
+
+.. tabularcolumns:: |p{1.4cm}|p{6.5cm}|p{9.4cm}|
+
+.. flat-table:: struct v4l2_ctrl_avs2_weight_quant
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - __u8
+      - ``matrix_4x4[16]``
+      - 4x4 matrix in raster scan order.
+    * - __u8
+      - ``matrix_8x8[64]``
+      - 8x8 matrix in raster scan order.
+
+``V4L2_CID_STATELESS_AVS2_ALF (struct)``
+    Specifies the adaptive loop filter parameters (as extracted from the
+    bitstream) of the associated AVS2 picture, as defined by section 7.1.8
+    "Adaptive loop filter parameter set" of :ref:`avs2`. Only used when the
+    sequence enables the adaptive loop filter.
+
+.. c:type:: v4l2_ctrl_avs2_alf
+
+.. cssclass:: longtable
+
+.. tabularcolumns:: |p{1.4cm}|p{6.5cm}|p{9.4cm}|
+
+.. flat-table:: struct v4l2_ctrl_avs2_alf
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - __s16
+      - ``luma_coeff[16][9]``
+      - alf_coeff_luma of each luma filter, as coded.
+    * - __s16
+      - ``chroma_coeff[2][9]``
+      - alf_coeff_chroma of the Cb (0) and Cr (1) filters, as coded.
+    * - __u8
+      - ``luma_region_filter[16]``
+      - Index of the luma filter used by each of the 16 regions, derived from
+	alf_region_distance. Never decreasing.
+    * - __u8
+      - ``flags``
+      - ``V4L2_AVS2_ALF_FLAG_LUMA_ENABLE`` (0x01),
+	``V4L2_AVS2_ALF_FLAG_CB_ENABLE`` (0x02) and
+	``V4L2_AVS2_ALF_FLAG_CR_ENABLE`` (0x04): picture_alf_enable_flag.
+    * - __u8
+      - ``num_luma_filters``
+      - alf_filter_num_minus1 + 1.
+    * - __u8
+      - ``reserved[6]``
+      - Applications and drivers must set this to zero.
