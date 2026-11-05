@@ -59,6 +59,12 @@ static bool rga3_can_capture(const struct rga3_fmt *fmt)
 	return fmt->hw_format <= RGA3_COLOR_FMT_LAST_OUTPUT;
 }
 
+static bool rga3_is_yuv10b(const struct rga3_fmt *fmt)
+{
+	return fmt->hw_format == RGA3_COLOR_FMT_YUV420_10B ||
+	       fmt->hw_format == RGA3_COLOR_FMT_YUV422_10B;
+}
+
 /*
  * Map the transformations to the RGA3 command buffer.
  * Currently this is just the scaling settings and a fixed alpha value.
@@ -185,6 +191,8 @@ static void rga3_cmd_set_win0_format(struct rga_ctx *ctx)
 		      |  FIELD_PREP(RGA3_WIN_PIC_FORMAT, in->hw_format)
 		      |  FIELD_PREP(RGA3_WIN_YC_SWAP, in->yc_swap)
 		      |  FIELD_PREP(RGA3_WIN_RBUV_SWAP, in->rbuv_swap)
+		      |  FIELD_PREP(RGA3_WIN_YUV10B_COMPACT, in->yuv10b_compact)
+		      |  FIELD_PREP(RGA3_WIN_YUV10B_ENDIAN, in->yuv10b_endian)
 		      |  FIELD_PREP(RGA3_WIN_RD_FORMAT, rd_format)
 		      |  FIELD_PREP(RGA3_WIN_R2Y, r2y)
 		      |  FIELD_PREP(RGA3_WIN_Y2R, y2r)
@@ -236,6 +244,8 @@ static void rga3_cmd_set_wr_format(struct rga_ctx *ctx)
 	cmd[reg >> 2] = FIELD_PREP(RGA3_WR_PIC_FORMAT, out->hw_format)
 		     |  FIELD_PREP(RGA3_WR_YC_SWAP, out->yc_swap)
 		     |  FIELD_PREP(RGA3_WR_RBUV_SWAP, out->rbuv_swap)
+		     |  FIELD_PREP(RGA3_WR_YUV10B_COMPACT, out->yuv10b_compact)
+		     |  FIELD_PREP(RGA3_WR_YUV10B_ENDIAN, out->yuv10b_endian)
 		     |  FIELD_PREP(RGA3_WR_FORMAT, wr_format)
 	/* Use the max value to avoid limiting the write speed */
 		     |  FIELD_PREP(RGA3_WR_SW_OUTSTANDING_MAX, 63);
@@ -399,6 +409,16 @@ static struct rga3_fmt rga3_formats[] = {
 		.rbuv_swap = 1,
 	},
 	{
+		.fourcc = V4L2_PIX_FMT_NV15,
+		.hw_format = RGA3_COLOR_FMT_YUV420_10B,
+		.yuv10b_compact = 1,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_P010,
+		.hw_format = RGA3_COLOR_FMT_YUV420_10B,
+		.yuv10b_endian = 1,
+	},
+	{
 		.fourcc = V4L2_PIX_FMT_NV16M,
 		.hw_format = RGA3_COLOR_FMT_YUV422,
 	},
@@ -519,8 +539,17 @@ static void *rga3_adjust_and_map_format(struct rga_ctx *ctx,
 		if (!is_output && !rga3_can_capture(&rga3_formats[i]))
 			continue;
 
-		if (rga3_formats[i].fourcc == format->pixelformat)
+		if (rga3_formats[i].fourcc == format->pixelformat) {
+			/*
+			 * The width of 10-bit YUV 4:2:x must be aligned to
+			 * 4 pixels (TRM part 2, 5.6.3); the hardware limits
+			 * are multiples of 4, the driver's YUV step of 2
+			 * keeps it aligned.
+			 */
+			if (rga3_is_yuv10b(&rga3_formats[i]))
+				format->width = ALIGN(format->width, 4);
 			return &rga3_formats[i];
+		}
 	}
 
 	format->pixelformat = rga3_formats[0].fourcc;
