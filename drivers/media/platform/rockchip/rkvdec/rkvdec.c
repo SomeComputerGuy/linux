@@ -426,6 +426,67 @@ static const struct rkvdec_ctrls vdpu38x_h264_ctrls = {
 	.num_ctrls = ARRAY_SIZE(vdpu38x_h264_ctrl_descs),
 };
 
+static const struct rkvdec_ctrl_desc vdpu381_h264_ctrl_descs[] = {
+	{
+		.cfg.id = V4L2_CID_STATELESS_H264_DECODE_PARAMS,
+	},
+	{
+		.cfg.id = V4L2_CID_STATELESS_H264_SPS,
+		.cfg.ops = &rkvdec_ctrl_ops,
+	},
+	{
+		.cfg.id = V4L2_CID_STATELESS_H264_PPS,
+	},
+	{
+		.cfg.id = V4L2_CID_STATELESS_H264_SCALING_MATRIX,
+	},
+	{
+		.cfg.id = V4L2_CID_STATELESS_H264_DECODE_MODE,
+		.cfg.min = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
+		.cfg.max = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
+		.cfg.def = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
+	},
+	{
+		.cfg.id = V4L2_CID_STATELESS_H264_START_CODE,
+		.cfg.min = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
+		.cfg.def = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
+		.cfg.max = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
+	},
+	{
+		.cfg.id = V4L2_CID_MPEG_VIDEO_H264_PROFILE,
+		.cfg.min = V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE,
+		.cfg.max = V4L2_MPEG_VIDEO_H264_PROFILE_MULTIVIEW_HIGH,
+		.cfg.menu_skip_mask =
+			BIT(V4L2_MPEG_VIDEO_H264_PROFILE_EXTENDED) |
+			BIT(V4L2_MPEG_VIDEO_H264_PROFILE_HIGH_444_PREDICTIVE) |
+			BIT(V4L2_MPEG_VIDEO_H264_PROFILE_HIGH_444_INTRA) |
+			BIT(V4L2_MPEG_VIDEO_H264_PROFILE_CAVLC_444_INTRA) |
+			BIT(V4L2_MPEG_VIDEO_H264_PROFILE_SCALABLE_BASELINE) |
+			BIT(V4L2_MPEG_VIDEO_H264_PROFILE_SCALABLE_HIGH) |
+			BIT(V4L2_MPEG_VIDEO_H264_PROFILE_SCALABLE_HIGH_INTRA),
+		.cfg.def = V4L2_MPEG_VIDEO_H264_PROFILE_MAIN,
+	},
+	{
+		.cfg.id = V4L2_CID_MPEG_VIDEO_H264_LEVEL,
+		.cfg.min = V4L2_MPEG_VIDEO_H264_LEVEL_1_0,
+		.cfg.max = V4L2_MPEG_VIDEO_H264_LEVEL_6_0,
+	},
+	{
+		/* Stereo: two views. */
+		.cfg.id = V4L2_CID_STATELESS_H264_MVC_VIEWS,
+		.cfg.ops = &rkvdec_ctrl_ops,
+		.cfg.dims = { 2 },
+	},
+	{
+		.cfg.id = V4L2_CID_STATELESS_H264_MVC_DECODE_PARAMS,
+	},
+};
+
+static const struct rkvdec_ctrls vdpu381_h264_ctrls = {
+	.ctrls = vdpu381_h264_ctrl_descs,
+	.num_ctrls = ARRAY_SIZE(vdpu381_h264_ctrl_descs),
+};
+
 static const struct rkvdec_decoded_fmt_desc rkvdec_h264_decoded_fmts[] = {
 	{
 		.fourcc = V4L2_PIX_FMT_NV12,
@@ -638,7 +699,7 @@ static const struct rkvdec_coded_fmt_desc vdpu381_coded_fmts[] = {
 			.max_height =  65520,
 			.step_height = 16,
 		},
-		.ctrls = &vdpu38x_h264_ctrls,
+		.ctrls = &vdpu381_h264_ctrls,
 		.ops = &rkvdec_vdpu381_h264_fmt_ops,
 		.num_decoded_fmts = ARRAY_SIZE(rkvdec_h264_decoded_fmts),
 		.decoded_fmts = rkvdec_h264_decoded_fmts,
