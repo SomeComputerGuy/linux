@@ -1112,13 +1112,22 @@ static bool vop2_gamma_lut_in_use(struct vop2 *vop2, struct vop2_video_port *vp)
  * TMDS character rate), and the VOP still fetches and blends 1188 Mpixel/s.
  * Keep the FRL condition too, FRL modes below that rate have always used the
  * raised rate.
+ *
+ * Rockchip's own kernel also raises ACLK for every mode wider or taller than
+ * 2560 pixels: a 4096 or 3840 wide line fetched at 60 Hz, and every spliced
+ * mode, leaves too little ACLK margin at the default rate.
  */
+#define VOP2_ACLK_BOOST_MIN_SIZE	2560
+
 static bool vop2_crtc_needs_aclk_boost(struct drm_crtc_state *crtc_state)
 {
 	struct rockchip_crtc_state *vcstate = to_rockchip_crtc_state(crtc_state);
+	const struct drm_display_mode *mode = &crtc_state->adjusted_mode;
 
 	return vcstate->frl_enabled ||
-	       crtc_state->adjusted_mode.crtc_clock * 1000ULL > VOP2_MAX_DCLK_RATE;
+	       mode->crtc_clock * 1000ULL > VOP2_MAX_DCLK_RATE ||
+	       mode->crtc_hdisplay > VOP2_ACLK_BOOST_MIN_SIZE ||
+	       mode->crtc_vdisplay > VOP2_ACLK_BOOST_MIN_SIZE;
 }
 
 static void vop2_crtc_get_aclk_boost(struct vop2_video_port *vp)
