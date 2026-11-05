@@ -67,10 +67,13 @@ void assemble_hw_rps(struct v4l2_h264_reflist_builder *builder,
 			continue;
 
 		rkvdec_set_bw_field(hw_rps->info, RPS_FRAME_NUM(i), builder->refs[i].frame_num);
+		/* MVC: the view of the entry, 0 for the base view. */
+		rkvdec_set_bw_field(hw_rps->info, RPS_VIEW_INDEX(i),
+				    !!dpb[i].view_order_idx);
 	}
 
 	for (j = 0; j < RKVDEC_NUM_REFLIST; j++) {
-		for (i = 0; i < builder->num_valid; i++) {
+		for (i = 0; i < builder->num_valid + reflists->num_inter_view[j]; i++) {
 			struct v4l2_h264_reference *ref;
 			bool dpb_valid;
 			bool bottom;
@@ -96,8 +99,127 @@ void assemble_hw_rps(struct v4l2_h264_reflist_builder *builder,
 			rkvdec_set_bw_field(hw_rps->info, RPS_ENTRY_DPB_INFO(j, i),
 					    ref->index | (dpb_valid << 4));
 			rkvdec_set_bw_field(hw_rps->info, RPS_ENTRY_BOTTOM_FLAG(j, i), bottom);
+			rkvdec_set_bw_field(hw_rps->info, RPS_ENTRY_VIEW_INDEX_OFF(j, i),
+					    !!dpb[ref->index].view_order_idx);
 		}
 	}
+}
+
+/* Is the picture of @run a picture of an MVC stream? */
+bool rkvdec_h264_is_mvc(const struct rkvdec_h264_run *run)
+{
+	return run->mvc_views && run->num_mvc_views > 1 && run->mvc_decode_params;
+}
+
+/*
+ * Appends the MVC inter-view references of a non-base view component to
+ * the initial reference lists, after the temporal references, in the order
+ * in which the subset SPS lists their views (H.8.2.1). The P list and B
+ * list 0 take the list 0 references, B list 1 the list 1 references.
+ */
+int rkvdec_h264_append_inter_view_refs(struct v4l2_h264_reflist_builder *builder,
+				       struct rkvdec_h264_run *run,
+				       struct rkvdec_h264_reflists *reflists)
+{
+	const struct v4l2_ctrl_h264_decode_params *dec_params = run->decode_params;
+	const struct v4l2_ctrl_h264_mvc_decode_params *mvc = run->mvc_decode_params;
+	const struct v4l2_h264_dpb_entry *dpb = dec_params->dpb;
+	int max_frame_num = 1 << (run->sps->log2_max_frame_num_minus4 + 4);
+	const struct v4l2_h264_mvc_view *view;
+	unsigned int list, j, i;
+
+	memset(reflists->num_inter_view, 0, sizeof(reflists->num_inter_view));
+
+	if (!rkvdec_h264_is_mvc(run) || !mvc->view_order_idx)
+		return 0;
+	if (mvc->view_order_idx >= run->num_mvc_views)
+		return -EINVAL;
+
+	view = &run->mvc_views[mvc->view_order_idx];
+
+	for (list = 0; list < 2; list++) {
+		bool anchor = mvc->flags & V4L2_H264_MVC_DECODE_PARAM_FLAG_ANCHOR_PIC;
+		const u16 *ref_view_ids;
+		unsigned int num_refs;
+
+		if (anchor) {
+			num_refs = list ? view->num_anchor_refs_l1 : view->num_anchor_refs_l0;
+			ref_view_ids = list ? view->anchor_ref_l1 : view->anchor_ref_l0;
+		} else {
+			num_refs = list ? view->num_non_anchor_refs_l1 :
+					  view->num_non_anchor_refs_l0;
+			ref_view_ids = list ? view->non_anchor_ref_l1 :
+					      view->non_anchor_ref_l0;
+		}
+
+		for (j = 0; j < num_refs; j++) {
+			unsigned int n = builder->num_valid +
+					 reflists->num_inter_view[list ? 2 : 1];
+			struct v4l2_h264_reference ref;
+
+			for (i = 0; i < ARRAY_SIZE(dec_params->dpb); i++) {
+				u16 voidx = dpb[i].view_order_idx;
+
+				if ((dpb[i].flags & (V4L2_H264_DPB_ENTRY_FLAG_ACTIVE |
+						     V4L2_H264_DPB_ENTRY_FLAG_INTER_VIEW)) !=
+				    (V4L2_H264_DPB_ENTRY_FLAG_ACTIVE |
+				     V4L2_H264_DPB_ENTRY_FLAG_INTER_VIEW))
+					continue;
+				if (voidx < run->num_mvc_views &&
+				    run->mvc_views[voidx].view_id == ref_view_ids[j])
+					break;
+			}
+
+			/* Not an inter-view reference of this view component. */
+			if (i == ARRAY_SIZE(dec_params->dpb))
+				continue;
+			if (n >= V4L2_H264_REF_LIST_LEN)
+				return -EINVAL;
+
+			builder->refs[i].longterm = false;
+			builder->refs[i].frame_num = dpb[i].frame_num > dec_params->frame_num ?
+						     (int)dpb[i].frame_num - max_frame_num :
+						     dpb[i].frame_num;
+			builder->refs[i].top_field_order_cnt = dpb[i].top_field_order_cnt;
+			builder->refs[i].bottom_field_order_cnt = dpb[i].bottom_field_order_cnt;
+
+			ref.index = i;
+			ref.fields = builder->cur_pic_fields;
+
+			if (list) {
+				reflists->b1[n] = ref;
+				reflists->num_inter_view[2]++;
+			} else {
+				reflists->p[n] = ref;
+				reflists->b0[n] = ref;
+				reflists->num_inter_view[0]++;
+				reflists->num_inter_view[1]++;
+			}
+		}
+	}
+
+	return 0;
+}
+
+int rkvdec_h264_validate_mvc_views(const struct v4l2_h264_mvc_view *views,
+				   unsigned int num_views)
+{
+	unsigned int i;
+
+	/*
+	 * The hardware takes the view_id of two views and at most one
+	 * inter-view reference per list (Stereo High).
+	 */
+	for (i = 0; i < num_views; i++) {
+		if (views[i].view_id > 1023 ||
+		    views[i].num_anchor_refs_l0 > 1 ||
+		    views[i].num_anchor_refs_l1 > 1 ||
+		    views[i].num_non_anchor_refs_l0 > 1 ||
+		    views[i].num_non_anchor_refs_l1 > 1)
+			return -EINVAL;
+	}
+
+	return 0;
 }
 
 void assemble_hw_scaling_list(struct rkvdec_h264_run *run,
@@ -210,6 +332,13 @@ void rkvdec_h264_run_preamble(struct rkvdec_ctx *ctx,
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
 			      V4L2_CID_STATELESS_H264_SCALING_MATRIX);
 	run->scaling_matrix = ctrl ? ctrl->p_cur.p : NULL;
+	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
+			      V4L2_CID_STATELESS_H264_MVC_VIEWS);
+	run->mvc_views = ctrl ? ctrl->p_cur.p : NULL;
+	run->num_mvc_views = ctrl ? ctrl->elems : 0;
+	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
+			      V4L2_CID_STATELESS_H264_MVC_DECODE_PARAMS);
+	run->mvc_decode_params = ctrl ? ctrl->p_cur.p : NULL;
 
 	rkvdec_run_preamble(ctx, &run->base);
 }

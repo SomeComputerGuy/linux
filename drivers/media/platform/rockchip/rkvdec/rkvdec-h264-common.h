@@ -28,6 +28,8 @@ struct rkvdec_h264_reflists {
 	struct v4l2_h264_reference p[V4L2_H264_REF_LIST_LEN];
 	struct v4l2_h264_reference b0[V4L2_H264_REF_LIST_LEN];
 	struct v4l2_h264_reference b1[V4L2_H264_REF_LIST_LEN];
+	/* MVC inter-view references after the temporal ones, per list. */
+	u8 num_inter_view[3];
 };
 
 struct rkvdec_h264_run {
@@ -36,10 +38,14 @@ struct rkvdec_h264_run {
 	const struct v4l2_ctrl_h264_sps *sps;
 	const struct v4l2_ctrl_h264_pps *pps;
 	const struct v4l2_ctrl_h264_scaling_matrix *scaling_matrix;
+	const struct v4l2_h264_mvc_view *mvc_views;
+	unsigned int num_mvc_views;
+	const struct v4l2_ctrl_h264_mvc_decode_params *mvc_decode_params;
 	struct vb2_buffer *ref_buf[V4L2_H264_NUM_DPB_ENTRIES];
 };
 
 #define RPS_FRAME_NUM(i)		BW_FIELD((i) * 16, 16)
+#define RPS_VIEW_INDEX(i)		BW_FIELD(272 + (i), 1)
 #define RPS_ENTRY_DPB_INFO(l, e)	BW_FIELD(288 + (l) * 7 * 32 + (e) * 7, 5) //l: 0-2, e: 0-31
 #define RPS_ENTRY_BOTTOM_FLAG(l, e)	BW_FIELD(293 + (l) * 7 * 32 + (e) * 7, 1) //l: 0-2, e: 0-31
 #define RPS_ENTRY_VIEW_INDEX_OFF(l, e)	BW_FIELD(294 + (l) * 7 * 32 + (e) * 7, 1) //l: 0-2, e: 0-31
@@ -55,6 +61,12 @@ void assemble_hw_rps(struct v4l2_h264_reflist_builder *builder,
 		     struct rkvdec_h264_run *run,
 		     struct rkvdec_h264_reflists *reflists,
 		     struct rkvdec_rps *hw_rps);
+bool rkvdec_h264_is_mvc(const struct rkvdec_h264_run *run);
+int rkvdec_h264_append_inter_view_refs(struct v4l2_h264_reflist_builder *builder,
+				       struct rkvdec_h264_run *run,
+				       struct rkvdec_h264_reflists *reflists);
+int rkvdec_h264_validate_mvc_views(const struct v4l2_h264_mvc_view *views,
+				   unsigned int num_views);
 void assemble_hw_scaling_list(struct rkvdec_h264_run *run,
 			      struct rkvdec_h264_scaling_list *scaling_list);
 int rkvdec_h264_adjust_fmt(struct rkvdec_ctx *ctx, struct v4l2_format *f);
