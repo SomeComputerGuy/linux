@@ -24,6 +24,8 @@
 #define VOP_VERSION_RK3576	VOP2_VERSION(0x50, 0x19, 0x9765)
 
 #define VOP2_VP_FEATURE_OUTPUT_10BIT        BIT(0)
+/* Shows modes wider than max_output with the help of another video port */
+#define VOP2_VP_FEATURE_SPLICE              BIT(1)
 
 #define VOP2_FEATURE_HAS_SYS_GRF	BIT(0)
 #define VOP2_FEATURE_HAS_VO0_GRF	BIT(1)
@@ -242,6 +244,17 @@ struct vop2_win {
 	u16 axi_y2;
 	/** @axi_vp: video port the window is fetching for, protected by &vop2.axi_lock */
 	u8 axi_vp;
+
+	/**
+	 * @splice_partner: window that shows the right half of the plane of
+	 * this window on a splicing video port, as programmed
+	 */
+	struct vop2_win *splice_partner;
+	/**
+	 * @splice_owner: window whose plane this window shows the right half
+	 * of, as programmed
+	 */
+	struct vop2_win *splice_owner;
 };
 
 /**
@@ -281,6 +294,25 @@ struct vop2_pll_state {
 	unsigned long clock[ROCKCHIP_MAX_CRTC];
 };
 
+/**
+ * struct vop2_splice_state - atomic state of the windows a splicing CRTC uses
+ *
+ * A plane on a CRTC that splices is shown by two windows: the window of
+ * the plane shows its left half on the video port of the CRTC, a window
+ * of an unused plane its right half on the splice video port.
+ */
+struct vop2_splice_state {
+	/** @base: base private state */
+	struct drm_private_state base;
+	/**
+	 * @partner: window that shows the right half of the plane of each
+	 * window (index in &vop2.win + 1, 0 if none)
+	 */
+	u8 partner[ROCKCHIP_VOP2_MAX_WINS];
+	/** @borrowed: windows (BIT(index in &vop2.win)) that are a partner */
+	u32 borrowed;
+};
+
 struct vop2_video_port_data {
 	unsigned int id;
 	u32 feature;
@@ -299,6 +331,13 @@ struct vop2_video_port_data {
 	 * video PLL is not planned for this video port
 	 */
 	u8 dclk_max_div;
+	/**
+	 * @splice_vp: video port that shows the right half of the active area
+	 * in splice mode (VOP2_VP_FEATURE_SPLICE)
+	 */
+	u8 splice_vp;
+	/** @splice_max_output: largest active area in splice mode */
+	struct vop_rect splice_max_output;
 };
 
 struct vop2_video_port {
@@ -327,6 +366,12 @@ struct vop2_video_port {
 	 * rate, see vop2_crtc_needs_aclk_boost().
 	 */
 	bool aclk_boost;
+
+	/**
+	 * @splice: the output of this video port is merged with the one of its
+	 * splice video port (&vop2_video_port_data.splice_vp)
+	 */
+	bool splice;
 
 	/**
 	 * @win_mask: Bitmask of windows attached to the video port;
@@ -456,6 +501,15 @@ struct vop2 {
 	unsigned long pll_hw_rate;
 	/** @pll_held: the video PLL rate is protected for @pll_hw_users */
 	bool pll_held;
+	/**
+	 * @splice_master: video port with a CRTC that can splice, NULL if none
+	 */
+	struct vop2_video_port *splice_master;
+	/**
+	 * @splice_obj: windows the splicing CRTC uses (&struct
+	 * vop2_splice_state), initialized if @splice_master is set
+	 */
+	struct drm_private_obj splice_obj;
 	struct reset_control *axi_rst;
 
 	/* optional internal rgb encoder */
@@ -864,6 +918,7 @@ enum dst_factor_mode {
 #define RK3588_DSP_IF_POL__DP1_PIN_POL			GENMASK(14, 12)
 #define RK3588_DSP_IF_POL__DP0_PIN_POL			GENMASK(10, 8)
 
+#define RK3588_LUT_PORT_SEL__PORT01_MERGE_EN		BIT(16)
 #define RK3588_LUT_PORT_SEL__GAMMA_AHB_WRITE_SEL	GENMASK(13, 12)
 
 #define RK3568_VP0_MIPI_CTRL__DCLK_DIV2_PHASE_LOCK	BIT(5)
@@ -1016,6 +1071,10 @@ static inline void vop2_cfg_done(struct vop2_video_port *vp)
 	u32 val = RK3568_REG_CFG_DONE__GLB_CFG_DONE_EN;
 
 	val |= BIT(vp->id) | (BIT(vp->id) << 16);
+
+	/* The splice video port runs on the timing of this one */
+	if (vp->splice)
+		val |= BIT(vp->data->splice_vp) | (BIT(vp->data->splice_vp) << 16);
 
 	regmap_set_bits(vop2->map, RK3568_REG_CFG_DONE, val);
 }
