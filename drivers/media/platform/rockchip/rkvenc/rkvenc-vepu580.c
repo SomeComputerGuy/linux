@@ -179,9 +179,41 @@ void vepu580_setup_common(struct rkvenc_ctx *ctx, struct rkvenc_core *core,
 	rkvenc_set(core, VEPU580_SLI_SPLT, 0);
 	rkvenc_set(core, VEPU580_SLI_CFG, VEPU580_SLI_CFG_SLI_CRS_EN);
 
-	/* No external line buffer: widths above 4096 are rejected for now. */
-	rkvenc_set(core, VEPU580_EBUFT_ADDR, 0);
-	rkvenc_set(core, VEPU580_EBUFB_ADDR, 0);
+	/* The external line buffer: top is the exclusive end, 0 when unused. */
+	if (ctx->line_buf.cpu) {
+		rkvenc_set(core, VEPU580_EBUFT_ADDR,
+			   ctx->line_buf.dma + ctx->line_buf.size);
+		rkvenc_set(core, VEPU580_EBUFB_ADDR, ctx->line_buf.dma);
+	} else {
+		rkvenc_set(core, VEPU580_EBUFT_ADDR, 0);
+		rkvenc_set(core, VEPU580_EBUFB_ADDR, 0);
+	}
+}
+
+/*
+ * The internal line buffers cover pictures up to 4096 pixels wide. Wider
+ * pictures need an external one of 480 bytes per 64-pixel column. Its
+ * address registers hold bits 31:8 only, hence the 256-byte rounding (the
+ * DMA allocation itself is page aligned). The content does not outlive a
+ * picture, and a context runs one picture at a time, so one buffer per
+ * context is enough.
+ */
+int vepu580_alloc_line_buf(struct rkvenc_ctx *ctx)
+{
+	unsigned int width = ALIGN(ctx->coded_fmt.fmt.pix_mp.width,
+				   ctx->coded_fmt_desc->size_align);
+
+	if (width <= VEPU580_LINE_BUF_MAX_WIDTH)
+		return 0;
+
+	return rkvenc_alloc_aux(ctx->dev, &ctx->line_buf,
+				ALIGN(DIV_ROUND_UP(width, 64) * 480, 256),
+				false);
+}
+
+void vepu580_free_line_buf(struct rkvenc_ctx *ctx)
+{
+	rkvenc_free_aux(ctx->dev, &ctx->line_buf);
 }
 
 /*

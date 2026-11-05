@@ -82,6 +82,8 @@
 #define VEPU580_LPFR_ADDR			0x02c4
 #define VEPU580_EBUFT_ADDR			0x02d8
 #define VEPU580_EBUFB_ADDR			0x02dc
+/* Widest picture the internal line buffers cover. */
+#define VEPU580_LINE_BUF_MAX_WIDTH		4096
 
 /* Frame class: control */
 #define VEPU580_ENC_PIC				0x0300
