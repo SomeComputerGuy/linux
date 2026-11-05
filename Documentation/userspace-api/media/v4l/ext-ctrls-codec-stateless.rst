@@ -1555,7 +1555,10 @@ FWHT Flags
       - Picture coding type for the frame covered by the current slice
 	(V4L2_MPEG2_PIC_CODING_TYPE_I, V4L2_MPEG2_PIC_CODING_TYPE_P,
 	V4L2_MPEG2_PIC_CODING_TYPE_B, or V4L2_MPEG2_PIC_CODING_TYPE_D in MPEG-1
-	sequences).
+	sequences). Decoding D-pictures is optional: drivers that cannot
+	decode them reject V4L2_MPEG2_PIC_CODING_TYPE_D, also in
+	``VIDIOC_TRY_EXT_CTRLS``, which applications can use to find out
+	whether D-pictures are supported.
     * - __u8
       - ``picture_structure``
       - Picture structure (1: interlaced top field, 2: interlaced bottom field,
