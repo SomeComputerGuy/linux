@@ -1068,7 +1068,7 @@ static const struct vop2_regs_dump rk3576_regs_dump[] = {
 static const struct vop2_video_port_data rk3588_vop_video_ports[] = {
 	{
 		.id = 0,
-		.feature = VOP2_VP_FEATURE_OUTPUT_10BIT,
+		.feature = VOP2_VP_FEATURE_OUTPUT_10BIT | VOP2_VP_FEATURE_SPLICE,
 		.gamma_lut_len = 1024,
 		.cubic_lut_len = 9 * 9 * 9, /* 9x9x9 */
 		.max_output = { 4096, 2304 },
@@ -1077,6 +1077,9 @@ static const struct vop2_video_port_data rk3588_vop_video_ports[] = {
 		.pre_scan_max_dly = { 76, 65, 65, 54 },
 		.dclk_max_div = 128,
 		.offset = 0xc00,
+		/* Video port 1 shows the right half of modes wider than 4096 */
+		.splice_vp = 1,
+		.splice_max_output = { 7680, 4320 },
 	}, {
 		.id = 1,
 		.feature = VOP2_VP_FEATURE_OUTPUT_10BIT,
@@ -2275,8 +2278,14 @@ static void rk3568_vop2_assign_layers(struct vop2_video_port *vp,
 	}
 }
 
+/*
+ * Set up the layers of video port vp, and those of its splice video port
+ * slave with slayers if vp splices (slave is NULL otherwise).
+ */
 static void rk3568_vop2_setup_layer_mixer(struct vop2_video_port *vp,
-					  const struct vop2_layer *layers, int nlayers)
+					  const struct vop2_layer *layers, int nlayers,
+					  struct vop2_video_port *slave,
+					  const struct vop2_layer *slayers, int nslayers)
 {
 	struct vop2 *vop2 = vp->vop2;
 	u32 layer_sel;
@@ -2298,6 +2307,27 @@ static void rk3568_vop2_setup_layer_mixer(struct vop2_video_port *vp,
 		ovl_ctrl |= RK3568_OVL_CTRL__YUV_MODE(vp->id);
 	else
 		ovl_ctrl &= ~RK3568_OVL_CTRL__YUV_MODE(vp->id);
+
+	/*
+	 * A splicing video port shares its layers with its splice video port,
+	 * half each (the windows of each plane are on the same layer of both).
+	 */
+	if (vp->data->feature & VOP2_VP_FEATURE_SPLICE) {
+		struct vop2_video_port *svp = &vop2->vps[vp->data->splice_vp];
+
+		if (slave) {
+			vp->ovl_layers = (vp->nlayers + svp->nlayers) / 2;
+			svp->ovl_layers = vp->ovl_layers;
+
+			if (vcstate->yuv_overlay)
+				ovl_ctrl |= RK3568_OVL_CTRL__YUV_MODE(svp->id);
+			else
+				ovl_ctrl &= ~RK3568_OVL_CTRL__YUV_MODE(svp->id);
+		} else {
+			vp->ovl_layers = vp->nlayers;
+			svp->ovl_layers = svp->nlayers;
+		}
+	}
 
 	port_sel = vop2->old_port_sel;
 	port_sel &= RK3568_OVL_PORT_SEL__SEL_PORT;
@@ -2328,6 +2358,8 @@ static void rk3568_vop2_setup_layer_mixer(struct vop2_video_port *vp,
 	layer_sel = vop2->old_layer_sel;
 
 	rk3568_vop2_assign_layers(vp, layers, nlayers, &layer_sel, &port_sel);
+	if (slave)
+		rk3568_vop2_assign_layers(slave, slayers, nslayers, &layer_sel, &port_sel);
 
 	/*
 	 * As the RK3568_OVL_LAYER_SEL and RK3568_OVL_PORT_SEL are shared by all Video Ports,
@@ -2418,12 +2450,21 @@ static void rk3568_vop2_setup_dly_for_windows(struct vop2_video_port *vp)
 static void rk3568_vop2_setup_overlay(struct vop2_video_port *vp)
 {
 	struct vop2_layer layers[ROCKCHIP_VOP2_MAX_WINS];
+	struct vop2_layer slayers[ROCKCHIP_VOP2_MAX_WINS];
 	struct vop2 *vop2 = vp->vop2;
 	struct drm_crtc *crtc = &vp->crtc;
+	struct rockchip_crtc_state *vcstate = to_rockchip_crtc_state(crtc->state);
+	struct vop2_video_port *slave = NULL;
 	struct drm_plane *plane;
-	int nlayers = 0;
+	int nlayers = 0, nslayers = 0;
 
 	vp->win_mask = 0;
+
+	/* The splice video port blends the windows of the right halves */
+	if (vcstate->splice) {
+		slave = &vop2->vps[vp->data->splice_vp];
+		slave->win_mask = 0;
+	}
 
 	drm_atomic_crtc_for_each_plane(plane, crtc) {
 		struct vop2_win *win = to_vop2_win(plane);
@@ -2441,13 +2482,34 @@ static void rk3568_vop2_setup_overlay(struct vop2_video_port *vp)
 
 		if (vop2_cluster_window(win))
 			vop2_setup_cluster_alpha(vop2, win, plane->state);
+
+		if (slave) {
+			u8 partner = vcstate->splice_win[win - vop2->win];
+			struct vop2_win *pwin;
+
+			if (WARN_ON(!partner))
+				continue;
+
+			pwin = &vop2->win[partner - 1];
+			slayers[nslayers].win = pwin;
+			slayers[nslayers].pstate = plane->state;
+			nslayers++;
+
+			pwin->delay = pwin->data->dly[VOP2_DLY_MODE_DEFAULT];
+			slave->win_mask |= BIT(pwin->data->phys_id);
+
+			if (vop2_cluster_window(pwin))
+				vop2_setup_cluster_alpha(vop2, pwin, plane->state);
+		}
 	}
 
 	if (!vp->win_mask)
 		return;
 
-	rk3568_vop2_setup_layer_mixer(vp, layers, nlayers);
+	rk3568_vop2_setup_layer_mixer(vp, layers, nlayers, slave, slayers, nslayers);
 	vop2_setup_alpha(vp, layers, nlayers);
+	if (slave)
+		vop2_setup_alpha(slave, slayers, nslayers);
 	rk3568_vop2_setup_dly_for_windows(vp);
 }
 
@@ -2529,10 +2591,15 @@ static void rk3568_vop2_setup_bg_dly(struct vop2_video_port *vp)
 {
 	struct drm_crtc *crtc = &vp->crtc;
 	struct drm_display_mode *mode = &crtc->state->adjusted_mode;
+	bool splice = to_rockchip_crtc_state(crtc->state)->splice;
 	u16 hdisplay = mode->crtc_hdisplay;
 	u16 hsync_len = mode->crtc_hsync_end - mode->crtc_hsync_start;
 	u32 bg_dly;
 	u32 pre_scan_dly;
+
+	/* Each video port of a splicing CRTC processes one half of the line */
+	if (splice)
+		hdisplay /= 2;
 
 	bg_dly = vp->data->pre_scan_max_dly[3];
 	vop2_writel(vp->vop2, RK3568_VP_BG_MIX_CTRL(vp->id),
@@ -2540,6 +2607,17 @@ static void rk3568_vop2_setup_bg_dly(struct vop2_video_port *vp)
 
 	pre_scan_dly = ((bg_dly + (hdisplay >> 1) - 1) << 16) | hsync_len;
 	vop2_vp_write(vp, RK3568_VP_PRE_SCAN_HTIMING, pre_scan_dly);
+
+	if (splice) {
+		struct vop2_video_port *svp = &vp->vop2->vps[vp->data->splice_vp];
+
+		bg_dly = svp->data->pre_scan_max_dly[3];
+		vop2_writel(vp->vop2, RK3568_VP_BG_MIX_CTRL(svp->id),
+			    FIELD_PREP(RK3568_VP_BG_MIX_CTRL__BG_DLY, bg_dly));
+
+		pre_scan_dly = ((bg_dly + (hdisplay >> 1) - 1) << 16) | hsync_len;
+		vop2_vp_write(svp, RK3568_VP_PRE_SCAN_HTIMING, pre_scan_dly);
+	}
 }
 
 static void rk3576_vop2_setup_bg_dly(struct vop2_video_port *vp)
