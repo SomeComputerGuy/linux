@@ -489,6 +489,18 @@ See also the examples in :ref:`control`.
       - n/a
       - A struct :c:type:`v4l2_ctrl_h264_decode_params`, containing H264
 	decode parameters for stateless video decoders.
+    * - ``V4L2_CTRL_TYPE_H264_MVC_VIEW``
+      - n/a
+      - n/a
+      - n/a
+      - A struct :c:type:`v4l2_h264_mvc_view`, containing one view of an H264
+	MVC subset sequence parameter set for stateless video decoders.
+    * - ``V4L2_CTRL_TYPE_H264_MVC_DECODE_PARAMS``
+      - n/a
+      - n/a
+      - n/a
+      - A struct :c:type:`v4l2_ctrl_h264_mvc_decode_params`, containing H264
+	MVC view component parameters for stateless video decoders.
     * - ``V4L2_CTRL_TYPE_FWHT_PARAMS``
       - n/a
       - n/a
