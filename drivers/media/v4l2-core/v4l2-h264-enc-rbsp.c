@@ -654,7 +654,7 @@ int v4l2_h264_enc_rbsp_sps(struct v4l2_h264_enc_rbsp *rbsp,
 	unsigned int i;
 	int ret;
 
-	ret = v4l2_h264_enc_rbsp_nalu_begin(rbsp, 0, V4L2_H264_NALU_TYPE_SPS);
+	ret = v4l2_h264_enc_rbsp_nalu_begin(rbsp, 3, V4L2_H264_NALU_TYPE_SPS);
 	if (ret)
 		return ret;
 
@@ -845,7 +845,7 @@ int v4l2_h264_enc_rbsp_pps(struct v4l2_h264_enc_rbsp *rbsp,
 	u8 pic_scaling_matrix_present_flag = 0;
 	int ret;
 
-	ret = v4l2_h264_enc_rbsp_nalu_begin(rbsp, 0, V4L2_H264_NALU_TYPE_PPS);
+	ret = v4l2_h264_enc_rbsp_nalu_begin(rbsp, 3, V4L2_H264_NALU_TYPE_PPS);
 	if (ret)
 		return ret;
 
