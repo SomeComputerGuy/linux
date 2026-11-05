@@ -9,6 +9,7 @@
 #include <linux/types.h>
 #include <linux/v4l2-controls.h>
 #include <linux/videodev2.h>
+#include <media/v4l2-enc-cbr.h>
 #include <media/v4l2-hevc-enc-rbsp.h>
 
 struct v4l2_ctrl_handler;
@@ -186,8 +187,10 @@ struct v4l2_hevc_enc_ops {
 /**
  * struct v4l2_hevc_enc_rc_ops - driver rate control
  *
- * The core selects the QP itself for the direct QP and constant quality
- * modes. These callbacks provide the constant and variable bitrate modes.
+ * The core selects the QP itself for the direct QP, constant quality and
+ * constant bitrate modes. These callbacks replace the constant bitrate
+ * mode of the core (if @estimate is set) and provide the variable bitrate
+ * mode.
  *
  * @estimate: return the QP of the next picture in @qp
  * @complete: account for a completed picture
@@ -231,6 +234,9 @@ struct v4l2_hevc_enc_rc_ops {
  * @rbsp: NAL unit writer
  * @slice: slice segment header of the current picture
  * @qp: SliceQpY of the current picture
+ * @cbr: constant bitrate rate control of the core. In that mode,
+ *	 @cbr.target_bits is the size target of the current picture in bits,
+ *	 for hardware with a rate control within the picture.
  * @header_size: number of bytes the core wrote at the start of the
  *		 CAPTURE buffer. The hardware writes from that offset.
  * @parameter_sets_pending: parameter sets were written for a picture that
@@ -261,6 +267,7 @@ struct v4l2_hevc_enc {
 	struct v4l2_hevc_enc_rbsp rbsp;
 	struct v4l2_hevc_slice_header slice;
 	int qp;
+	struct v4l2_enc_cbr cbr;
 	unsigned int header_size;
 	bool parameter_sets_pending;
 
