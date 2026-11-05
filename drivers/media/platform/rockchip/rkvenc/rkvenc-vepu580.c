@@ -805,7 +805,6 @@ void vepu580_setup_hevc_tuning(struct rkvenc_core *core, bool intra)
 const struct vepu580_row_rc vepu580_h264_row_rc = {
 	.qp_adj = { -2, -1, 0, 1, 2, 0, 0, 0, 1 },
 	.dthd_outer = 4,
-	.aq_mode = false,
 };
 
 void vepu580_setup_row_rc(struct rkvenc_core *core,
@@ -825,9 +824,13 @@ void vepu580_setup_row_rc(struct rkvenc_core *core,
 	thd = 5 * row_bits / 16;
 
 	rkvenc_or(core, VEPU580_ENC_PIC, FIELD_PREP(VEPU580_ENC_PIC_PIC_QP, qp));
+	/*
+	 * MPP also enables the texture adaptive QP here (aq_en). With its
+	 * tables that costs 0.3-1.3 dB of PSNR at the same bitrate (and SSIM
+	 * for H.264), so the QP only follows the row size deviation.
+	 */
 	rkvenc_set(core, VEPU580_RC_CFG,
-		   VEPU580_RC_CFG_RC_EN | VEPU580_RC_CFG_AQ_EN |
-		   (cfg->aq_mode ? VEPU580_RC_CFG_AQ_MODE : 0) |
+		   VEPU580_RC_CFG_RC_EN |
 		   FIELD_PREP(VEPU580_RC_CFG_RC_CTU_NUM, blocks_per_row));
 	rkvenc_set(core, VEPU580_RC_QP,
 		   FIELD_PREP(VEPU580_RC_QP_RANGE, qp_range) |

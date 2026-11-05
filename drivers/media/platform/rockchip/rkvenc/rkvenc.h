@@ -332,12 +332,10 @@ void vepu580_setup_hevc_tuning(struct rkvenc_core *core, bool intra);
  * struct vepu580_row_rc - codec-specific row rate control parameters
  * @qp_adj: QP adjustment for each of the nine deviation buckets
  * @dthd_outer: multiple of the base threshold for the outer buckets
- * @aq_mode: value of rc_cfg.aq_mode
  */
 struct vepu580_row_rc {
 	s8 qp_adj[9];
 	unsigned int dthd_outer;
-	bool aq_mode;
 };
 
 extern const struct vepu580_row_rc vepu580_h264_row_rc;
