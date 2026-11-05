@@ -201,6 +201,27 @@ struct hantro_mpeg2_dec_hw_ctx {
 	u8 field_structure;
 };
 
+/* Number of registers of the AVS+ decoder */
+#define HANTRO_AVS_NUM_REGS		60
+
+/**
+ * struct hantro_avs_dec_hw_ctx
+ *
+ * @regs:		Registers of the hardware runs of the current picture:
+ *			one, or one per field for a field coded picture.
+ * @strm_dma:		Bus address of the OUTPUT buffer.
+ * @strm_vaddr:		Kernel address of the OUTPUT buffer, NULL if unmapped.
+ * @strm_size:		Size of the coded picture.
+ * @second_field:	The second field of the picture is still to decode.
+ */
+struct hantro_avs_dec_hw_ctx {
+	u32 regs[2][HANTRO_AVS_NUM_REGS];
+	dma_addr_t strm_dma;
+	const void *strm_vaddr;
+	u32 strm_size;
+	bool second_field;
+};
+
 /**
  * struct hantro_vp8_dec_hw_ctx
  *
@@ -503,6 +524,13 @@ void hantro_hevc_ref_init(struct hantro_ctx *ctx);
 dma_addr_t hantro_hevc_get_ref_buf(struct hantro_ctx *ctx, s32 poc);
 int hantro_hevc_add_ref_buf(struct hantro_ctx *ctx, int poc, dma_addr_t addr);
 
+int rockchip_avsd_hw_init(struct hantro_dev *vpu);
+irqreturn_t rockchip_avsd_irq(struct hantro_dev *vpu);
+int rockchip_avsd_avs_dec_init(struct hantro_ctx *ctx);
+void rockchip_avsd_avs_dec_exit(struct hantro_ctx *ctx);
+int rockchip_avsd_avs_dec_run(struct hantro_ctx *ctx);
+void rockchip_avsd_avs_dec_reset(struct hantro_ctx *ctx);
+
 int rockchip_vpu981_av1_dec_init(struct hantro_ctx *ctx);
 void rockchip_vpu981_av1_dec_exit(struct hantro_ctx *ctx);
 int rockchip_vpu981_av1_dec_run(struct hantro_ctx *ctx);
@@ -551,6 +579,16 @@ hantro_h264_mv_size(unsigned int width, unsigned int height)
 	 * +---------------------------+
 	 */
 	return 64 * MB_WIDTH(width) * MB_WIDTH(height) + 32;
+}
+
+static inline size_t
+hantro_avs_mv_size(unsigned int width, unsigned int height)
+{
+	/*
+	 * 16 bytes of motion vectors per macroblock, for each field of
+	 * a field coded picture, with a spare macroblock row: double that.
+	 */
+	return 32 * MB_WIDTH(width) * (MB_HEIGHT(height) + 1);
 }
 
 static inline size_t

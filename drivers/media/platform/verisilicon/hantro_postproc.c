@@ -217,6 +217,9 @@ static unsigned int hantro_postproc_buffer_size(struct hantro_ctx *ctx)
 	else if (ctx->vpu_src_fmt->fourcc == V4L2_PIX_FMT_AV1_FRAME)
 		buf_size += hantro_av1_mv_size(ctx->ref_fmt.width,
 					       ctx->ref_fmt.height);
+	else if (ctx->vpu_src_fmt->fourcc == V4L2_PIX_FMT_AVS_FRAME)
+		buf_size += hantro_avs_mv_size(ctx->ref_fmt.width,
+					       ctx->ref_fmt.height);
 
 	return buf_size;
 }
