@@ -202,6 +202,15 @@ struct hantro_mpeg2_dec_hw_ctx {
 };
 
 /**
+ * struct hantro_mpeg4_dec_hw_ctx
+ *
+ * @qtable:		Quantization table
+ */
+struct hantro_mpeg4_dec_hw_ctx {
+	struct hantro_aux_buf qtable;
+};
+
+/**
  * struct hantro_vp8_dec_hw_ctx
  *
  * @segment_map:	Segment map buffer.
@@ -603,6 +612,17 @@ hantro_av1_mv_size(unsigned int width, unsigned int height)
 	return ALIGN(num_sbs * 384, 16) * 2 + 512;
 }
 
+static inline size_t
+hantro_mpeg4_mv_size(unsigned int width, unsigned int height)
+{
+	/*
+	 * The MPEG-4 decoder stores the motion vectors of the P-VOPs for the
+	 * direct mode of the B-VOPs which use them as backward reference:
+	 * 4 vectors of 32 bits per macroblock, after the NV12 picture.
+	 */
+	return 16 * MB_WIDTH(width) * MB_HEIGHT(height);
+}
+
 size_t hantro_g2_chroma_offset(struct hantro_ctx *ctx);
 size_t hantro_g2_motion_vectors_offset(struct hantro_ctx *ctx);
 size_t hantro_g2_luma_compress_offset(struct hantro_ctx *ctx);
@@ -617,6 +637,14 @@ bool hantro_mpeg2_dec_second_field(struct hantro_ctx *ctx,
 				   u64 timestamp);
 int hantro_mpeg2_dec_init(struct hantro_ctx *ctx);
 void hantro_mpeg2_dec_exit(struct hantro_ctx *ctx);
+
+int rockchip_vpu2_mpeg4_dec_run(struct hantro_ctx *ctx);
+int rockchip_vpu2_h263_dec_run(struct hantro_ctx *ctx);
+void hantro_mpeg4_dec_copy_qtable(u8 *qtable,
+				  const struct v4l2_ctrl_mpeg4_quantisation *q);
+u32 hantro_mpeg4_direct_ratio(s32 num, s32 den);
+int hantro_mpeg4_dec_init(struct hantro_ctx *ctx);
+void hantro_mpeg4_dec_exit(struct hantro_ctx *ctx);
 
 int hantro_g1_vp8_dec_run(struct hantro_ctx *ctx);
 int rockchip_vpu2_vp8_dec_run(struct hantro_ctx *ctx);
