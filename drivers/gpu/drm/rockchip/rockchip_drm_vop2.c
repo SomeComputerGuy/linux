@@ -3803,6 +3803,7 @@ static int vop2_create_crtcs(struct vop2 *vop2)
 
 		if (vp->crtc.port)
 			vp->nlayers = vop2_data->win_size / nvps;
+		vp->ovl_layers = vp->nlayers;
 	}
 
 	return 0;
@@ -3978,6 +3979,9 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 	vop2_data = of_device_get_match_data(dev);
 	if (!vop2_data)
 		return -ENODEV;
+
+	if (WARN_ON(vop2_data->win_size > ROCKCHIP_VOP2_MAX_WINS))
+		return -EINVAL;
 
 	/* Allocate vop2 struct and its vop2_win array */
 	alloc_size = struct_size(vop2, win, vop2_data->win_size);
