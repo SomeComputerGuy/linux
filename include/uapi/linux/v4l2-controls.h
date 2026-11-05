@@ -1642,6 +1642,7 @@ struct v4l2_ctrl_h264_slice_params {
 #define V4L2_H264_DPB_ENTRY_FLAG_ACTIVE		0x02
 #define V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM	0x04
 #define V4L2_H264_DPB_ENTRY_FLAG_FIELD		0x08
+#define V4L2_H264_DPB_ENTRY_FLAG_INTER_VIEW	0x10
 
 /**
  * struct v4l2_h264_dpb_entry - H264 decoded picture buffer entry
@@ -1654,6 +1655,9 @@ struct v4l2_ctrl_h264_slice_params {
  * @frame_num: frame identifier which matches frame_num syntax element.
  * @fields: indicates how the DPB entry is referenced. Valid values are
  * V4L2_H264_{}_REF.
+ * @reserved0: padding field. Should be zeroed by applications.
+ * @view_order_idx: MVC view order index (VOIdx) of the view the picture
+ * belongs to. Zero for the base view and for streams without MVC.
  * @reserved: padding field. Should be zeroed by applications.
  * @top_field_order_cnt: matches TopFieldOrderCnt picture value.
  * @bottom_field_order_cnt: matches BottomFieldOrderCnt picture value.
@@ -1665,7 +1669,9 @@ struct v4l2_h264_dpb_entry {
 	__u32 pic_num;
 	__u16 frame_num;
 	__u8 fields;
-	__u8 reserved[5];
+	__u8 reserved0;
+	__u16 view_order_idx;
+	__u8 reserved[2];
 	__s32 top_field_order_cnt;
 	__s32 bottom_field_order_cnt;
 	__u32 flags;
@@ -1748,6 +1754,70 @@ struct v4l2_ctrl_h264_encode_params {
 	__s8 slice_beta_offset_div2;
 	__u8 reserved1[6];
 	__u32 flags; /* V4L2_H264_ENCODE_FLAG_ */
+};
+
+#define V4L2_H264_MVC_MAX_VIEWS		1024
+#define V4L2_H264_MVC_MAX_VIEW_REFS	15
+
+#define V4L2_CID_STATELESS_H264_MVC_VIEWS	(V4L2_CID_CODEC_STATELESS_BASE + 9)
+/**
+ * struct v4l2_h264_mvc_view - H264 MVC view of the active subset SPS
+ *
+ * One element of the V4L2_CID_STATELESS_H264_MVC_VIEWS dynamic array, which
+ * holds the views of seq_parameter_set_mvc_extension() in view order index
+ * order: element i describes the view with VOIdx i. The base view is
+ * element 0. A stream without MVC has a single element, which is all zero.
+ *
+ * @view_id: seq_parameter_set_mvc_extension syntax element view_id[i].
+ * @num_anchor_refs_l0: number of inter-view references of anchor pictures
+ * in list 0, num_anchor_refs_l0[i]. Zero for the base view.
+ * @num_anchor_refs_l1: as above, for list 1.
+ * @num_non_anchor_refs_l0: number of inter-view references of non-anchor
+ * pictures in list 0, num_non_anchor_refs_l0[i]. Zero for the base view.
+ * @num_non_anchor_refs_l1: as above, for list 1.
+ * @anchor_ref_l0: view_id of the inter-view references of anchor pictures in
+ * list 0, anchor_ref_l0[i][j], in the syntax order.
+ * @anchor_ref_l1: as above, for list 1.
+ * @non_anchor_ref_l0: view_id of the inter-view references of non-anchor
+ * pictures in list 0, non_anchor_ref_l0[i][j], in the syntax order.
+ * @non_anchor_ref_l1: as above, for list 1.
+ * @reserved: padding field. Should be zeroed by applications.
+ */
+struct v4l2_h264_mvc_view {
+	__u16 view_id;
+	__u8 num_anchor_refs_l0;
+	__u8 num_anchor_refs_l1;
+	__u8 num_non_anchor_refs_l0;
+	__u8 num_non_anchor_refs_l1;
+	__u16 anchor_ref_l0[V4L2_H264_MVC_MAX_VIEW_REFS];
+	__u16 anchor_ref_l1[V4L2_H264_MVC_MAX_VIEW_REFS];
+	__u16 non_anchor_ref_l0[V4L2_H264_MVC_MAX_VIEW_REFS];
+	__u16 non_anchor_ref_l1[V4L2_H264_MVC_MAX_VIEW_REFS];
+	__u8 reserved[2];
+};
+
+#define V4L2_H264_MVC_DECODE_PARAM_FLAG_ANCHOR_PIC	0x01
+#define V4L2_H264_MVC_DECODE_PARAM_FLAG_INTER_VIEW	0x02
+
+#define V4L2_CID_STATELESS_H264_MVC_DECODE_PARAMS	(V4L2_CID_CODEC_STATELESS_BASE + 10)
+/**
+ * struct v4l2_ctrl_h264_mvc_decode_params - H264 MVC view component parameters
+ *
+ * The MVC part of the decoding parameters of the view component (the
+ * picture of one view in an access unit) which the request decodes. Each
+ * view component is decoded by its own request, the base view first.
+ *
+ * @view_order_idx: view order index (VOIdx) of the view component: the index
+ * of its view_id in V4L2_CID_STATELESS_H264_MVC_VIEWS.
+ * @reserved0: padding field. Should be zeroed by applications.
+ * @flags: see V4L2_H264_MVC_DECODE_PARAM_FLAG_{}.
+ * @reserved: padding field. Should be zeroed by applications.
+ */
+struct v4l2_ctrl_h264_mvc_decode_params {
+	__u16 view_order_idx;
+	__u16 reserved0;
+	__u32 flags;
+	__u32 reserved[2];
 };
 
 /* Stateless FWHT control, used by the vicodec driver */

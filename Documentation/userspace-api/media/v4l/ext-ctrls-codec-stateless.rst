@@ -664,7 +664,15 @@ Stateless Codec Control ID
       - ``fields``
       - Specifies how the DPB entry is referenced. See :ref:`Reference Fields <h264_ref_fields>`
     * - __u8
-      - ``reserved[5]``
+      - ``reserved0``
+      - Applications and drivers must set this to zero.
+    * - __u16
+      - ``view_order_idx``
+      - MVC view order index (VOIdx) of the view the picture belongs to, see
+        ``V4L2_CID_STATELESS_H264_MVC_VIEWS``. Zero for pictures of the base
+        view and for streams without MVC.
+    * - __u8
+      - ``reserved[2]``
       - Applications and drivers must set this to zero.
     * - __s32
       - ``top_field_order_cnt``
@@ -707,6 +715,172 @@ Stateless Codec Control ID
     * - ``V4L2_H264_DPB_ENTRY_FLAG_FIELD``
       - 0x00000008
       - The DPB entry is a single field or a complementary field pair.
+    * - ``V4L2_H264_DPB_ENTRY_FLAG_INTER_VIEW``
+      - 0x00000010
+      - MVC only: the DPB entry is an inter-view reference, a picture of
+        another view (``view_order_idx``) in the same access unit as the
+        picture being decoded, whose ``inter_view_flag`` is 1. It is
+        short-term and also has ``V4L2_H264_DPB_ENTRY_FLAG_VALID`` and
+        ``V4L2_H264_DPB_ENTRY_FLAG_ACTIVE`` set. Inter-view references are not
+        part of the initial temporal reference lists (8.2.4.2): drivers that
+        build the lists append them as described in H.8.2.1. All the other
+        active entries are temporal references of the view being decoded.
+
+.. raw:: latex
+
+    \normalsize
+
+.. _v4l2-codec-stateless-h264-mvc:
+
+``V4L2_CID_STATELESS_H264_MVC_VIEWS (struct)``
+    The views of the active subset sequence parameter set, as given by
+    seq_parameter_set_mvc_extension() (H.7.3.2.1.4) of the H.264
+    specification, for H.264 Multiview Video Coding (Annex H): the MVC
+    profiles Multiview High and Stereo High. This is a dynamic array control:
+    element i describes the view with view order index (VOIdx) i, element 0
+    is the base view. Applications set as many elements as the subset
+    sequence parameter set has views (num_views_minus1 + 1). A single element
+    (the default, all zero) means that the stream is decoded without MVC.
+    Drivers advertise the number of views they can decode as the maximum
+    number of elements of the array (``dims[0]``): setting more views fails
+    with ``ENOSPC``, and drivers may reject other subset sequence parameter
+    sets they cannot decode with ``EINVAL``.
+
+    In MVC streams, each view component (the coded picture of one view in an
+    access unit) is decoded by a request of its own into its own capture
+    buffer, the base view component first, in VOIdx order. The output buffer
+    of a request holds the slices of one view component only: NAL units of
+    type 1 or 5 for the base view, of type 20 (coded slice extension) for the
+    other views. Prefix NAL units (type 14) and subset sequence parameter
+    sets (type 15) are not passed to the driver. The other H.264 controls
+    apply to each view component as for a stream without MVC: for the
+    non-base views, the SPS control holds the seq_parameter_set_data() of the
+    subset sequence parameter set, and the DPB of
+    ``V4L2_CID_STATELESS_H264_DECODE_PARAMS`` holds the references of the
+    view being decoded and its inter-view references, see
+    ``V4L2_H264_DPB_ENTRY_FLAG_INTER_VIEW``.
+
+    In field-coded MVC streams the fields of the other views come between
+    the two fields of a frame of one view, so the first field cannot hold the
+    capture buffer for the second one with
+    ``V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF`` (the requests of the other views
+    have other timestamps, which release it). Instead, the request of the
+    second field queues the capture buffer of the first field again, after
+    it was dequeued; the driver only writes the lines of the field it
+    decodes.
+
+.. c:type:: v4l2_h264_mvc_view
+
+.. raw:: latex
+
+    \small
+
+.. tabularcolumns:: |p{1.6cm}|p{4.8cm}|p{10.9cm}|
+
+.. flat-table:: struct v4l2_h264_mvc_view
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - __u16
+      - ``view_id``
+      - view_id[i] of the subset sequence parameter set.
+    * - __u8
+      - ``num_anchor_refs_l0``
+      - Number of inter-view references of anchor view components in list
+        0, num_anchor_refs_l0[i]. Zero for the base view.
+    * - __u8
+      - ``num_anchor_refs_l1``
+      - As above, for list 1.
+    * - __u8
+      - ``num_non_anchor_refs_l0``
+      - Number of inter-view references of non-anchor view components in
+        list 0, num_non_anchor_refs_l0[i]. Zero for the base view.
+    * - __u8
+      - ``num_non_anchor_refs_l1``
+      - As above, for list 1.
+    * - __u16
+      - ``anchor_ref_l0[V4L2_H264_MVC_MAX_VIEW_REFS]``
+      - view_id of the inter-view references of anchor view components in
+        list 0, anchor_ref_l0[i][j], in the order of the syntax.
+    * - __u16
+      - ``anchor_ref_l1[V4L2_H264_MVC_MAX_VIEW_REFS]``
+      - As above, for list 1.
+    * - __u16
+      - ``non_anchor_ref_l0[V4L2_H264_MVC_MAX_VIEW_REFS]``
+      - view_id of the inter-view references of non-anchor view components
+        in list 0, non_anchor_ref_l0[i][j], in the order of the syntax.
+    * - __u16
+      - ``non_anchor_ref_l1[V4L2_H264_MVC_MAX_VIEW_REFS]``
+      - As above, for list 1.
+    * - __u8
+      - ``reserved[2]``
+      - Applications and drivers must set this to zero.
+
+.. raw:: latex
+
+    \normalsize
+
+``V4L2_CID_STATELESS_H264_MVC_DECODE_PARAMS (struct)``
+    The MVC parameters of the view component decoded by the request, from
+    nal_unit_header_mvc_extension() (H.7.3.1.1) of its NAL units, or of the
+    prefix NAL unit for the base view. Used with
+    ``V4L2_CID_STATELESS_H264_MVC_VIEWS``. The IDR flag of
+    ``V4L2_CID_STATELESS_H264_DECODE_PARAMS`` is set for a view component
+    with non_idr_flag equal to 0.
+
+.. c:type:: v4l2_ctrl_h264_mvc_decode_params
+
+.. raw:: latex
+
+    \small
+
+.. tabularcolumns:: |p{1.6cm}|p{4.8cm}|p{10.9cm}|
+
+.. flat-table:: struct v4l2_ctrl_h264_mvc_decode_params
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - __u16
+      - ``view_order_idx``
+      - View order index (VOIdx) of the view component: the index of its
+        view_id in ``V4L2_CID_STATELESS_H264_MVC_VIEWS``.
+    * - __u16
+      - ``reserved0``
+      - Applications and drivers must set this to zero.
+    * - __u32
+      - ``flags``
+      - See :ref:`MVC Decode Parameters Flags <h264_mvc_decode_params_flags>`
+    * - __u32
+      - ``reserved[2]``
+      - Applications and drivers must set this to zero.
+
+.. raw:: latex
+
+    \normalsize
+
+.. _h264_mvc_decode_params_flags:
+
+``MVC Decode Parameters Flags``
+
+.. raw:: latex
+
+    \small
+
+.. flat-table::
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - ``V4L2_H264_MVC_DECODE_PARAM_FLAG_ANCHOR_PIC``
+      - 0x00000001
+      - anchor_pic_flag: the view component is an anchor picture, its
+        inter-view references are the anchor references of its view.
+    * - ``V4L2_H264_MVC_DECODE_PARAM_FLAG_INTER_VIEW``
+      - 0x00000002
+      - inter_view_flag: the view component may be used for inter-view
+        prediction by the other views of the access unit.
 
 .. raw:: latex
 
