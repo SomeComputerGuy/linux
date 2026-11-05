@@ -689,11 +689,11 @@ const struct rkvenc_coded_fmt_desc rkvenc_hevc_fmt_desc = {
 	.size_align = 8,
 	.frmsize = {
 		.min_width = 64,
-		/* Wider pictures need tiles, which are not implemented. */
-		.max_width = 4096,
+		/* Wider than 4096 with the external line buffer. */
+		.max_width = 16384,
 		.step_width = 2,
 		.min_height = 64,
-		.max_height = 4096,
+		.max_height = 8192,
 		.step_height = 2,
 	},
 	.ctrls = &rkvenc_hevc_ctrls,

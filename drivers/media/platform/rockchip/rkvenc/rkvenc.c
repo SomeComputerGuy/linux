@@ -505,7 +505,12 @@ static int rkvenc_start_streaming(struct vb2_queue *q, unsigned int count)
 	    ctx->src_fmt.fmt.pix_mp.height != ctx->coded_fmt.fmt.pix_mp.height)
 		ret = -EINVAL;
 	else
-		ret = desc->ops->start ? desc->ops->start(ctx) : 0;
+		ret = vepu580_alloc_line_buf(ctx);
+	if (!ret && desc->ops->start) {
+		ret = desc->ops->start(ctx);
+		if (ret)
+			vepu580_free_line_buf(ctx);
+	}
 	if (ret) {
 		rkvenc_queue_cleanup(q, VB2_BUF_STATE_QUEUED);
 		return ret;
@@ -524,6 +529,7 @@ static void rkvenc_stop_streaming(struct vb2_queue *q)
 	if (ctx->started) {
 		if (desc->ops->stop)
 			desc->ops->stop(ctx);
+		vepu580_free_line_buf(ctx);
 		ctx->started = false;
 	}
 
