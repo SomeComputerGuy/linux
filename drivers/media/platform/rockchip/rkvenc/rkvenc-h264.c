@@ -170,95 +170,6 @@ static int rkvenc_h264_rec_buffer_free(struct v4l2_h264_enc *enc,
 	return 0;
 }
 
-/* ---- constant bitrate rate control ---- */
-
-/*
- * Start QP of an I picture from its size in bits per luma sample: about
- * 20.3 - 6 * log2(bpp), the bits per macroblock to QP relation of MPP's
- * first picture estimate for 1080p-class pictures, clipped to 15..45.
- */
-static int rkvenc_h264_rc_qp_initial(u64 bits, unsigned int pixels)
-{
-	int qp_q8 = 20 * 256 + 77 +
-		    6 * (rkvenc_log2_q8(pixels) -
-			 rkvenc_log2_q8(max_t(u64, bits, 1)));
-
-	return clamp(DIV_ROUND_CLOSEST(qp_q8, 256), 15, 45);
-}
-
-/* MPP's H.264 defaults: I pictures 2 QP below P, I/P size ratio 10 to start */
-static const struct rkvenc_rc_codec rkvenc_h264_rc_codec = {
-	.ip_delta = 2,
-	.ratio_init = 160,
-	.qp_initial = rkvenc_h264_rc_qp_initial,
-};
-
-static bool rkvenc_h264_rc_cbr(const struct v4l2_h264_enc_state *state)
-{
-	return state->frame_rc_enable &&
-	       state->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_CBR;
-}
-
-static int rkvenc_h264_rc_init(struct v4l2_h264_enc_rc *rc)
-{
-	struct rkvenc_ctx *ctx = rc->private_data;
-	struct rkvenc_h264_ctx *h264 = ctx->priv;
-
-	memset(&h264->rc, 0, sizeof(h264->rc));
-	return 0;
-}
-
-static int rkvenc_h264_rc_estimate(struct v4l2_h264_enc_rc *rc,
-				   unsigned int *qp)
-{
-	struct rkvenc_ctx *ctx = rc->private_data;
-	struct rkvenc_h264_ctx *h264 = ctx->priv;
-	struct v4l2_h264_enc_state *state = rc->state;
-	int ret;
-
-	/* The core handles the direct QP and constant quality modes. */
-	if (!rkvenc_h264_rc_cbr(state))
-		return -EOPNOTSUPP;
-
-	ret = rkvenc_rc_estimate(&h264->rc, &rkvenc_h264_rc_codec,
-				 state->bitrate, &state->timeperframe,
-				 state->width_mbs * state->height_mbs * 256,
-				 state->encode.slice_type == V4L2_H264_SLICE_TYPE_I,
-				 state->qp_min, state->qp_max);
-	if (ret < 0)
-		return ret;
-
-	*qp = ret;
-	return 0;
-}
-
-static int rkvenc_h264_rc_complete(struct v4l2_h264_enc_rc *rc,
-				   unsigned long bytesused)
-{
-	struct rkvenc_ctx *ctx = rc->private_data;
-	struct rkvenc_h264_ctx *h264 = ctx->priv;
-	struct v4l2_h264_enc_state *state = rc->state;
-
-	if (!rkvenc_h264_rc_cbr(state))
-		return -EOPNOTSUPP;
-
-	rkvenc_rc_complete(&h264->rc, (u64)bytesused * 8, state->qp_min,
-			   state->qp_max);
-	return 0;
-}
-
-/*
- * The CBR mode of the H.264 core is replaced: its frame QP does not move
- * while the hardware row rate control keeps the picture sizes near their
- * targets, it keeps separate I and P histories, and its targets settle
- * below the bitrate.
- */
-static const struct v4l2_h264_enc_rc_ops rkvenc_h264_rc_ops = {
-	.init = rkvenc_h264_rc_init,
-	.estimate = rkvenc_h264_rc_estimate,
-	.complete = rkvenc_h264_rc_complete,
-};
-
 static const struct v4l2_h264_enc_ops rkvenc_h264_enc_ops = {
 	.state_constrain = rkvenc_h264_state_constrain,
 	.rec_buffer_alloc = rkvenc_h264_rec_buffer_alloc,
@@ -277,7 +188,6 @@ static int rkvenc_h264_start(struct rkvenc_ctx *ctx)
 
 	enc = &h264->enc;
 	enc->ops = &rkvenc_h264_enc_ops;
-	enc->rc_ops = &rkvenc_h264_rc_ops;
 	enc->private_data = ctx;
 	enc->format_mplane = &ctx->coded_fmt.fmt.pix_mp;
 	enc->timeperframe = &ctx->timeperframe;
@@ -287,15 +197,13 @@ static int rkvenc_h264_start(struct rkvenc_ctx *ctx)
 		     V4L2_H264_ENC_FLAG_HW_SLICE_HEADER |
 		     V4L2_H264_ENC_FLAG_CHROMA_QP_CR_OFFSET;
 
-	/* The rate control callbacks find their state through ctx->priv. */
-	ctx->priv = h264;
 	ret = v4l2_h264_enc_init(enc);
 	if (ret) {
-		ctx->priv = NULL;
 		kfree(h264);
 		return ret;
 	}
 
+	ctx->priv = h264;
 	return 0;
 }
 
@@ -477,13 +385,13 @@ static int rkvenc_h264_run(struct rkvenc_ctx *ctx, struct rkvenc_core *core,
 	 * the hardware row rate control, which adapts the QP of each
 	 * macroblock row by up to the row_rc_qp_range parameter.
 	 */
-	h264->hw_rc = rkvenc_h264_rc_cbr(state) &&
+	h264->hw_rc = rc->mode && rc->mode->type == V4L2_H264_ENC_RC_TYPE_CBR &&
 		      READ_ONCE(rkvenc_row_rc_qp_range);
 	if (h264->hw_rc)
 		vepu580_setup_row_rc(core, &vepu580_h264_row_rc, rc->qp,
 				     state->qp_min, state->qp_max,
 				     min(READ_ONCE(rkvenc_row_rc_qp_range), 15U),
-				     h264->rc.target_bits,
+				     (u64)rc->size * 8,
 				     mbs, state->width_mbs);
 	else
 		vepu580_setup_fixed_qp(core, rc->qp);
