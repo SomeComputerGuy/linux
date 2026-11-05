@@ -337,6 +337,11 @@ struct vop2_video_port {
 	struct drm_pending_vblank_event *event;
 
 	unsigned int nlayers;
+	/**
+	 * @ovl_layers: layers of the overlay assigned to the video port in
+	 * OVL_PORT_SEL, protected by &vop2.ovl_lock
+	 */
+	unsigned int ovl_layers;
 
 	/** @irq_lock: protects @vblank_enabled and @post_buf_empty_masked */
 	spinlock_t irq_lock;
