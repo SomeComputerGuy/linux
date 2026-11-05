@@ -3769,6 +3769,236 @@ struct v4l2_ctrl_av1_film_grain {
 	__u8 reserved[4];
 };
 
+/* Stateless AVS2 (GB/T 33475.2, IEEE 1857.4) decoder controls */
+
+#define V4L2_AVS2_PROFILE_MAIN_PICTURE			0x12
+#define V4L2_AVS2_PROFILE_MAIN				0x20
+#define V4L2_AVS2_PROFILE_MAIN10			0x22
+
+#define V4L2_AVS2_SEQUENCE_FLAG_PROGRESSIVE_SEQUENCE	0x00000001
+#define V4L2_AVS2_SEQUENCE_FLAG_FIELD_CODED_SEQUENCE	0x00000002
+#define V4L2_AVS2_SEQUENCE_FLAG_LOW_DELAY		0x00000004
+#define V4L2_AVS2_SEQUENCE_FLAG_TEMPORAL_ID_ENABLE	0x00000008
+#define V4L2_AVS2_SEQUENCE_FLAG_WEIGHT_QUANT_ENABLE	0x00000010
+#define V4L2_AVS2_SEQUENCE_FLAG_BACKGROUND_PICTURE_ENABLE 0x00000020
+#define V4L2_AVS2_SEQUENCE_FLAG_MHP_SKIP_ENABLE		0x00000040
+#define V4L2_AVS2_SEQUENCE_FLAG_DHP_ENABLE		0x00000080
+#define V4L2_AVS2_SEQUENCE_FLAG_WSM_ENABLE		0x00000100
+#define V4L2_AVS2_SEQUENCE_FLAG_AMP_ENABLE		0x00000200
+#define V4L2_AVS2_SEQUENCE_FLAG_NSQT_ENABLE		0x00000400
+#define V4L2_AVS2_SEQUENCE_FLAG_NSIP_ENABLE		0x00000800
+#define V4L2_AVS2_SEQUENCE_FLAG_SECONDARY_TRANSFORM_ENABLE 0x00001000
+#define V4L2_AVS2_SEQUENCE_FLAG_SAO_ENABLE		0x00002000
+#define V4L2_AVS2_SEQUENCE_FLAG_ALF_ENABLE		0x00004000
+#define V4L2_AVS2_SEQUENCE_FLAG_PMVR_ENABLE		0x00008000
+#define V4L2_AVS2_SEQUENCE_FLAG_CROSS_SLICE_LOOPFILTER_ENABLE 0x00010000
+#define V4L2_AVS2_SEQUENCE_FLAG_BCBR_ENABLE		0x00020000
+
+#define V4L2_CID_STATELESS_AVS2_SEQUENCE	(V4L2_CID_CODEC_STATELESS_BASE + 900)
+/**
+ * struct v4l2_ctrl_avs2_sequence - AVS2 sequence header
+ *
+ * Syntax elements of sequence_header(), GB/T 33475.2 section 7.1.2.2. The
+ * reference configuration sets (RCS) of the sequence header are not part
+ * of the control: the reference pictures of each picture are passed,
+ * resolved, with struct v4l2_ctrl_avs2_picture. The weighting quantization
+ * matrices of the sequence header are passed, resolved for each picture,
+ * with struct v4l2_ctrl_avs2_weight_quant.
+ *
+ * @flags: see V4L2_AVS2_SEQUENCE_FLAG_{}. BACKGROUND_PICTURE_ENABLE is set
+ *	when background_picture_disable is 0.
+ * @horizontal_size: horizontal_size, the width of the picture in luma
+ *	samples.
+ * @vertical_size: vertical_size, the height of the picture in luma samples.
+ * @profile_id: profile_id, see V4L2_AVS2_PROFILE_{}.
+ * @level_id: level_id.
+ * @chroma_format: chroma_format, 1 for 4:2:0.
+ * @sample_precision: sample_precision: 1 for 8-bit, 2 for 10-bit samples.
+ * @encoding_precision: encoding_precision: 1 for 8-bit, 2 for 10-bit
+ *	coding. Set to 1 when the profile has no encoding_precision.
+ * @lcu_size: lcu_size, the base 2 logarithm of the largest coding unit
+ *	size, 4 to 6.
+ * @picture_reorder_delay: picture_reorder_delay, 0 when LOW_DELAY is set.
+ * @reserved: padding field. Should be zeroed by applications.
+ */
+struct v4l2_ctrl_avs2_sequence {
+	__u32	flags;
+	__u16	horizontal_size;
+	__u16	vertical_size;
+	__u8	profile_id;
+	__u8	level_id;
+	__u8	chroma_format;
+	__u8	sample_precision;
+	__u8	encoding_precision;
+	__u8	lcu_size;
+	__u8	picture_reorder_delay;
+	__u8	reserved[5];
+};
+
+#define V4L2_AVS2_PICTURE_TYPE_I			0
+#define V4L2_AVS2_PICTURE_TYPE_P			1
+#define V4L2_AVS2_PICTURE_TYPE_B			2
+#define V4L2_AVS2_PICTURE_TYPE_F			3
+
+#define V4L2_AVS2_PICTURE_FLAG_PROGRESSIVE_FRAME	0x00000001
+#define V4L2_AVS2_PICTURE_FLAG_PICTURE_STRUCTURE	0x00000002
+#define V4L2_AVS2_PICTURE_FLAG_TOP_FIELD_FIRST		0x00000004
+#define V4L2_AVS2_PICTURE_FLAG_REPEAT_FIRST_FIELD	0x00000008
+#define V4L2_AVS2_PICTURE_FLAG_IS_TOP_FIELD		0x00000010
+#define V4L2_AVS2_PICTURE_FLAG_FIXED_PICTURE_QP		0x00000020
+#define V4L2_AVS2_PICTURE_FLAG_LOOP_FILTER_DISABLE	0x00000040
+#define V4L2_AVS2_PICTURE_FLAG_REFERED_BY_OTHERS	0x00000080
+#define V4L2_AVS2_PICTURE_FLAG_BACKGROUND_PICTURE	0x00000100
+#define V4L2_AVS2_PICTURE_FLAG_BACKGROUND_PICTURE_OUTPUT 0x00000200
+#define V4L2_AVS2_PICTURE_FLAG_BACKGROUND_PRED		0x00000400
+#define V4L2_AVS2_PICTURE_FLAG_BACKGROUND_REFERENCE	0x00000800
+#define V4L2_AVS2_PICTURE_FLAG_RANDOM_ACCESS_DECODABLE	0x00001000
+#define V4L2_AVS2_PICTURE_FLAG_WEIGHT_QUANT_ENABLE	0x00002000
+
+#define V4L2_AVS2_MAX_REF_PICS				7
+
+#define V4L2_AVS2_REF_PIC_FLAG_BACKGROUND		0x01
+
+/**
+ * struct v4l2_avs2_ref_pic - AVS2 reference picture
+ *
+ * @timestamp: timestamp of the V4L2 capture buffer holding the reference
+ *	picture. See note in struct v4l2_ctrl_avs2_picture.
+ * @poc: picture order count of the reference picture, derived as for
+ *	@poc of struct v4l2_ctrl_avs2_picture when it was decoded.
+ * @ref_poc: picture order counts of the reference pictures of the
+ *	reference picture itself, in the order of its own reference list
+ *	(ref_pics[] of the picture control it was decoded with).
+ * @picture_type: picture type of the reference picture when it was decoded,
+ *	see V4L2_AVS2_PICTURE_TYPE_{}.
+ * @num_ref_pics: number of valid entries in @ref_poc.
+ * @flags: see V4L2_AVS2_REF_PIC_FLAG_{}.
+ * @reserved: padding field. Should be zeroed by applications.
+ */
+struct v4l2_avs2_ref_pic {
+	__u64	timestamp;
+	__s32	poc;
+	__s32	ref_poc[V4L2_AVS2_MAX_REF_PICS];
+	__u8	picture_type;
+	__u8	num_ref_pics;
+	__u8	flags;
+	__u8	reserved[5];
+};
+
+#define V4L2_CID_STATELESS_AVS2_PICTURE		(V4L2_CID_CODEC_STATELESS_BASE + 901)
+/**
+ * struct v4l2_ctrl_avs2_picture - AVS2 picture header and reference list
+ *
+ * Syntax elements of intra_picture_header() or inter_picture_header(),
+ * GB/T 33475.2 sections 7.1.3.1 and 7.1.3.2, and the reference picture
+ * list of the picture.
+ *
+ * The OUTPUT buffer holds one coded picture: its picture header and all
+ * its slices, in decoding order, with their start codes and as found in
+ * the elementary stream (pseudo start code bits not removed). Sequence
+ * headers, extensions and user data may precede the picture header.
+ *
+ * @ref_pics: the reference pictures, in the order of the reference
+ *	configuration set of the picture. For a P or F picture with
+ *	BACKGROUND_REFERENCE, the last entry is the background picture. For a
+ *	P picture with BACKGROUND_PRED (an S picture), the first entry is the
+ *	background picture.
+ * @data_offset: offset in bytes from the start of the OUTPUT buffer to the
+ *	first byte of the start code prefix of the first slice.
+ * @flags: see V4L2_AVS2_PICTURE_FLAG_{}.
+ * @poc: picture order count: decode_order_index, made monotonic across its
+ *	8-bit wrap around, plus picture_output_delay minus
+ *	picture_reorder_delay of the sequence (decode_order_index only when the
+ *	sequence is low delay).
+ * @picture_type: V4L2_AVS2_PICTURE_TYPE_I for intra_picture_header(),
+ *	otherwise the picture type from picture_coding_type.
+ * @num_ref_pics: num_of_reference_picture of the reference configuration set
+ *	of the picture, the number of valid entries in @ref_pics.
+ * @decode_order_index: decode_order_index.
+ * @temporal_id: temporal_id, 0 when the sequence has no temporal id.
+ * @picture_output_delay: picture_output_delay.
+ * @picture_qp: picture_qp.
+ * @alpha_c_offset: alpha_c_offset, 0 unless loop_filter_parameter_flag.
+ * @beta_offset: beta_offset, 0 unless loop_filter_parameter_flag.
+ * @chroma_quant_param_delta_cb: chroma_quant_param_delta_cb, 0 when
+ *	chroma_quant_param_disable is set.
+ * @chroma_quant_param_delta_cr: chroma_quant_param_delta_cr, 0 when
+ *	chroma_quant_param_disable is set.
+ * @reserved: padding field. Should be zeroed by applications.
+ *
+ * Note: the timestamp refers to the timestamp field in struct v4l2_buffer.
+ * Use v4l2_timeval_to_ns() to convert the struct timeval to a __u64.
+ */
+struct v4l2_ctrl_avs2_picture {
+	struct v4l2_avs2_ref_pic ref_pics[V4L2_AVS2_MAX_REF_PICS];
+	__u32	data_offset;
+	__u32	flags;
+	__s32	poc;
+	__u8	picture_type;
+	__u8	num_ref_pics;
+	__u8	decode_order_index;
+	__u8	temporal_id;
+	__u8	picture_output_delay;
+	__u8	picture_qp;
+	__s8	alpha_c_offset;
+	__s8	beta_offset;
+	__s8	chroma_quant_param_delta_cb;
+	__s8	chroma_quant_param_delta_cr;
+	__u8	reserved[2];
+};
+
+#define V4L2_CID_STATELESS_AVS2_WEIGHT_QUANT	(V4L2_CID_CODEC_STATELESS_BASE + 902)
+/**
+ * struct v4l2_ctrl_avs2_weight_quant - AVS2 weighting quantization matrices
+ *
+ * The weighting quantization matrices WeightQuantMatrix4x4 and
+ * WeightQuantMatrix8x8 that apply to the picture (GB/T 33475.2 section
+ * 9.2.4), resolved by the application from the sequence and picture
+ * headers: the default matrices, the matrices of the sequence header, the
+ * picture header matrices, or the matrices derived from the weighting
+ * quantization parameters of the picture header. Every entry is 64 when
+ * weighting quantization is disabled for the picture.
+ *
+ * @matrix_4x4: 4x4 matrix in raster scan order.
+ * @matrix_8x8: 8x8 matrix in raster scan order.
+ */
+struct v4l2_ctrl_avs2_weight_quant {
+	__u8	matrix_4x4[16];
+	__u8	matrix_8x8[64];
+};
+
+#define V4L2_AVS2_ALF_FLAG_LUMA_ENABLE			0x01
+#define V4L2_AVS2_ALF_FLAG_CB_ENABLE			0x02
+#define V4L2_AVS2_ALF_FLAG_CR_ENABLE			0x04
+
+#define V4L2_AVS2_ALF_MAX_LUMA_FILTERS			16
+#define V4L2_AVS2_ALF_NUM_COEFFS			9
+
+#define V4L2_CID_STATELESS_AVS2_ALF		(V4L2_CID_CODEC_STATELESS_BASE + 903)
+/**
+ * struct v4l2_ctrl_avs2_alf - AVS2 adaptive loop filter parameters
+ *
+ * The alf_parameter_set() of the picture header, GB/T 33475.2 section
+ * 7.1.8. Only used when the sequence enables the adaptive loop filter.
+ *
+ * @luma_coeff: alf_coeff_luma[i][j] of the luma filters, as coded.
+ * @chroma_coeff: alf_coeff_chroma[0][j] (Cb) and alf_coeff_chroma[1][j]
+ *	(Cr), as coded.
+ * @luma_region_filter: luma filter index used by each of the 16 regions,
+ *	derived from alf_region_distance[].
+ * @flags: see V4L2_AVS2_ALF_FLAG_{}, picture_alf_enable_flag[0..2].
+ * @num_luma_filters: alf_filter_num_minus1 + 1.
+ * @reserved: padding field. Should be zeroed by applications.
+ */
+struct v4l2_ctrl_avs2_alf {
+	__s16	luma_coeff[V4L2_AVS2_ALF_MAX_LUMA_FILTERS][V4L2_AVS2_ALF_NUM_COEFFS];
+	__s16	chroma_coeff[2][V4L2_AVS2_ALF_NUM_COEFFS];
+	__u8	luma_region_filter[V4L2_AVS2_ALF_MAX_LUMA_FILTERS];
+	__u8	flags;
+	__u8	num_luma_filters;
+	__u8	reserved[6];
+};
+
 /* MPEG-compression definitions kept for backwards compatibility */
 #ifndef __KERNEL__
 #define V4L2_CTRL_CLASS_MPEG            V4L2_CTRL_CLASS_CODEC

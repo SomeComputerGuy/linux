@@ -591,6 +591,30 @@ See also the examples in :ref:`control`.
       - n/a
       - A struct :c:type:`v4l2_ctrl_av1_film_grain`, containing AV1 Film Grain
         parameters for stateless video decoders.
+    * - ``V4L2_CTRL_TYPE_AVS2_SEQUENCE``
+      - n/a
+      - n/a
+      - n/a
+      - A struct :c:type:`v4l2_ctrl_avs2_sequence`, containing the AVS2
+	sequence header for stateless video decoders.
+    * - ``V4L2_CTRL_TYPE_AVS2_PICTURE``
+      - n/a
+      - n/a
+      - n/a
+      - A struct :c:type:`v4l2_ctrl_avs2_picture`, containing the AVS2
+	picture header and reference list for stateless video decoders.
+    * - ``V4L2_CTRL_TYPE_AVS2_WEIGHT_QUANT``
+      - n/a
+      - n/a
+      - n/a
+      - A struct :c:type:`v4l2_ctrl_avs2_weight_quant`, containing the AVS2
+	weighting quantization matrices for stateless video decoders.
+    * - ``V4L2_CTRL_TYPE_AVS2_ALF``
+      - n/a
+      - n/a
+      - n/a
+      - A struct :c:type:`v4l2_ctrl_avs2_alf`, containing the AVS2
+	adaptive loop filter parameters for stateless video decoders.
 
 .. raw:: latex
 

@@ -278,6 +278,23 @@ Compressed Formats
         of macroblocks to decode a full corresponding frame to the matching
         capture buffer.
 
+    * .. _V4L2-PIX-FMT-AVS2-FRAME:
+
+      - ``V4L2_PIX_FMT_AVS2_FRAME``
+      - 'AVS2'
+      - AVS2 parsed frame, as extracted from the :ref:`avs2` bitstream. This
+	format is adapted for stateless video decoders that implement an AVS2
+	pipeline with the :ref:`stateless_decoder`. Metadata associated with
+	the picture to decode is required to be passed through the
+	``V4L2_CID_STATELESS_AVS2_SEQUENCE``, ``V4L2_CID_STATELESS_AVS2_PICTURE``,
+	``V4L2_CID_STATELESS_AVS2_WEIGHT_QUANT`` and
+	``V4L2_CID_STATELESS_AVS2_ALF`` controls. See the
+	:ref:`associated Codec Control IDs <v4l2-codec-stateless-avs2>`. Exactly
+	one output and one capture buffer must be provided for use with this
+	pixel format. The output buffer must contain exactly one coded picture:
+	its picture header and all its slices, with their start codes, as found
+	in the elementary stream. Sequence headers, extensions and user data may
+	precede the picture header.
     * .. _V4L2-PIX-FMT-AV1:
 
       - ``V4L2_PIX_FMT_AV1``
