@@ -45,12 +45,11 @@ static const struct v4l2_hevc_enc_rps_limits rkvenc_hevc_rps_limits = {
 
 /*
  * Row rate control: MPP's HEVC deviation thresholds are {2n, n, p, 2p}
- * with the adjustments {-2, -1, 0, 1, 2} and AQ mode 1.
+ * with the adjustments {-2, -1, 0, 1, 2}.
  */
 static const struct vepu580_row_rc rkvenc_hevc_row_rc = {
 	.qp_adj = { -2, -1, 0, 1, 2, 0, 0, 0, 0 },
 	.dthd_outer = 2,
-	.aq_mode = true,
 };
 
 static int rkvenc_hevc_state_constrain(struct v4l2_hevc_enc *enc,
