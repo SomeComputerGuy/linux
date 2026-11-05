@@ -324,6 +324,77 @@ static const struct hantro_fmt rockchip_vdpu2_dec_fmts[] = {
 	},
 };
 
+/*
+ * The RK3588 VPU121 with its AVS+ decoder: the VDPU2 formats, plus AVS1
+ * and AVS+ decoded by the AVS+ decoder.
+ */
+static const struct hantro_fmt rk3588_vpu121_avsd_dec_fmts[] = {
+	{
+		.fourcc = V4L2_PIX_FMT_NV12,
+		.codec_mode = HANTRO_MODE_NONE,
+		.frmsize = {
+			.min_width = FMT_MIN_WIDTH,
+			.max_width = FMT_FHD_WIDTH,
+			.step_width = MB_DIM,
+			.min_height = FMT_MIN_HEIGHT,
+			.max_height = FMT_FHD_HEIGHT,
+			.step_height = MB_DIM,
+		},
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_H264_SLICE,
+		.codec_mode = HANTRO_MODE_H264_DEC,
+		.max_depth = 2,
+		.frmsize = {
+			.min_width = FMT_MIN_WIDTH,
+			.max_width = FMT_FHD_WIDTH,
+			.step_width = MB_DIM,
+			.min_height = FMT_MIN_HEIGHT,
+			.max_height = FMT_FHD_HEIGHT,
+			.step_height = MB_DIM,
+		},
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_MPEG2_SLICE,
+		.codec_mode = HANTRO_MODE_MPEG2_DEC,
+		.max_depth = 2,
+		.frmsize = {
+			.min_width = FMT_MIN_WIDTH,
+			.max_width = FMT_FHD_WIDTH,
+			.step_width = MB_DIM,
+			.min_height = FMT_MIN_HEIGHT,
+			.max_height = FMT_FHD_HEIGHT,
+			.step_height = MB_DIM,
+		},
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_VP8_FRAME,
+		.codec_mode = HANTRO_MODE_VP8_DEC,
+		.max_depth = 2,
+		.frmsize = {
+			.min_width = FMT_MIN_WIDTH,
+			.max_width = FMT_FHD_WIDTH,
+			.step_width = MB_DIM,
+			.min_height = FMT_MIN_HEIGHT,
+			.max_height = FMT_FHD_HEIGHT,
+			.step_height = MB_DIM,
+		},
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_AVS_FRAME,
+		.codec_mode = HANTRO_MODE_AVS_DEC,
+		.max_depth = 2,
+		.frmsize = {
+			.min_width = FMT_MIN_WIDTH,
+			.max_width = FMT_FHD_WIDTH,
+			.step_width = MB_DIM,
+			.min_height = FMT_MIN_HEIGHT,
+			.max_height = FMT_FHD_HEIGHT,
+			.step_height = MB_DIM,
+		},
+	},
+};
+
 static const struct hantro_fmt rk3399_vpu_dec_fmts[] = {
 	{
 		.fourcc = V4L2_PIX_FMT_NV12,
@@ -461,6 +532,20 @@ static irqreturn_t rockchip_vpu2_vepu_irq(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+/*
+ * The VDPU2 decoder of the RK3588 VPU121 shares its interrupt line with the
+ * AVS+ decoder, which only claims the interrupts it raised.
+ */
+static irqreturn_t rk3588_vpu121_vdpu_irq(int irq, void *dev_id)
+{
+	struct hantro_dev *vpu = dev_id;
+
+	if (rockchip_avsd_irq(vpu) == IRQ_HANDLED)
+		return IRQ_HANDLED;
+
+	return rockchip_vpu2_vdpu_irq(irq, dev_id);
+}
+
 static irqreturn_t rk3588_vpu981_irq(int irq, void *dev_id)
 {
 	struct hantro_dev *vpu = dev_id;
@@ -499,6 +584,26 @@ static int rockchip_vpu_hw_init(struct hantro_dev *vpu)
 	/* Bump ACLK to max. possible freq. to improve performance. */
 	clk_set_rate(vpu->clocks[0].clk, RK3288_ACLK_MAX_FREQ);
 	return 0;
+}
+
+static const struct hantro_variant rk3588_vpu121_avsd_variant;
+
+/*
+ * Device trees that describe the AVS+ decoder registers of the VPU121
+ * select the variant that exposes it.
+ */
+static int rk3588_vpu121_hw_init(struct hantro_dev *vpu)
+{
+	int ret;
+
+	ret = rockchip_avsd_hw_init(vpu);
+	if (ret)
+		return ret;
+
+	if (vpu->avsd_base)
+		vpu->variant = &rk3588_vpu121_avsd_variant;
+
+	return rockchip_vpu_hw_init(vpu);
 }
 
 static void rk3066_vpu_dec_reset(struct hantro_ctx *ctx)
@@ -701,6 +806,12 @@ static const struct hantro_codec_ops rk3588_vpu121_codec_ops[] = {
 		.init = hantro_vp8_dec_init,
 		.exit = hantro_vp8_dec_exit,
 	},
+	[HANTRO_MODE_AVS_DEC] = {
+		.run = rockchip_avsd_avs_dec_run,
+		.reset = rockchip_avsd_avs_dec_reset,
+		.init = rockchip_avsd_avs_dec_init,
+		.exit = rockchip_avsd_avs_dec_exit,
+	},
 };
 
 static const struct hantro_codec_ops rk3588_vpu981_codec_ops[] = {
@@ -736,7 +847,7 @@ static const struct hantro_irq rockchip_vpu2_irqs[] = {
 /* Older device trees only describe the decoder of the RK3588 VPU121. */
 static const struct hantro_irq rk3588_vpu121_irqs[] = {
 	{ "vepu", rockchip_vpu2_vepu_irq, .enc_optional = true },
-	{ "vdpu", rockchip_vpu2_vdpu_irq },
+	{ "vdpu", rk3588_vpu121_vdpu_irq },
 };
 
 static const struct hantro_irq rk3568_vepu_irqs[] = {
@@ -924,7 +1035,25 @@ const struct hantro_variant rk3588_vpu121_variant = {
 	.codec_ops = rk3588_vpu121_codec_ops,
 	.irqs = rk3588_vpu121_irqs,
 	.num_irqs = ARRAY_SIZE(rk3588_vpu121_irqs),
-	.init = rockchip_vpu_hw_init,
+	.init = rk3588_vpu121_hw_init,
+	.clk_names = rockchip_vpu_clk_names,
+	.num_clocks = ARRAY_SIZE(rockchip_vpu_clk_names)
+};
+
+static const struct hantro_variant rk3588_vpu121_avsd_variant = {
+	.enc_offset = 0x0,
+	.enc_fmts = rk3588_vpu121_enc_fmts,
+	.num_enc_fmts = ARRAY_SIZE(rk3588_vpu121_enc_fmts),
+	.dec_offset = 0x400,
+	.dec_fmts = rk3588_vpu121_avsd_dec_fmts,
+	.num_dec_fmts = ARRAY_SIZE(rk3588_vpu121_avsd_dec_fmts),
+	.codec = HANTRO_H264_ENCODER | HANTRO_MPEG2_DECODER |
+		 HANTRO_VP8_DECODER | HANTRO_H264_DECODER |
+		 HANTRO_AVS_DECODER,
+	.codec_ops = rk3588_vpu121_codec_ops,
+	.irqs = rk3588_vpu121_irqs,
+	.num_irqs = ARRAY_SIZE(rk3588_vpu121_irqs),
+	.init = rk3588_vpu121_hw_init,
 	.clk_names = rockchip_vpu_clk_names,
 	.num_clocks = ARRAY_SIZE(rockchip_vpu_clk_names)
 };

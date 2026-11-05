@@ -40,6 +40,7 @@ struct hantro_postproc_ops;
 #define HANTRO_HEVC_DECODER	BIT(19)
 #define HANTRO_VP9_DECODER	BIT(20)
 #define HANTRO_AV1_DECODER	BIT(21)
+#define HANTRO_AVS_DECODER	BIT(22)
 #define HANTRO_DECODERS		0xffff0000
 
 /**
@@ -123,6 +124,7 @@ struct hantro_variant {
  * @HANTRO_MODE_HEVC_DEC: HEVC decoder.
  * @HANTRO_MODE_VP9_DEC: VP9 decoder.
  * @HANTRO_MODE_AV1_DEC: AV1 decoder
+ * @HANTRO_MODE_AVS_DEC: AVS1 / AVS+ decoder
  */
 enum hantro_codec_mode {
 	HANTRO_MODE_NONE = -1,
@@ -134,6 +136,7 @@ enum hantro_codec_mode {
 	HANTRO_MODE_HEVC_DEC,
 	HANTRO_MODE_VP9_DEC,
 	HANTRO_MODE_AV1_DEC,
+	HANTRO_MODE_AVS_DEC,
 };
 
 /*
@@ -232,6 +235,10 @@ enum hantro_core_role {
  *			encoder is not exposed.
  * @empty_domain:	Empty IOMMU domain, used to reinitialize the IOMMU after
  *			a timeout. NULL if the VPU isn't behind an IOMMU.
+ * @avsd_base:		Mapped address of the AVS+ decoder registers, NULL if
+ *			the device has no AVS+ decoder.
+ * @avsd_id:		Identification register of the AVS+ decoder, 0 until
+ *			it was read.
  */
 struct hantro_dev {
 	struct v4l2_device v4l2_dev;
@@ -261,6 +268,8 @@ struct hantro_dev {
 	struct iommu_domain *attached_domain;
 	bool no_encoder;
 	struct iommu_domain *empty_domain;
+	void __iomem *avsd_base;
+	u32 avsd_id;
 };
 
 /**
@@ -297,6 +306,7 @@ struct hantro_dev {
  * @hevc_dec:		HEVC-decoding context.
  * @vp9_dec:		VP9-decoding context.
  * @av1_dec:		AV1-decoding context.
+ * @avs_dec:		AVS1 / AVS+-decoding context.
  */
 struct hantro_ctx {
 	struct hantro_dev *dev;
@@ -333,6 +343,7 @@ struct hantro_ctx {
 		struct hantro_hevc_dec_hw_ctx hevc_dec;
 		struct hantro_vp9_dec_hw_ctx vp9_dec;
 		struct hantro_av1_dec_hw_ctx av1_dec;
+		struct hantro_avs_dec_hw_ctx avs_dec;
 	};
 };
 
