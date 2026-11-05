@@ -53,7 +53,12 @@ v4l2_h264_init_reflist_builder(struct v4l2_h264_reflist_builder *b,
 	}
 
 	for (i = 0; i < V4L2_H264_NUM_DPB_ENTRIES; i++) {
-		if (!(dpb[i].flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE))
+		/*
+		 * MVC inter-view references are appended to the initial
+		 * lists by the caller, see H.8.2.1.
+		 */
+		if (!(dpb[i].flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE) ||
+		    (dpb[i].flags & V4L2_H264_DPB_ENTRY_FLAG_INTER_VIEW))
 			continue;
 
 		if (dpb[i].flags & V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM)
@@ -122,7 +127,12 @@ v4l2_h264_init_reflist_builder_gen(struct v4l2_h264_reflist_builder *b,
 	b->cur_pic_fields = fields;
 
 	for (i = 0; i < V4L2_H264_NUM_DPB_ENTRIES; i++) {
-		if (!(dpb[i].flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE))
+		/*
+		 * MVC inter-view references are appended to the initial
+		 * lists by the caller, see H.8.2.1.
+		 */
+		if (!(dpb[i].flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE) ||
+		    (dpb[i].flags & V4L2_H264_DPB_ENTRY_FLAG_INTER_VIEW))
 			continue;
 
 		if (dpb[i].flags & V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM)
