@@ -26,7 +26,7 @@ static ssize_t fill_descriptors(struct rga_dma_desc *desc, size_t max_desc,
 	dma_addr_t addr;
 
 	for_each_sgtable_dma_page(sgt, &iter, 0) {
-		if (n_desc > max_desc)
+		if (n_desc >= max_desc)
 			return -EINVAL;
 		addr = sg_page_iter_dma_address(&iter);
 		tmp->addr = lower_32_bits(addr);
@@ -79,7 +79,6 @@ static int rga_buf_init(struct vb2_buffer *vb)
 	struct rockchip_rga *rga = ctx->rga;
 	struct rga_frame *f = rga_get_frame(ctx, vb->vb2_queue->type);
 	size_t n_desc = 0;
-	u32 size = 0;
 	u8 i;
 
 	if (IS_ERR(f))
@@ -88,9 +87,12 @@ static int rga_buf_init(struct vb2_buffer *vb)
 	if (!rga_has_internal_iommu(rga))
 		return 0;
 
+	/*
+	 * Every plane is a separate buffer whose descriptors start at a new
+	 * entry, so round up the page count of each plane on its own.
+	 */
 	for (i = 0; i < f->pix.num_planes; i++)
-		size += f->pix.plane_fmt[i].sizeimage;
-	n_desc = DIV_ROUND_UP(size, PAGE_SIZE);
+		n_desc += DIV_ROUND_UP(f->pix.plane_fmt[i].sizeimage, PAGE_SIZE);
 
 	rbuf->n_desc = n_desc;
 	rbuf->dma_desc = dma_alloc_coherent(rga->cores[0]->dev,
