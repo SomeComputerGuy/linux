@@ -18,6 +18,7 @@
 #include <linux/sort.h>
 #include <linux/v4l2-controls.h>
 #include <media/v4l2-ctrls.h>
+#include <media/v4l2-enc-cbr.h>
 #include <media/v4l2-hevc.h>
 #include <media/v4l2-hevc-enc.h>
 #include <media/v4l2-hevc-enc-rbsp.h>
@@ -25,6 +26,12 @@
 
 #define RBSP_UPDATE_AUD			BIT(0)
 #define RBSP_UPDATE_PARAMETER_SETS	BIT(1)
+
+/*
+ * Constant bitrate mode: I pictures 4 QP below the P pictures, the default
+ * of the Rockchip MPP library for HEVC.
+ */
+#define RC_CBR_QP_DELTA_INTRA		4
 
 /* Table A.8: MaxLumaPs and MaxLumaSr (main tier is enough to pick a level) */
 static const struct {
@@ -150,6 +157,7 @@ int v4l2_hevc_enc_init(struct v4l2_hevc_enc *enc)
 	memset(&enc->state_next, 0, sizeof(enc->state_next));
 	memset(&enc->ref, 0, sizeof(enc->ref));
 	enc->state_serial = 0;
+	v4l2_enc_cbr_reset(&enc->cbr, RC_CBR_QP_DELTA_INTRA);
 
 	if (!enc->max_l0_refs)
 		enc->max_l0_refs = 1;
@@ -1052,6 +1060,18 @@ static int ref_step(struct v4l2_hevc_enc *enc)
 	return 0;
 }
 
+/*
+ * The core provides the constant bitrate mode unless the driver has its own
+ * rate control.
+ */
+static bool rc_core_cbr(const struct v4l2_hevc_enc *enc,
+			const struct v4l2_hevc_enc_state *state)
+{
+	return state->frame_rc_enable &&
+	       state->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_CBR &&
+	       !(enc->rc_ops && enc->rc_ops->estimate);
+}
+
 static int rc_step(struct v4l2_hevc_enc *enc)
 {
 	struct v4l2_hevc_enc_state *state = &enc->state_active;
@@ -1074,6 +1094,17 @@ static int rc_step(struct v4l2_hevc_enc *enc)
 		if (range)
 			qp -= (state->quality - state->quality_min) *
 			      (state->qp_max - state->qp_min) / range;
+	} else if (rc_core_cbr(enc, state)) {
+		ret = v4l2_enc_cbr_begin(&enc->cbr, state->bitrate,
+					 &state->timeperframe,
+					 state->sps.pic_width_in_luma_samples *
+					 state->sps.pic_height_in_luma_samples,
+					 slice_type == V4L2_HEVC_SLICE_TYPE_I,
+					 state->qp_min, state->qp_max);
+		if (ret)
+			return ret;
+
+		qp = v4l2_enc_cbr_qp(&enc->cbr);
 	} else {
 		if (!enc->rc_ops || !enc->rc_ops->estimate)
 			return -EOPNOTSUPP;
@@ -1382,6 +1413,10 @@ int v4l2_hevc_enc_complete(struct v4l2_hevc_enc *enc,
 	    !v4l2_hevc_nal_is_sub_layer_non_ref(nal_unit_type))
 		enc->ref.prev_tid0_poc = encode->pic_order_cnt_val;
 
+	if (rc_core_cbr(enc, state))
+		v4l2_enc_cbr_end(&enc->cbr, (u64)bytesused * 8,
+				 &state->timeperframe, state->qp_min,
+				 state->qp_max);
 	if (enc->rc_ops && enc->rc_ops->complete)
 		enc->rc_ops->complete(enc, state, bytesused, stats);
 
