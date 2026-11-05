@@ -317,8 +317,13 @@ queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 	 * for faster allocation. Also, no CPU access on the source queue,
 	 * so no kernel mapping needed.
 	 */
-	src_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES |
-			    DMA_ATTR_NO_KERNEL_MAPPING;
+	src_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES;
+	/*
+	 * The AVS decoder reads the bitstream to find the second field of
+	 * field coded pictures.
+	 */
+	if (!(ctx->dev->variant->codec & HANTRO_AVS_DECODER))
+		src_vq->dma_attrs |= DMA_ATTR_NO_KERNEL_MAPPING;
 	src_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
 	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	src_vq->lock = &ctx->dev->vpu_mutex;
@@ -386,6 +391,12 @@ static int hantro_try_ctrl(struct v4l2_ctrl *ctrl)
 		const struct v4l2_ctrl_av1_sequence *sequence = ctrl->p_new.p_av1_sequence;
 
 		if (sequence->bit_depth != 8 && sequence->bit_depth != 10)
+			return -EINVAL;
+	} else if (ctrl->id == V4L2_CID_STATELESS_AVS_SEQUENCE) {
+		const struct v4l2_ctrl_avs_sequence *seq = ctrl->p_new.p_avs_sequence;
+
+		/* Only 8-bit 4:2:0 */
+		if (seq->chroma_format != 1 || seq->sample_precision != 1)
 			return -EINVAL;
 	}
 
@@ -806,6 +817,22 @@ static const struct hantro_ctrl controls[] = {
 		.codec = HANTRO_AV1_DECODER,
 		.cfg = {
 			.id = V4L2_CID_STATELESS_AV1_FILM_GRAIN,
+		},
+	}, {
+		.codec = HANTRO_AVS_DECODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_AVS_SEQUENCE,
+			.ops = &hantro_ctrl_ops,
+		},
+	}, {
+		.codec = HANTRO_AVS_DECODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_AVS_PICTURE,
+		},
+	}, {
+		.codec = HANTRO_AVS_DECODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_AVS_WEIGHT_QUANT,
 		},
 	},
 };
