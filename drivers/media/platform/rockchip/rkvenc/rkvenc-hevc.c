@@ -21,7 +21,6 @@
 #include <linux/bitfield.h>
 #include <linux/bitops.h>
 #include <linux/log2.h>
-#include <linux/math64.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <media/v4l2-hevc-enc.h>
@@ -31,10 +30,6 @@
 #define RKVENC_HEVC_CTB_SIZE		64
 /* max_mrg_cnd is a 2-bit field: MaxNumMergeCand 1..3 */
 #define RKVENC_HEVC_MAX_MERGE_CAND	3
-/* Cumulative frame size error the CBR rate control tracks, in pictures */
-#define RKVENC_HEVC_RC_WINDOW		8
-/* Size of an I picture relative to the nominal picture size */
-#define RKVENC_HEVC_RC_I_RATIO		4
 
 /* Inline short-term RPS: dlt_poc_s0_m10..m13, poc_lsb_lt0..2 */
 static const struct v4l2_hevc_enc_rps_limits rkvenc_hevc_rps_limits = {
@@ -216,132 +211,6 @@ static const struct v4l2_hevc_enc_ops rkvenc_hevc_enc_ops = {
 	.rec_buffer_free = rkvenc_hevc_rec_buffer_free,
 };
 
-/* ---- constant bitrate rate control ---- */
-
-/* log2(x) in 8.8 fixed point, linear between powers of two */
-static int rkvenc_log2_q8(u64 x)
-{
-	unsigned int n;
-
-	if (!x)
-		return 0;
-
-	n = ilog2(x);
-	if (n >= 8)
-		return n * 256 + (int)((x >> (n - 8)) - 256);
-
-	return n * 256 + (int)(((x << 8) >> n) - 256);
-}
-
-static u64 rkvenc_hevc_rc_nominal(const struct v4l2_hevc_enc_state *state)
-{
-	const struct v4l2_fract *tpf = &state->timeperframe;
-
-	if (!tpf->denominator || !tpf->numerator)
-		return max(state->bitrate / 30, 1U);
-
-	return max_t(u64, div_u64((u64)state->bitrate * tpf->numerator,
-				  tpf->denominator), 1);
-}
-
-/* Starting QP of an I picture from its bits per pixel */
-static int rkvenc_hevc_rc_qp_initial(u64 bits, unsigned int pixels)
-{
-	static const struct {
-		unsigned int bpp_milli;
-		int qp;
-	} table[] = {
-		{ 1000, 22 }, { 500, 25 }, { 250, 28 }, { 120, 31 },
-		{ 60, 34 }, { 30, 37 }, { 15, 40 },
-	};
-	u64 bpp_milli = div_u64(bits * 1000, max(pixels, 1U));
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(table); i++)
-		if (bpp_milli >= table[i].bpp_milli)
-			return table[i].qp;
-
-	return 43;
-}
-
-static int rkvenc_hevc_rc_estimate(struct v4l2_hevc_enc *enc,
-				   const struct v4l2_hevc_enc_state *state,
-				   int *qp)
-{
-	struct rkvenc_hevc_ctx *hevc = container_of(enc, struct rkvenc_hevc_ctx,
-						    enc);
-	struct rkvenc_hevc_rc *rc = &hevc->rc;
-	bool intra = state->encode.slice_type == V4L2_HEVC_SLICE_TYPE_I;
-	u64 nominal = rkvenc_hevc_rc_nominal(state);
-	s64 target;
-
-	if (!state->bitrate)
-		return -EINVAL;
-
-	if (rc->bitrate != state->bitrate) {
-		unsigned int pixels = state->sps.pic_width_in_luma_samples *
-				      state->sps.pic_height_in_luma_samples;
-
-		rc->bitrate = state->bitrate;
-		rc->buffer_bits = 0;
-		rc->qp[1] = rkvenc_hevc_rc_qp_initial(nominal *
-						      RKVENC_HEVC_RC_I_RATIO,
-						      pixels);
-		rc->qp[0] = rc->qp[1] + 2;
-	}
-
-	/* Spread the accumulated error over the next pictures. */
-	target = (s64)nominal - div_s64(rc->buffer_bits, RKVENC_HEVC_RC_WINDOW);
-	target = clamp_t(s64, target, nominal / 4, nominal * 2);
-	if (intra)
-		target *= RKVENC_HEVC_RC_I_RATIO;
-
-	rc->target_bits = target;
-	*qp = rc->qp[intra];
-
-	return 0;
-}
-
-static void rkvenc_hevc_rc_complete(struct v4l2_hevc_enc *enc,
-				    const struct v4l2_hevc_enc_state *state,
-				    unsigned long bytesused,
-				    const struct v4l2_stateless_encode_stats *stats)
-{
-	struct rkvenc_hevc_ctx *hevc = container_of(enc, struct rkvenc_hevc_ctx,
-						    enc);
-	struct rkvenc_hevc_rc *rc = &hevc->rc;
-	bool intra = state->encode.slice_type == V4L2_HEVC_SLICE_TYPE_I;
-	u64 nominal = rkvenc_hevc_rc_nominal(state);
-	u64 bits = (u64)bytesused * 8;
-	s64 limit = nominal * 30;
-	int delta;
-
-	if (!rc->bitrate || !rc->target_bits)
-		return;
-
-	rc->buffer_bits = clamp_t(s64, rc->buffer_bits + (s64)bits - (s64)nominal,
-				  -limit, limit);
-
-	/*
-	 * QP + 6 halves the size: correct the frame QP by 6 * log2 of the
-	 * size error. The model works on the frame QP, not on the measured
-	 * average, which adaptive quantisation keeps a few steps below it.
-	 */
-	delta = 6 * (rkvenc_log2_q8(bits) - rkvenc_log2_q8(rc->target_bits));
-	delta = DIV_ROUND_CLOSEST(delta, 256);
-	delta = clamp(delta, -4, 4);
-
-	rc->qp[intra] = clamp(enc->qp + delta, state->qp_min, state->qp_max);
-	/* Keep P pictures from drifting far from the I pictures. */
-	if (intra)
-		rc->qp[0] = clamp(rc->qp[0], rc->qp[1] - 2, rc->qp[1] + 6);
-}
-
-static const struct v4l2_hevc_enc_rc_ops rkvenc_hevc_rc_ops = {
-	.estimate = rkvenc_hevc_rc_estimate,
-	.complete = rkvenc_hevc_rc_complete,
-};
-
 /* ---- codec ops ---- */
 
 static int rkvenc_hevc_start(struct rkvenc_ctx *ctx)
@@ -356,7 +225,6 @@ static int rkvenc_hevc_start(struct rkvenc_ctx *ctx)
 
 	enc = &hevc->enc;
 	enc->ops = &rkvenc_hevc_enc_ops;
-	enc->rc_ops = &rkvenc_hevc_rc_ops;
 	enc->private_data = ctx;
 	enc->format_mplane = &ctx->coded_fmt.fmt.pix_mp;
 	enc->timeperframe = &ctx->timeperframe;
@@ -685,7 +553,7 @@ static int rkvenc_hevc_run(struct rkvenc_ctx *ctx, struct rkvenc_core *core,
 		vepu580_setup_row_rc(core, &rkvenc_hevc_row_rc, enc->qp,
 				     clamp(state->qp_min, 0, 51),
 				     clamp(state->qp_max, 0, 51), qp_range,
-				     hevc->rc.target_bits, ctus,
+				     enc->cbr.target_bits, ctus,
 				     state->width_ctbs);
 	else
 		vepu580_setup_fixed_qp(core, enc->qp);
