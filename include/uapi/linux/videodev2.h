@@ -1897,6 +1897,8 @@ struct v4l2_ext_control {
 		struct v4l2_ctrl_h264_pred_weights __user *p_h264_pred_weights;
 		struct v4l2_ctrl_h264_slice_params __user *p_h264_slice_params;
 		struct v4l2_ctrl_h264_decode_params __user *p_h264_decode_params;
+		struct v4l2_h264_mvc_view __user *p_h264_mvc_view;
+		struct v4l2_ctrl_h264_mvc_decode_params __user *p_h264_mvc_decode_params;
 		struct v4l2_ctrl_fwht_params __user *p_fwht_params;
 		struct v4l2_ctrl_vp8_frame __user *p_vp8_frame;
 		struct v4l2_ctrl_mpeg2_sequence __user *p_mpeg2_sequence;
@@ -1975,6 +1977,8 @@ enum v4l2_ctrl_type {
 	V4L2_CTRL_TYPE_H264_DECODE_PARAMS   = 0x0204,
 	V4L2_CTRL_TYPE_H264_PRED_WEIGHTS    = 0x0205,
 	V4L2_CTRL_TYPE_H264_ENCODE_PARAMS   = 0x0206,
+	V4L2_CTRL_TYPE_H264_MVC_VIEW        = 0x0207,
+	V4L2_CTRL_TYPE_H264_MVC_DECODE_PARAMS = 0x0208,
 
 	V4L2_CTRL_TYPE_FWHT_PARAMS	    = 0x0220,
 

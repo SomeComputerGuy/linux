@@ -458,6 +458,12 @@ void v4l2_ctrl_type_op_log(const struct v4l2_ctrl *ctrl)
 	case V4L2_CTRL_TYPE_H264_ENCODE_PARAMS:
 		pr_cont("H264_ENCODE_PARAMS");
 		break;
+	case V4L2_CTRL_TYPE_H264_MVC_VIEW:
+		pr_cont("H264_MVC_VIEW");
+		break;
+	case V4L2_CTRL_TYPE_H264_MVC_DECODE_PARAMS:
+		pr_cont("H264_MVC_DECODE_PARAMS");
+		break;
 	case V4L2_CTRL_TYPE_FWHT_PARAMS:
 		pr_cont("FWHT_PARAMS");
 		break;
@@ -1332,6 +1338,8 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 	struct v4l2_ctrl_h264_slice_params *p_h264_slice_params;
 	struct v4l2_ctrl_h264_decode_params *p_h264_dec_params;
 	struct v4l2_ctrl_h264_encode_params *p_h264_enc_params;
+	struct v4l2_ctrl_h264_mvc_decode_params *p_h264_mvc_dec_params;
+	struct v4l2_h264_mvc_view *p_h264_mvc_view;
 	struct v4l2_ctrl_hevc_ext_sps_lt_rps *p_hevc_lt_rps;
 	struct v4l2_ctrl_hevc_ext_sps_st_rps *p_hevc_st_rps;
 	struct v4l2_ctrl_hevc_sps *p_hevc_sps;
@@ -1553,9 +1561,53 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 			struct v4l2_h264_dpb_entry *dpb_entry =
 				&p_h264_dec_params->dpb[i];
 
+			/* MVC inter-view references are short-term. */
+			if (dpb_entry->view_order_idx >= V4L2_H264_MVC_MAX_VIEWS ||
+			    ((dpb_entry->flags & V4L2_H264_DPB_ENTRY_FLAG_INTER_VIEW) &&
+			     (dpb_entry->flags & V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM)))
+				return -EINVAL;
+			dpb_entry->reserved0 = 0;
 			zero_reserved(*dpb_entry);
 		}
 		zero_reserved(*p_h264_dec_params);
+		break;
+
+	case V4L2_CTRL_TYPE_H264_MVC_VIEW:
+		p_h264_mvc_view = p;
+
+		if (p_h264_mvc_view->num_anchor_refs_l0 > V4L2_H264_MVC_MAX_VIEW_REFS ||
+		    p_h264_mvc_view->num_anchor_refs_l1 > V4L2_H264_MVC_MAX_VIEW_REFS ||
+		    p_h264_mvc_view->num_non_anchor_refs_l0 > V4L2_H264_MVC_MAX_VIEW_REFS ||
+		    p_h264_mvc_view->num_non_anchor_refs_l1 > V4L2_H264_MVC_MAX_VIEW_REFS)
+			return -EINVAL;
+		/* The base view (VOIdx 0) has no inter-view references. */
+		if (!idx && (p_h264_mvc_view->num_anchor_refs_l0 ||
+			     p_h264_mvc_view->num_anchor_refs_l1 ||
+			     p_h264_mvc_view->num_non_anchor_refs_l0 ||
+			     p_h264_mvc_view->num_non_anchor_refs_l1))
+			return -EINVAL;
+		for (i = p_h264_mvc_view->num_anchor_refs_l0;
+		     i < V4L2_H264_MVC_MAX_VIEW_REFS; i++)
+			p_h264_mvc_view->anchor_ref_l0[i] = 0;
+		for (i = p_h264_mvc_view->num_anchor_refs_l1;
+		     i < V4L2_H264_MVC_MAX_VIEW_REFS; i++)
+			p_h264_mvc_view->anchor_ref_l1[i] = 0;
+		for (i = p_h264_mvc_view->num_non_anchor_refs_l0;
+		     i < V4L2_H264_MVC_MAX_VIEW_REFS; i++)
+			p_h264_mvc_view->non_anchor_ref_l0[i] = 0;
+		for (i = p_h264_mvc_view->num_non_anchor_refs_l1;
+		     i < V4L2_H264_MVC_MAX_VIEW_REFS; i++)
+			p_h264_mvc_view->non_anchor_ref_l1[i] = 0;
+		zero_reserved(*p_h264_mvc_view);
+		break;
+
+	case V4L2_CTRL_TYPE_H264_MVC_DECODE_PARAMS:
+		p_h264_mvc_dec_params = p;
+
+		if (p_h264_mvc_dec_params->view_order_idx >= V4L2_H264_MVC_MAX_VIEWS)
+			return -EINVAL;
+		p_h264_mvc_dec_params->reserved0 = 0;
+		zero_reserved(*p_h264_mvc_dec_params);
 		break;
 
 	case V4L2_CTRL_TYPE_H264_ENCODE_PARAMS:
@@ -2515,6 +2567,12 @@ static struct v4l2_ctrl *v4l2_ctrl_new(struct v4l2_ctrl_handler *hdl,
 		break;
 	case V4L2_CTRL_TYPE_H264_ENCODE_PARAMS:
 		elem_size = sizeof(struct v4l2_ctrl_h264_encode_params);
+		break;
+	case V4L2_CTRL_TYPE_H264_MVC_VIEW:
+		elem_size = sizeof(struct v4l2_h264_mvc_view);
+		break;
+	case V4L2_CTRL_TYPE_H264_MVC_DECODE_PARAMS:
+		elem_size = sizeof(struct v4l2_ctrl_h264_mvc_decode_params);
 		break;
 	case V4L2_CTRL_TYPE_VP8_FRAME:
 		elem_size = sizeof(struct v4l2_ctrl_vp8_frame);
