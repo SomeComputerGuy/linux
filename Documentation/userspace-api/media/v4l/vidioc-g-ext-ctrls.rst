@@ -310,6 +310,22 @@ still cause this situation.
       - ``p_av1_film_grain``
       - A pointer to a struct :c:type:`v4l2_ctrl_av1_film_grain`. Valid if this control is
         of type ``V4L2_CTRL_TYPE_AV1_FILM_GRAIN``.
+    * - struct :c:type:`v4l2_ctrl_avs2_sequence` *
+      - ``p_avs2_sequence``
+      - A pointer to a struct :c:type:`v4l2_ctrl_avs2_sequence`. Valid if this control is
+        of type ``V4L2_CTRL_TYPE_AVS2_SEQUENCE``.
+    * - struct :c:type:`v4l2_ctrl_avs2_picture` *
+      - ``p_avs2_picture``
+      - A pointer to a struct :c:type:`v4l2_ctrl_avs2_picture`. Valid if this control is
+        of type ``V4L2_CTRL_TYPE_AVS2_PICTURE``.
+    * - struct :c:type:`v4l2_ctrl_avs2_weight_quant` *
+      - ``p_avs2_weight_quant``
+      - A pointer to a struct :c:type:`v4l2_ctrl_avs2_weight_quant`. Valid if this control is
+        of type ``V4L2_CTRL_TYPE_AVS2_WEIGHT_QUANT``.
+    * - struct :c:type:`v4l2_ctrl_avs2_alf` *
+      - ``p_avs2_alf``
+      - A pointer to a struct :c:type:`v4l2_ctrl_avs2_alf`. Valid if this control is
+        of type ``V4L2_CTRL_TYPE_AVS2_ALF``.
     * - struct :c:type:`v4l2_ctrl_hdr10_cll_info` *
       - ``p_hdr10_cll_info``
       - A pointer to a struct :c:type:`v4l2_ctrl_hdr10_cll_info`. Valid if this control is
