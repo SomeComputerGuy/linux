@@ -17,24 +17,30 @@
 
 #include "rga.h"
 
-static ssize_t fill_descriptors(struct rga_dma_desc *desc, size_t max_desc,
-				struct sg_table *sgt)
+/*
+ * Map the first n_desc pages of the buffer. An imported DMA-BUF can be larger
+ * than the plane (padding, or a buffer allocated for a larger frame), so the
+ * pages past the plane are left out instead of making the buffer invalid.
+ */
+static int fill_descriptors(struct rga_dma_desc *desc, size_t n_desc,
+			    struct sg_table *sgt)
 {
 	struct sg_dma_page_iter iter;
 	struct rga_dma_desc *tmp = desc;
-	size_t n_desc = 0;
+	size_t filled = 0;
 	dma_addr_t addr;
 
 	for_each_sgtable_dma_page(sgt, &iter, 0) {
-		if (n_desc >= max_desc)
-			return -EINVAL;
+		if (filled == n_desc)
+			break;
 		addr = sg_page_iter_dma_address(&iter);
 		tmp->addr = lower_32_bits(addr);
 		tmp++;
-		n_desc++;
+		filled++;
 	}
 
-	return n_desc;
+	/* vb2 checks the buffer size, a shorter mapping isn't expected */
+	return filled == n_desc ? 0 : -EINVAL;
 }
 
 static int
@@ -127,9 +133,9 @@ static int rga_buf_prepare(struct vb2_buffer *vb)
 	struct rga_vb_buffer *rbuf = vb_to_rga(vbuf);
 	struct rga_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
 	struct rga_frame *f = rga_get_frame(ctx, vb->vb2_queue->type);
-	ssize_t n_desc = 0;
+	size_t n_desc;
 	size_t curr_desc = 0;
-	int i;
+	int i, ret;
 	const struct v4l2_format_info *info;
 	dma_addr_t dma_addrs[VIDEO_MAX_PLANES];
 
@@ -148,13 +154,15 @@ static int rga_buf_prepare(struct vb2_buffer *vb)
 
 		if (rga_has_internal_iommu(ctx->rga)) {
 			/* Create local MMU table for RGA */
-			n_desc = fill_descriptors(&rbuf->dma_desc[curr_desc],
-						  rbuf->n_desc - curr_desc,
-						  vb2_dma_sg_plane_desc(vb, i));
-			if (n_desc < 0) {
+			n_desc = DIV_ROUND_UP(f->pix.plane_fmt[i].sizeimage,
+					      PAGE_SIZE);
+			ret = fill_descriptors(&rbuf->dma_desc[curr_desc],
+					       n_desc,
+					       vb2_dma_sg_plane_desc(vb, i));
+			if (ret) {
 				v4l2_err(&ctx->rga->v4l2_dev,
 					 "Failed to map video buffer to RGA\n");
-				return n_desc;
+				return ret;
 			}
 			dma_addrs[i] = curr_desc << PAGE_SHIFT;
 			curr_desc += n_desc;
