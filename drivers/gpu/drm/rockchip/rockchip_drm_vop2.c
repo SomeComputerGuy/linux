@@ -442,9 +442,9 @@ static bool vop2_half_block_enable(struct drm_plane_state *pstate)
 }
 
 static u32 vop2_afbc_transform_offset(struct drm_plane_state *pstate,
+				      const struct drm_rect *src,
 				      bool afbc_half_block_en)
 {
-	struct drm_rect *src = &pstate->src;
 	struct drm_framebuffer *fb = pstate->fb;
 	u32 bpp = vop2_get_bpp(fb->format);
 	u32 vir_width = (fb->pitches[0] << 3) / bpp;
@@ -1379,20 +1379,22 @@ struct vop2_axi_fetch {
 	u8 vp;
 };
 
-static void vop2_plane_axi_fetch(const struct drm_plane_state *pstate, u8 vp_id,
-				 const struct drm_display_mode *mode,
-				 struct vop2_axi_fetch *f)
+static void vop2_win_axi_fetch(const struct drm_plane_state *pstate,
+			       const struct drm_rect *src,
+			       const struct drm_rect *dst, u8 vp_id,
+			       const struct drm_display_mode *mode,
+			       struct vop2_axi_fetch *f)
 {
 	u32 bpp = vop2_get_bpp(pstate->fb->format);
-	u32 src_w = drm_rect_width(&pstate->src) >> 16;
-	u32 src_h = drm_rect_height(&pstate->src) >> 16;
-	u32 dsp_h = drm_rect_height(&pstate->dst);
+	u32 src_w = drm_rect_width(src) >> 16;
+	u32 src_h = drm_rect_height(src) >> 16;
+	u32 dsp_h = drm_rect_height(dst);
 	u64 line;
 
 	f->load = (u64)src_w * src_h * bpp / 8 * drm_mode_vrefresh(mode);
 	f->vp = vp_id;
-	f->y1 = pstate->dst.y1;
-	f->y2 = pstate->dst.y2;
+	f->y1 = dst->y1;
+	f->y2 = dst->y2;
 	f->peak = 0;
 
 	if (!dsp_h || !mode->crtc_htotal)
@@ -1584,8 +1586,9 @@ static int vop2_axi_check(struct vop2 *vop2, struct drm_atomic_commit *state)
 			continue;
 		}
 
-		vop2_plane_axi_fetch(pstate, to_vop2_video_port(pstate->crtc)->id,
-				     &cstate->adjusted_mode, &s[i].f);
+		vop2_win_axi_fetch(pstate, &pstate->src, &pstate->dst,
+				   to_vop2_video_port(pstate->crtc)->id,
+				   &cstate->adjusted_mode, &s[i].f);
 		s[i].active = true;
 	}
 
@@ -1665,11 +1668,11 @@ static void vop2_plane_atomic_disable(struct drm_plane *plane,
  * The color key is 10 bit, so all format should
  * convert to 10 bit here.
  */
-static void vop2_plane_setup_color_key(struct drm_plane *plane, u32 color_key)
+static void vop2_win_setup_color_key(struct vop2_win *win,
+				     struct drm_plane_state *pstate,
+				     u32 color_key)
 {
-	struct drm_plane_state *pstate = plane->state;
 	struct drm_framebuffer *fb = pstate->fb;
-	struct vop2_win *win = to_vop2_win(plane);
 	u32 color_key_en = 0;
 	u32 r = 0;
 	u32 g = 0;
@@ -1711,14 +1714,17 @@ static void vop2_plane_setup_color_key(struct drm_plane *plane, u32 color_key)
 	vop2_win_write(win, VOP2_WIN_COLOR_KEY, (r << 20) | (g << 10) | b);
 }
 
-static void vop2_plane_atomic_update(struct drm_plane *plane,
-				     struct drm_atomic_commit *state)
+/*
+ * Program a window with the source rectangle src of the framebuffer of
+ * pstate, shown at dest in an active area width pixels wide of video port
+ * vp.
+ */
+static void vop2_win_update(struct vop2_win *win, struct vop2_video_port *vp,
+			    struct drm_plane_state *pstate,
+			    const struct drm_rect *src, const struct drm_rect *dest,
+			    u16 width)
 {
-	struct drm_plane_state *pstate = plane->state;
-	struct drm_crtc *crtc = pstate->crtc;
-	struct vop2_win *win = to_vop2_win(plane);
-	struct vop2_video_port *vp = to_vop2_video_port(crtc);
-	struct drm_display_mode *adjusted_mode = &crtc->state->adjusted_mode;
+	struct drm_display_mode *adjusted_mode = &vp->crtc.state->adjusted_mode;
 	struct vop2 *vop2 = win->vop2;
 	struct drm_framebuffer *fb = pstate->fb;
 	u32 bpp = vop2_get_bpp(fb->format);
@@ -1728,8 +1734,6 @@ static void vop2_plane_atomic_update(struct drm_plane *plane,
 	u32 afbc_format;
 	u32 rb_swap;
 	u32 uv_swap;
-	struct drm_rect *src = &pstate->src;
-	struct drm_rect *dest = &pstate->dst;
 	u32 afbc_tile_num;
 	u32 transform_offset;
 	bool dither_up;
@@ -1743,20 +1747,6 @@ static void vop2_plane_atomic_update(struct drm_plane *plane,
 	bool afbc_en;
 	dma_addr_t yrgb_mst;
 	dma_addr_t uv_mst;
-
-	/*
-	 * can't update plane when vop2 is disabled.
-	 */
-	if (WARN_ON(!crtc))
-		return;
-
-	if (!vp->enabled)
-		return;
-
-	if (!pstate->visible) {
-		vop2_plane_atomic_disable(plane, state);
-		return;
-	}
 
 	afbc_en = drm_is_afbc(fb->modifier);
 
@@ -1797,7 +1787,7 @@ static void vop2_plane_atomic_update(struct drm_plane *plane,
 	/* drm_atomic_helper_check_plane_state calls drm_rect_clip_scaled for
 	 * us, which keeps our planes bounded within the CRTC active area
 	 */
-	if (WARN_ON(dest->x1 + dsp_w > adjusted_mode->hdisplay) ||
+	if (WARN_ON(dest->x1 + dsp_w > width) ||
 	    WARN_ON(dest->y1 + dsp_h > adjusted_mode->vdisplay) ||
 	    WARN_ON(dsp_w < 4) || WARN_ON(dsp_h < 4) ||
 	    WARN_ON(src_w < 4) || WARN_ON(src_h < 4))
@@ -1822,7 +1812,7 @@ static void vop2_plane_atomic_update(struct drm_plane *plane,
 	if (vop2->version > VOP_VERSION_RK3568) {
 		struct vop2_axi_fetch f;
 
-		vop2_plane_axi_fetch(pstate, vp->id, adjusted_mode, &f);
+		vop2_win_axi_fetch(pstate, src, dest, vp->id, adjusted_mode, &f);
 		vop2_win_write(win, VOP2_WIN_AXI_BUS_ID, vop2_win_get_axi_bus(win, &f));
 		vop2_win_write(win, VOP2_WIN_AXI_YRGB_R_ID, win->data->axi_yrgb_r_id);
 		vop2_win_write(win, VOP2_WIN_AXI_UV_R_ID, win->data->axi_uv_r_id);
@@ -1897,7 +1887,7 @@ static void vop2_plane_atomic_update(struct drm_plane *plane,
 			vop2_win_write(win, VOP2_WIN_AFBC_PLD_OFFSET, yrgb_mst);
 		}
 
-		transform_offset = vop2_afbc_transform_offset(pstate, half_block_en);
+		transform_offset = vop2_afbc_transform_offset(pstate, src, half_block_en);
 		vop2_win_write(win, VOP2_WIN_AFBC_HDR_PTR, yrgb_mst);
 		vop2_win_write(win, VOP2_WIN_AFBC_PIC_SIZE, act_info);
 		vop2_win_write(win, VOP2_WIN_TRANSFORM_OFFSET, transform_offset);
@@ -1940,7 +1930,7 @@ static void vop2_plane_atomic_update(struct drm_plane *plane,
 
 	vop2_setup_scale(vop2, win, src_w, src_h, dsp_w, dsp_h, fb->format->format);
 	if (!vop2_cluster_window(win))
-		vop2_plane_setup_color_key(plane, 0);
+		vop2_win_setup_color_key(win, pstate, 0);
 	vop2_win_write(win, VOP2_WIN_ACT_INFO, act_info);
 	vop2_win_write(win, VOP2_WIN_DSP_INFO, dsp_info);
 	vop2_win_write(win, VOP2_WIN_DSP_ST, dest->y1 << 16 | (dest->x1 & 0xffff));
@@ -1958,6 +1948,32 @@ static void vop2_plane_atomic_update(struct drm_plane *plane,
 		vop2_win_write(win, VOP2_WIN_CLUSTER_LB_MODE, lb_mode);
 		vop2_win_write(win, VOP2_WIN_CLUSTER_ENABLE, 1);
 	}
+}
+
+static void vop2_plane_atomic_update(struct drm_plane *plane,
+				     struct drm_atomic_commit *state)
+{
+	struct drm_plane_state *pstate = plane->state;
+	struct drm_crtc *crtc = pstate->crtc;
+	struct vop2_win *win = to_vop2_win(plane);
+	struct vop2_video_port *vp = to_vop2_video_port(crtc);
+
+	/*
+	 * can't update plane when vop2 is disabled.
+	 */
+	if (WARN_ON(!crtc))
+		return;
+
+	if (!vp->enabled)
+		return;
+
+	if (!pstate->visible) {
+		vop2_plane_atomic_disable(plane, state);
+		return;
+	}
+
+	vop2_win_update(win, vp, pstate, &pstate->src, &pstate->dst,
+			crtc->state->adjusted_mode.hdisplay);
 }
 
 static const struct drm_plane_helper_funcs vop2_plane_helper_funcs = {
