@@ -1278,11 +1278,19 @@ out_unlock:
  * video port shows the left half of the active area, its splice video
  * port the right half, both on the timing of the first one.
  */
+/* TEST: splice every mode of the splice video port at the next modeset */
+static bool splice_force;
+module_param(splice_force, bool, 0644);
+MODULE_PARM_DESC(splice_force, "TEST: splice VP0 on every modeset");
+
 static bool vop2_crtc_wants_splice(struct vop2_video_port *vp,
 				   const struct drm_crtc_state *crtc_state)
 {
 	if (vp->vop2->splice_master != vp || !crtc_state->enable)
 		return false;
+
+	if (READ_ONCE(splice_force) && !(crtc_state->adjusted_mode.hdisplay % 8))
+		return true;
 
 	return crtc_state->adjusted_mode.hdisplay > vp->data->max_output.width;
 }
