@@ -867,6 +867,16 @@ static int vidioc_s_selection(struct file *file, void *priv,
 		rect->top = 0;
 		rect->width = ctx->src_fmt.width;
 		rect->height = ctx->src_fmt.height;
+	} else if (ctx->vpu_dst_fmt->codec_mode == HANTRO_MODE_H264_ENC) {
+		/*
+		 * H.264 crops in units of 2 luma samples for 4:2:0 (the SPS
+		 * frame_crop_*_offset). The right overfill register counts 4
+		 * pixel units, so a 2 pixel crop is not filled by the hardware:
+		 * those source columns are read from the buffer, which spans
+		 * whole macroblocks, and fall outside the cropped picture.
+		 */
+		rect->width = round_up(rect->width, 2);
+		rect->height = round_up(rect->height, 2);
 	} else {
 		/* We support widths aligned to 4 pixels and arbitrary heights. */
 		rect->width = round_up(rect->width, 4);
