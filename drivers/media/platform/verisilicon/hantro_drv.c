@@ -363,6 +363,9 @@ queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 
 static int hantro_try_ctrl(struct v4l2_ctrl *ctrl)
 {
+	struct hantro_ctx *ctx = container_of(ctrl->handler,
+					      struct hantro_ctx, ctrl_handler);
+
 	if (ctrl->id == V4L2_CID_STATELESS_H264_SPS) {
 		const struct v4l2_ctrl_h264_sps *sps = ctrl->p_new.p_h264_sps;
 
@@ -395,16 +398,19 @@ static int hantro_try_ctrl(struct v4l2_ctrl *ctrl)
 	} else if (ctrl->id == V4L2_CID_STATELESS_MPEG2_SEQUENCE) {
 		const struct v4l2_ctrl_mpeg2_sequence *seq = ctrl->p_new.p_mpeg2_sequence;
 
-		/* No MPEG-1 decoding mode is implemented */
-		if (seq->flags & V4L2_MPEG2_SEQ_FLAG_MPEG1)
+		if (seq->flags & V4L2_MPEG2_SEQ_FLAG_MPEG1 &&
+		    !ctx->dev->variant->mpeg1_dec)
 			return -EINVAL;
 	} else if (ctrl->id == V4L2_CID_STATELESS_MPEG2_PICTURE) {
 		const struct v4l2_ctrl_mpeg2_picture *pic = ctrl->p_new.p_mpeg2_picture;
 
-		/* D-pictures and full pel vectors only exist in MPEG-1 */
-		if (pic->picture_coding_type == V4L2_MPEG2_PIC_CODING_TYPE_D ||
-		    pic->flags & (V4L2_MPEG2_PIC_FLAG_FULL_PEL_FORWARD |
-				  V4L2_MPEG2_PIC_FLAG_FULL_PEL_BACKWARD))
+		/* The MPEG-1 mode has no D-picture (DC only) decoding */
+		if (pic->picture_coding_type == V4L2_MPEG2_PIC_CODING_TYPE_D)
+			return -EINVAL;
+		/* Full pel vectors only exist in MPEG-1 */
+		if (pic->flags & (V4L2_MPEG2_PIC_FLAG_FULL_PEL_FORWARD |
+				  V4L2_MPEG2_PIC_FLAG_FULL_PEL_BACKWARD) &&
+		    !ctx->dev->variant->mpeg1_dec)
 			return -EINVAL;
 	} else if (ctrl->id == V4L2_CID_STATELESS_AVS_SEQUENCE) {
 		const struct v4l2_ctrl_avs_sequence *seq = ctrl->p_new.p_avs_sequence;
