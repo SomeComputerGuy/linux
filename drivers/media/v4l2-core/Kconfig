@@ -44,9 +44,14 @@ config V4L2_JPEG_HELPER
 config V4L2_H264
 	tristate
 
+# Used by the stateless encode cores that need v4l2-enc-cbr.ko
+config V4L2_ENC_CBR
+	tristate
+
 # Used by drivers that need v4l2-h264-enc.ko
 config V4L2_H264_ENC
 	tristate
+	select V4L2_ENC_CBR
 
 # Used by drivers that need v4l2-hevc-enc-rbsp.ko
 config V4L2_HEVC_ENC_RBSP

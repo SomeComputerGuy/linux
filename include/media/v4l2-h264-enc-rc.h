@@ -10,6 +10,7 @@
 
 #include <linux/types.h>
 #include <linux/v4l2-controls.h>
+#include <media/v4l2-enc-cbr.h>
 #include <media/v4l2-h264.h>
 
 #define V4L2_H264_ENC_RC_STATS_TYPE_COUNT	10
@@ -83,38 +84,6 @@ struct v4l2_h264_enc_rc_stats {
 	unsigned int index;
 };
 
-/**
- * struct v4l2_h264_enc_rc_cbr - constant bitrate mode state
- * @bitrate: bitrate the state was set up for, 0 before the first picture
- * @nominal: nominal picture size in bits (bitrate times frame interval)
- * @qp_q8: QP of the P pictures in 1/256 units, -1 before the first picture
- * @ratio: I/P picture size ratio in 1/16 units
- * @gop: measured IDR period in pictures, 0 until two I pictures were seen
- * @since_i: pictures coded since the last I picture
- * @seen_i: an I picture was coded
- * @intra: the current picture is an I picture
- * @p_bits: running mean of the P picture sizes
- * @i_bits: size of the last I picture
- * @buffer_bits: accumulated difference between the coded and nominal sizes
- * @plan_bits: planned size of the current picture
- * @target_bits: size target of the current picture
- */
-struct v4l2_h264_enc_rc_cbr {
-	u32 bitrate;
-	u64 nominal;
-	int qp_q8;
-	unsigned int ratio;
-	unsigned int gop;
-	unsigned int since_i;
-	bool seen_i;
-	bool intra;
-	u64 p_bits;
-	u64 i_bits;
-	s64 buffer_bits;
-	u64 plan_bits;
-	u64 target_bits;
-};
-
 struct v4l2_h264_enc_rc {
 	const struct v4l2_h264_enc_rc_ops *ops;
 	void *private_data;
@@ -124,7 +93,7 @@ struct v4l2_h264_enc_rc {
 	void *mode_data;
 
 	struct v4l2_h264_enc_rc_stats stats;
-	struct v4l2_h264_enc_rc_cbr cbr;
+	struct v4l2_enc_cbr cbr;
 	unsigned long size;
 	unsigned int qp;
 };
