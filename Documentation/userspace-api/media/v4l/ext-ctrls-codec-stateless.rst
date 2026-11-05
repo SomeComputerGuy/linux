@@ -1495,9 +1495,11 @@ FWHT Flags
       - 0x02
       - The sequence is an ISO/IEC 11172-2 (MPEG-1) sequence: the inverse
 	quantisation uses the MPEG-1 mismatch control, motion vectors may be
-	full pel and pictures may be D-pictures. MPEG-1 has no sequence or
-	picture extensions: applications set the fields as ISO/IEC 13818-2
-	defines them for MPEG-1 bitstreams (chroma_format 1,
+	full pel and pictures may be D-pictures. Applications set this flag
+	if and only if the coded format is ``V4L2_PIX_FMT_MPEG1_SLICE``;
+	drivers reject it with ``V4L2_PIX_FMT_MPEG2_SLICE``. MPEG-1 has no
+	sequence or picture extensions: applications set the fields as
+	ISO/IEC 13818-2 defines them for MPEG-1 bitstreams (chroma_format 1,
 	V4L2_MPEG2_SEQ_FLAG_PROGRESSIVE, frame pictures with
 	V4L2_MPEG2_PIC_FLAG_FRAME_PRED_DCT and V4L2_MPEG2_PIC_FLAG_PROGRESSIVE,
 	intra_dc_precision 0, both components of ``f_code[0]`` set to
