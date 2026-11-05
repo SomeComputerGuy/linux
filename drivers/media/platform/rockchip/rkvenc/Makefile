@@ -5,4 +5,5 @@ rockchip-venc-y += \
 		rkvenc.o \
 		rkvenc-h264.o \
 		rkvenc-hevc.o \
+		rkvenc-rc.o \
 		rkvenc-vepu580.o
