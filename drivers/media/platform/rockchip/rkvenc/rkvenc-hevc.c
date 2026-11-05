@@ -218,6 +218,21 @@ static const struct v4l2_hevc_enc_ops rkvenc_hevc_enc_ops = {
 
 /* ---- constant bitrate rate control ---- */
 
+/* log2(x) in 8.8 fixed point, linear between powers of two */
+static int rkvenc_log2_q8(u64 x)
+{
+	unsigned int n;
+
+	if (!x)
+		return 0;
+
+	n = ilog2(x);
+	if (n >= 8)
+		return n * 256 + (int)((x >> (n - 8)) - 256);
+
+	return n * 256 + (int)(((x << 8) >> n) - 256);
+}
+
 static u64 rkvenc_hevc_rc_nominal(const struct v4l2_hevc_enc_state *state)
 {
 	const struct v4l2_fract *tpf = &state->timeperframe;
