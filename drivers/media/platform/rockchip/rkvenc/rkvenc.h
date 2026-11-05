@@ -198,64 +198,12 @@ struct rkvenc_dev {
 };
 
 /**
- * struct rkvenc_rc - constant bitrate frame rate control (rkvenc-rc.c)
- * @bitrate: bitrate the state was set up for, 0 before the first picture
- * @nominal: nominal picture size in bits (bitrate times frame interval)
- * @qp_q8: QP of the P pictures in 1/256 units, -1 before the first picture
- * @ratio: I/P picture size ratio in 1/16 units
- * @gop: measured IDR period in pictures, 0 until two I pictures were seen
- * @since_i: P pictures coded since the last I picture
- * @seen_i: an I picture was coded
- * @intra: the current picture is an I picture
- * @p_bits: running mean of the P picture sizes
- * @i_bits: size of the last I picture
- * @buffer_bits: accumulated difference between the coded and nominal sizes
- * @plan_bits: planned size of the current picture
- * @target_bits: size target of the current picture
- */
-struct rkvenc_rc {
-	u32 bitrate;
-	u64 nominal;
-	int qp_q8;
-	unsigned int ratio;
-	unsigned int gop;
-	unsigned int since_i;
-	bool seen_i;
-	bool intra;
-	u64 p_bits;
-	u64 i_bits;
-	s64 buffer_bits;
-	u64 plan_bits;
-	u64 target_bits;
-};
-
-/**
- * struct rkvenc_rc_codec - codec parameters of the rate control
- * @ip_delta: QP of the I pictures below the QP of the P pictures
- * @ratio_init: initial I/P picture size ratio, 1/16 units
- * @qp_initial: QP of an I picture of @bits bits with @pixels luma samples
- */
-struct rkvenc_rc_codec {
-	int ip_delta;
-	unsigned int ratio_init;
-	int (*qp_initial)(u64 bits, unsigned int pixels);
-};
-
-int rkvenc_log2_q8(u64 x);
-int rkvenc_rc_estimate(struct rkvenc_rc *rc, const struct rkvenc_rc_codec *codec,
-		       u32 bitrate, const struct v4l2_fract *tpf,
-		       unsigned int pixels, bool intra, int qp_min, int qp_max);
-void rkvenc_rc_complete(struct rkvenc_rc *rc, u64 bits, int qp_min, int qp_max);
-
-/**
  * struct rkvenc_h264_ctx - H.264 per-context state
  * @enc: H.264 stateless encode core
- * @rc: constant bitrate rate control
  * @hw_rc: the current picture uses the hardware row rate control
  */
 struct rkvenc_h264_ctx {
 	struct v4l2_h264_enc enc;
-	struct rkvenc_rc rc;
 	bool hw_rc;
 };
 
