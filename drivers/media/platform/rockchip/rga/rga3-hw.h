@@ -183,6 +183,8 @@
 #define RGA3_WIN_SCALE_HOR_BYPASS BIT(20)
 #define RGA3_WIN_YC_SWAP BIT(13)
 #define RGA3_WIN_RBUV_SWAP BIT(12)
+#define RGA3_WIN_YUV10B_ENDIAN BIT(11)
+#define RGA3_WIN_YUV10B_COMPACT BIT(10)
 #define RGA3_WIN_RD_FORMAT GENMASK(9, 8)
 #define RGA3_WIN_PIC_FORMAT GENMASK(7, 4)
 #define RGA3_WIN_ENABLE BIT(0)
@@ -199,14 +201,24 @@
 #define RGA3_WR_YC_SWAP BIT(20)
 #define RGA3_WR_SW_OUTSTANDING_MAX GENMASK(18, 13)
 #define RGA3_WR_RBUV_SWAP BIT(12)
+#define RGA3_WR_YUV10B_ENDIAN BIT(11)
+#define RGA3_WR_YUV10B_COMPACT BIT(10)
 #define RGA3_WR_FORMAT GENMASK(9, 8)
 #define RGA3_WR_PIC_FORMAT GENMASK(7, 4)
 
+/*
+ * 10-bit YUV in raster mode is either compact (4 samples packed into 5 bytes,
+ * as NV15) or one sample per 16-bit word. The endian bit only applies to the
+ * latter. Userspace using the vendor librga sets it for P010, whose samples
+ * are in the upper 10 bits of little-endian words.
+ */
 struct rga3_fmt {
 	u32 fourcc;
 	u8 hw_format;
 	bool rbuv_swap;
 	bool yc_swap;
+	bool yuv10b_compact;
+	bool yuv10b_endian;
 };
 
 #endif
