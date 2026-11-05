@@ -226,6 +226,8 @@ struct rkvenc_ctx {
 	struct v4l2_ctrl_handler ctrl_hdl;
 	struct rkvenc_core *core;
 	struct v4l2_ctrl *avg_qp_ctrl;
+	/* External line buffer, only for pictures wider than 4096 pixels. */
+	struct rkvenc_aux_buf line_buf;
 	void *priv;
 	bool started;
 };
@@ -249,6 +251,8 @@ static inline void rkvenc_or(struct rkvenc_core *core, u32 reg, u32 val)
 int rkvenc_alloc_aux(struct rkvenc_dev *rkvenc, struct rkvenc_aux_buf *buf,
 		     size_t size, bool kernel_mapping);
 void rkvenc_free_aux(struct rkvenc_dev *rkvenc, struct rkvenc_aux_buf *buf);
+int vepu580_alloc_line_buf(struct rkvenc_ctx *ctx);
+void vepu580_free_line_buf(struct rkvenc_ctx *ctx);
 void vepu580_setup_common(struct rkvenc_ctx *ctx, struct rkvenc_core *core,
 			  struct rkvenc_run *run);
 void vepu580_setup_me(struct rkvenc_core *core, unsigned int width_mbs,
