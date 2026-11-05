@@ -228,6 +228,11 @@ static int rga_buf_prepare_streaming(struct vb2_queue *q)
 	const struct rga_hw *hw = ctx->rga->hw;
 	int ret;
 
+	/* The input format can have changed since the rotation was set */
+	ret = rga_check_rotation(hw, ctx->in.fmt, ctx->rotate);
+	if (ret < 0)
+		return ret;
+
 	/* It's safe to check the streaming state of the other queue,
 	 * as the streamon ioctl's can't race due to the lock set in
 	 * the queue_init function.

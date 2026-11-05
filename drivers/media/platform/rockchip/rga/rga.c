@@ -310,6 +310,9 @@ static int rga_s_ctrl(struct v4l2_ctrl *ctrl)
 		ctx->vflip = ctrl->val;
 		break;
 	case V4L2_CID_ROTATE:
+		ret = rga_check_rotation(hw, ctx->in.fmt, ctrl->val);
+		if (ret < 0)
+			goto s_ctrl_done;
 		if (vb2_is_streaming(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)) &&
 		    vb2_is_streaming(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx))) {
 			ret = rga_check_scaling(hw, &ctx->in.crop,
@@ -394,6 +397,15 @@ int rga_check_scaling(const struct rga_hw *hw, const struct v4l2_rect *crop_in,
 		return -EINVAL;
 
 	if (!check_scaling_factor(hw, crop_in->height, scaled_height))
+		return -EINVAL;
+
+	return 0;
+}
+
+int rga_check_rotation(const struct rga_hw *hw, const void *in_fmt, u32 rotate)
+{
+	if ((rotate == 90 || rotate == 270) && hw->can_rotate_90 &&
+	    !hw->can_rotate_90(in_fmt))
 		return -EINVAL;
 
 	return 0;
