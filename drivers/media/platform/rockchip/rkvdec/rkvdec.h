@@ -316,6 +316,7 @@ extern const struct rkvdec_coded_fmt_ops rkvdec_vp9_fmt_ops;
 /* VDPU381 ops */
 extern const struct rkvdec_coded_fmt_ops rkvdec_vdpu381_h264_fmt_ops;
 extern const struct rkvdec_coded_fmt_ops rkvdec_vdpu381_hevc_fmt_ops;
+extern const struct rkvdec_coded_fmt_ops rkvdec_vdpu381_avs2_fmt_ops;
 extern const struct rkvdec_coded_fmt_ops rkvdec_vdpu381_vp9_fmt_ops;
 
 /* VDPU383 ops */
