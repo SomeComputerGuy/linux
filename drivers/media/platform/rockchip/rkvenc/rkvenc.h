@@ -208,26 +208,10 @@ struct rkvenc_h264_ctx {
 };
 
 /**
- * struct rkvenc_hevc_rc - HEVC constant bitrate frame rate control
- * @bitrate: bitrate the state was set up for, 0 before the first picture
- * @qp: QP of the next I and P picture
- * @buffer_bits: accumulated difference between the coded and the nominal
- *		 picture sizes
- * @target_bits: size target of the current picture
- */
-struct rkvenc_hevc_rc {
-	unsigned int bitrate;
-	int qp[2];
-	s64 buffer_bits;
-	u64 target_bits;
-};
-
-/**
  * struct rkvenc_hevc_ctx - HEVC per-context state
  */
 struct rkvenc_hevc_ctx {
 	struct v4l2_hevc_enc enc;
-	struct rkvenc_hevc_rc rc;
 	bool hw_rc;
 };
 
