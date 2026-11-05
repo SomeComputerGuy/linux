@@ -154,6 +154,7 @@ int rockchip_vpu2_mpeg2_dec_run(struct hantro_ctx *ctx)
 	struct vb2_v4l2_buffer *src_buf, *dst_buf;
 	const struct v4l2_ctrl_mpeg2_sequence *seq;
 	const struct v4l2_ctrl_mpeg2_picture *pic;
+	bool mpeg1;
 	u32 reg;
 
 	src_buf = hantro_get_src_buf(ctx);
@@ -165,6 +166,19 @@ int rockchip_vpu2_mpeg2_dec_run(struct hantro_ctx *ctx)
 			      V4L2_CID_STATELESS_MPEG2_SEQUENCE);
 	pic = hantro_get_ctrl(ctx,
 			      V4L2_CID_STATELESS_MPEG2_PICTURE);
+
+	/*
+	 * MPEG-1 (ISO/IEC 11172-2) has its own decoding mode: it differs
+	 * from MPEG-2 in the inverse quantisation mismatch control and has
+	 * full pel motion vectors. Userspace fills the MPEG-2 extension
+	 * fields with the MPEG-1 values. MPEG-1 has frame pictures only, and
+	 * full pel vectors do not exist in MPEG-2.
+	 */
+	mpeg1 = seq->flags & V4L2_MPEG2_SEQ_FLAG_MPEG1;
+	if (mpeg1 ? pic->picture_structure != V4L2_MPEG2_PIC_FRAME :
+		    pic->flags & (V4L2_MPEG2_PIC_FLAG_FULL_PEL_FORWARD |
+				  V4L2_MPEG2_PIC_FLAG_FULL_PEL_BACKWARD))
+		return -EINVAL;
 
 	reg = VDPU_REG_DEC_ADV_PRE_DIS(0) |
 	      VDPU_REG_DEC_SCMD_DIS(0) |
@@ -181,7 +195,7 @@ int rockchip_vpu2_mpeg2_dec_run(struct hantro_ctx *ctx)
 	      VDPU_REG_STARTMB_Y(0);
 	vdpu_write_relaxed(vpu, reg, VDPU_SWREG(52));
 
-	reg = VDPU_REG_DEC_MODE(5);
+	reg = VDPU_REG_DEC_MODE(mpeg1 ? 6 : 5);
 	vdpu_write_relaxed(vpu, reg, VDPU_SWREG(53));
 
 	reg = VDPU_REG_DEC_STRENDIAN_E(1) |
@@ -229,8 +243,8 @@ int rockchip_vpu2_mpeg2_dec_run(struct hantro_ctx *ctx)
 	      VDPU_REG_FCODE_FWD_VER(pic->f_code[0][1]) |
 	      VDPU_REG_FCODE_BWD_HOR(pic->f_code[1][0]) |
 	      VDPU_REG_FCODE_BWD_VER(pic->f_code[1][1]) |
-	      VDPU_REG_MV_ACCURACY_FWD(1) |
-	      VDPU_REG_MV_ACCURACY_BWD(1);
+	      VDPU_REG_MV_ACCURACY_FWD(!(pic->flags & V4L2_MPEG2_PIC_FLAG_FULL_PEL_FORWARD)) |
+	      VDPU_REG_MV_ACCURACY_BWD(!(pic->flags & V4L2_MPEG2_PIC_FLAG_FULL_PEL_BACKWARD));
 	vdpu_write_relaxed(vpu, reg, VDPU_SWREG(136));
 
 	rockchip_vpu2_mpeg2_dec_set_quantisation(vpu, ctx);
