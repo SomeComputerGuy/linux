@@ -25,7 +25,6 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
-#include <linux/rockchip-iep.h>
 
 #include <media/v4l2-common.h>
 #include <media/v4l2-event.h>
@@ -340,7 +339,7 @@ static void iep_device_run(void *priv)
 	struct vb2_v4l2_buffer *src, *dst0, *dst1 = NULL;
 	dma_addr_t src_addr, prv_addr, dst_top, dst_bot;
 	enum v4l2_field field;
-	u32 deint_mode = READ_ONCE(ctx->deint_mode);
+	bool motion_adaptive = READ_ONCE(ctx->motion_adaptive);
 	bool field_rate = READ_ONCE(ctx->field_rate);
 	bool bff, first_frame;
 	u64 half_period = 0;
@@ -356,8 +355,8 @@ static void iep_device_run(void *priv)
 	}
 
 	/*
-	 * The FIELD_RATE control is grabbed while streaming, so job_ready()
-	 * has seen the same value. Be defensive anyway.
+	 * The output rate cannot change while streaming (iep_s_ctrl()), so
+	 * job_ready() has seen the same value. Be defensive anyway.
 	 */
 	if (field_rate && v4l2_m2m_num_dst_bufs_ready(ctx->fh.m2m_ctx) < 2)
 		field_rate = false;
@@ -378,8 +377,7 @@ static void iep_device_run(void *priv)
 		/* Progressive frame: copy it through */
 		mode = IEP2_DIL_MODE_BYPASS;
 		field_rate = false;
-	} else if (deint_mode == V4L2_ROCKCHIP_IEP_DEINT_MODE_BOB ||
-		   first_frame) {
+	} else if (!motion_adaptive || first_frame) {
 		if (field_rate)
 			mode = IEP2_DIL_MODE_I2O2;
 		else
@@ -394,8 +392,7 @@ static void iep_device_run(void *priv)
 	ctx->job_src = src;
 	ctx->job_dst[0] = dst0;
 	ctx->job_ndst = 1;
-	ctx->job_keep_src = field != V4L2_FIELD_NONE &&
-		deint_mode == V4L2_ROCKCHIP_IEP_DEINT_MODE_MOTION_ADAPTIVE;
+	ctx->job_keep_src = field != V4L2_FIELD_NONE && motion_adaptive;
 
 	if (field_rate) {
 		dst1 = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
@@ -684,9 +681,6 @@ static int iep_start_streaming(struct vb2_queue *vq, unsigned int count)
 	struct iep_ctx *ctx = vb2_get_drv_priv(vq);
 	struct device *dev = ctx->iep->dev;
 
-	/* job_ready() and device_run() must agree on the CAPTURE count */
-	v4l2_ctrl_grab(ctx->field_rate_ctrl, true);
-
 	if (!V4L2_TYPE_IS_OUTPUT(vq->type)) {
 		ctx->cap_sequence = 0;
 		return 0;
@@ -702,8 +696,6 @@ static int iep_start_streaming(struct vb2_queue *vq, unsigned int count)
 	if (!ctx->md_cpu || !ctx->mv_cpu) {
 		iep_free_ctx_bufs(ctx);
 		iep_return_bufs(vq, VB2_BUF_STATE_QUEUED);
-		if (!vb2_is_streaming(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
-			v4l2_ctrl_grab(ctx->field_rate_ctrl, false);
 		return -ENOMEM;
 	}
 
@@ -713,19 +705,11 @@ static int iep_start_streaming(struct vb2_queue *vq, unsigned int count)
 static void iep_stop_streaming(struct vb2_queue *vq)
 {
 	struct iep_ctx *ctx = vb2_get_drv_priv(vq);
-	struct vb2_queue *other;
 
 	iep_return_bufs(vq, VB2_BUF_STATE_ERROR);
 
-	if (V4L2_TYPE_IS_OUTPUT(vq->type)) {
+	if (V4L2_TYPE_IS_OUTPUT(vq->type))
 		iep_free_ctx_bufs(ctx);
-		other = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
-	} else {
-		other = v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx);
-	}
-
-	if (!vb2_is_streaming(other))
-		v4l2_ctrl_grab(ctx->field_rate_ctrl, false);
 }
 
 static const struct vb2_ops iep_qops = {
@@ -1017,13 +1001,26 @@ static int iep_s_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct iep_ctx *ctx = container_of(ctrl->handler, struct iep_ctx,
 					   ctrl_handler);
+	bool field_rate;
 
 	switch (ctrl->id) {
-	case V4L2_CID_ROCKCHIP_IEP_DEINT_MODE:
-		WRITE_ONCE(ctx->deint_mode, ctrl->val);
-		return 0;
-	case V4L2_CID_ROCKCHIP_IEP_FIELD_RATE:
-		WRITE_ONCE(ctx->field_rate, !!ctrl->val);
+	case V4L2_CID_DEINTERLACING_MODE:
+		field_rate = ctrl->val == IEP_DEINT_BOB_FIELD ||
+			     ctrl->val == IEP_DEINT_MA_FIELD;
+		/*
+		 * The output rate sets how many CAPTURE buffers a job takes,
+		 * which job_ready() and device_run() must agree on, so it is
+		 * fixed while streaming. The algorithm can change at any
+		 * time. Ioctls are serialised by iep->mutex.
+		 */
+		if (field_rate != ctx->field_rate &&
+		    (vb2_is_streaming(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)) ||
+		     vb2_is_streaming(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx))))
+			return -EBUSY;
+		WRITE_ONCE(ctx->motion_adaptive,
+			   ctrl->val == IEP_DEINT_MA_FRAME ||
+			   ctrl->val == IEP_DEINT_MA_FIELD);
+		WRITE_ONCE(ctx->field_rate, field_rate);
 		return 0;
 	}
 
@@ -1035,43 +1032,26 @@ static const struct v4l2_ctrl_ops iep_ctrl_ops = {
 };
 
 static const char * const iep_deint_mode_menu[] = {
-	"Bob",
-	"Motion Adaptive",
+	[IEP_DEINT_BOB_FRAME]	= "Bob, Frame Rate",
+	[IEP_DEINT_BOB_FIELD]	= "Bob, Field Rate",
+	[IEP_DEINT_MA_FRAME]	= "Motion Adaptive, Frame Rate",
+	[IEP_DEINT_MA_FIELD]	= "Motion Adaptive, Field Rate",
 	NULL,
-};
-
-static const struct v4l2_ctrl_config iep_ctrl_deint_mode = {
-	.ops = &iep_ctrl_ops,
-	.id = V4L2_CID_ROCKCHIP_IEP_DEINT_MODE,
-	.name = "Deinterlacing Mode",
-	.type = V4L2_CTRL_TYPE_MENU,
-	.max = V4L2_ROCKCHIP_IEP_DEINT_MODE_MOTION_ADAPTIVE,
-	/*
-	 * Without look-ahead (the current frame doubles as the next one) the
-	 * motion-adaptive modes are not reliably better than bob.
-	 */
-	.def = V4L2_ROCKCHIP_IEP_DEINT_MODE_BOB,
-	.qmenu = iep_deint_mode_menu,
-};
-
-static const struct v4l2_ctrl_config iep_ctrl_field_rate = {
-	.ops = &iep_ctrl_ops,
-	.id = V4L2_CID_ROCKCHIP_IEP_FIELD_RATE,
-	.name = "Output One Frame Per Field",
-	.type = V4L2_CTRL_TYPE_BOOLEAN,
-	.max = 1,
-	.step = 1,
-	.def = 0,
 };
 
 static int iep_ctrls_init(struct iep_ctx *ctx)
 {
 	struct v4l2_ctrl_handler *hdl = &ctx->ctrl_handler;
 
-	v4l2_ctrl_handler_init(hdl, 2);
-	v4l2_ctrl_new_custom(hdl, &iep_ctrl_deint_mode, NULL);
-	ctx->field_rate_ctrl = v4l2_ctrl_new_custom(hdl, &iep_ctrl_field_rate,
-						    NULL);
+	v4l2_ctrl_handler_init(hdl, 1);
+	/*
+	 * Without look-ahead (the current frame doubles as the next one) the
+	 * motion-adaptive modes are not reliably better than bob.
+	 */
+	v4l2_ctrl_new_std_menu_items(hdl, &iep_ctrl_ops,
+				     V4L2_CID_DEINTERLACING_MODE,
+				     IEP_DEINT_MA_FIELD, 0, IEP_DEINT_BOB_FRAME,
+				     iep_deint_mode_menu);
 
 	if (hdl->error) {
 		int ret = hdl->error;

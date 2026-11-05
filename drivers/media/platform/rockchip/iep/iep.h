@@ -33,6 +33,18 @@
 #define IEP_MAX_STRIDE		(0xffff * 4)
 #define IEP_STRIDE_ALIGN	16
 
+/*
+ * V4L2_CID_DEINTERLACING_MODE menu items. The algorithm and the output rate
+ * are one menu, as in other deinterlacers: frame rate outputs one CAPTURE
+ * buffer per OUTPUT buffer, field rate two (e.g. 50i to 50p).
+ */
+enum iep_deint_mode {
+	IEP_DEINT_BOB_FRAME,
+	IEP_DEINT_BOB_FIELD,
+	IEP_DEINT_MA_FRAME,
+	IEP_DEINT_MA_FIELD,
+};
+
 /* Context buffers, sizes as allocated by the Rockchip BSP / MPP */
 #define IEP_MD_BUF_SIZE		(IEP_MAX_WIDTH * IEP_MAX_HEIGHT)
 #define IEP_MV_BUF_SIZE		(120 * 480)
@@ -77,14 +89,13 @@ struct iep_ctx {
 	struct v4l2_fh fh;
 	struct iep_dev *iep;
 	struct v4l2_ctrl_handler ctrl_handler;
-	struct v4l2_ctrl *field_rate_ctrl;
 
 	const struct iep_fmt *fmt;
 	struct v4l2_pix_format_mplane src_fmt;
 	struct v4l2_pix_format_mplane dst_fmt;
 
-	/* V4L2_CID_ROCKCHIP_IEP_* control values */
-	u32 deint_mode;
+	/* from V4L2_CID_DEINTERLACING_MODE */
+	bool motion_adaptive;
 	bool field_rate;
 
 	/* motion detection / motion vector history, per context */
