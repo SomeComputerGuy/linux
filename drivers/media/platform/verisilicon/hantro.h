@@ -40,6 +40,8 @@ struct hantro_postproc_ops;
 #define HANTRO_HEVC_DECODER	BIT(19)
 #define HANTRO_VP9_DECODER	BIT(20)
 #define HANTRO_AV1_DECODER	BIT(21)
+#define HANTRO_MPEG4_DECODER	BIT(22)
+#define HANTRO_H263_DECODER	BIT(23)
 #define HANTRO_DECODERS		0xffff0000
 
 /**
@@ -123,6 +125,8 @@ struct hantro_variant {
  * @HANTRO_MODE_HEVC_DEC: HEVC decoder.
  * @HANTRO_MODE_VP9_DEC: VP9 decoder.
  * @HANTRO_MODE_AV1_DEC: AV1 decoder
+ * @HANTRO_MODE_MPEG4_DEC: MPEG-4 Part 2 decoder.
+ * @HANTRO_MODE_H263_DEC: H.263 and Sorenson Spark decoder.
  */
 enum hantro_codec_mode {
 	HANTRO_MODE_NONE = -1,
@@ -134,6 +138,8 @@ enum hantro_codec_mode {
 	HANTRO_MODE_HEVC_DEC,
 	HANTRO_MODE_VP9_DEC,
 	HANTRO_MODE_AV1_DEC,
+	HANTRO_MODE_MPEG4_DEC,
+	HANTRO_MODE_H263_DEC,
 };
 
 /*
@@ -297,6 +303,7 @@ struct hantro_dev {
  * @hevc_dec:		HEVC-decoding context.
  * @vp9_dec:		VP9-decoding context.
  * @av1_dec:		AV1-decoding context.
+ * @mpeg4_dec:		MPEG-4 Part 2-decoding context.
  */
 struct hantro_ctx {
 	struct hantro_dev *dev;
@@ -333,6 +340,7 @@ struct hantro_ctx {
 		struct hantro_hevc_dec_hw_ctx hevc_dec;
 		struct hantro_vp9_dec_hw_ctx vp9_dec;
 		struct hantro_av1_dec_hw_ctx av1_dec;
+		struct hantro_mpeg4_dec_hw_ctx mpeg4_dec;
 	};
 };
 

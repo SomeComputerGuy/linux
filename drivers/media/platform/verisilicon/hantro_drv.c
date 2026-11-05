@@ -408,6 +408,25 @@ static int hantro_try_ctrl(struct v4l2_ctrl *ctrl)
 				  V4L2_MPEG2_PIC_FLAG_FULL_PEL_BACKWARD) &&
 		    ctx->vpu_src_fmt->fourcc != V4L2_PIX_FMT_MPEG1_SLICE)
 			return -EINVAL;
+	} else if (ctrl->id == V4L2_CID_STATELESS_MPEG4_VOL) {
+		const struct v4l2_ctrl_mpeg4_vol *vol = ctrl->p_new.p_mpeg4_vol;
+
+		/* No global motion compensation, no data partitioning */
+		if (vol->sprite_enable != V4L2_MPEG4_SPRITE_ENABLE_NONE ||
+		    vol->flags & V4L2_MPEG4_VOL_FLAG_DATA_PARTITIONED)
+			return -EINVAL;
+	} else if (ctrl->id == V4L2_CID_STATELESS_MPEG4_VOP) {
+		const struct v4l2_ctrl_mpeg4_vop *vop = ctrl->p_new.p_mpeg4_vop;
+
+		if (vop->vop_coding_type == V4L2_MPEG4_VOP_CODING_TYPE_S)
+			return -EINVAL;
+	} else if (ctrl->id == V4L2_CID_STATELESS_H263_PICTURE) {
+		const struct v4l2_ctrl_h263_picture *pic = ctrl->p_new.p_h263_picture;
+
+		/* Baseline H.263 only: none of the optional modes */
+		if (pic->flags & ~(V4L2_H263_PICTURE_FLAG_ROUNDING_TYPE |
+				   V4L2_H263_PICTURE_FLAG_PLUSPTYPE))
+			return -EINVAL;
 	}
 
 	return 0;
@@ -692,6 +711,35 @@ static const struct hantro_ctrl controls[] = {
 		.codec = HANTRO_MPEG2_DECODER,
 		.cfg = {
 			.id = V4L2_CID_STATELESS_MPEG2_QUANTISATION,
+		},
+	}, {
+		.codec = HANTRO_MPEG4_DECODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_MPEG4_VOL,
+			.ops = &hantro_ctrl_ops,
+		},
+	}, {
+		.codec = HANTRO_MPEG4_DECODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_MPEG4_VOP,
+			.ops = &hantro_ctrl_ops,
+		},
+	}, {
+		.codec = HANTRO_MPEG4_DECODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_MPEG4_QUANTISATION,
+		},
+	}, {
+		.codec = HANTRO_MPEG4_DECODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_MPEG4_QUIRKS,
+			.max = V4L2_MPEG4_QUIRK_EDGE_EXACT_SIZE,
+		},
+	}, {
+		.codec = HANTRO_H263_DECODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_H263_PICTURE,
+			.ops = &hantro_ctrl_ops,
 		},
 	}, {
 		.codec = HANTRO_VP8_DECODER,
