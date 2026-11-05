@@ -425,8 +425,7 @@ static void rkvenc_h264_setup_syntax(struct rkvenc_core *core,
 	rkvenc_set(core, VEPU580_H264_SYNT_REFM2, 0);
 
 	val = VEPU580_RDO_CFG_INTER_4X4 | VEPU580_RDO_CFG_CHRM_SPCL |
-	      VEPU580_RDO_CFG_CCWA_E | VEPU580_RDO_CFG_ATR_E |
-	      VEPU580_RDO_CFG_ATF_INTRA_E;
+	      VEPU580_RDO_CFG_CCWA_E | VEPU580_RDO_CFG_ATR_E;
 	if (sps->profile_idc == RKVENC_H264_PROFILE_BASELINE &&
 	    sps->level_idc <= 30)
 		val |= VEPU580_RDO_CFG_RECT_SIZE;
