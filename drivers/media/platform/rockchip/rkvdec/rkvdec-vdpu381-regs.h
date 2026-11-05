@@ -103,7 +103,7 @@ struct rkvdec_vdpu381_regs_common {
 	} reg011_important_en;
 
 	struct {
-		u32 reserved0			: 1;
+		u32 wr_ddr_align_en		: 1;
 		u32 colmv_compress_en		: 1;
 		u32 fbc_e			: 1;
 		u32 reserved1			: 1;
@@ -120,7 +120,7 @@ struct rkvdec_vdpu381_regs_common {
 	} reg012_secondary_en;
 
 	struct {
-		u32 reserved0			: 1;
+		u32 timeout_mode		: 1;
 		u32 req_timeout_rst_sel		: 1;
 		u32 reserved1			: 1;
 		u32 dec_commonirq_mode		: 1;
@@ -396,6 +396,31 @@ struct rkvdec_vdpu381_regs_hevc_params {
 	} reg112_hevc_ref_info;
 
 } __packed;
+
+/* base: OFFSET_CODEC_PARAMS_REGS */
+struct rkvdec_vdpu381_regs_avs2_params {
+	u32 reg064_reserved;
+
+	u32 reg065_cur_poc;
+	u32 reg066_cur_bot_poc;
+	u32 reg067_098_ref_poc[32];
+
+	/* One byte for each reference, see VDPU381_AVS2_REF_* */
+	u8 reg099_100_ref_info[8];
+
+	u32 reserved_101_104[4];
+
+	struct {
+		u32 head_len	: 4;
+		u32 reserved	: 28;
+	} reg105_head_len;
+
+	u32 reserved_106_112[7];
+} __packed;
+
+#define VDPU381_AVS2_REF_FIELD		BIT(0)
+#define VDPU381_AVS2_REF_BOTTOM		BIT(2)
+#define VDPU381_AVS2_REF_USED		BIT(3)
 
 struct rkvdec_vdpu381_vp9_set {
 	u32 vp9_cprheader_offset : 16;
@@ -673,6 +698,14 @@ struct rkvdec_vdpu381_regs_vp9 {
 	struct rkvdec_vdpu381_regs_vp9_params		vp9_param;
 	struct rkvdec_vdpu381_regs_common_addr		common_addr;
 	struct rkvdec_vdpu381_regs_vp9_addr			vp9_addr;
+} __packed;
+
+struct rkvdec_vdpu381_regs_avs2 {
+	struct rkvdec_vdpu381_regs_common		common;
+	struct rkvdec_vdpu381_regs_avs2_params		avs2_param;
+	struct rkvdec_vdpu381_regs_common_addr		common_addr;
+	struct rkvdec_vdpu381_regs_h26x_addr		avs2_addr;
+	struct rkvdec_vdpu381_regs_h26x_highpoc		avs2_highpoc;
 } __packed;
 
 #endif /* __RKVDEC_REGS_H__ */
