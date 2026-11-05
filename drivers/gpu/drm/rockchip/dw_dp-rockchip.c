@@ -224,9 +224,8 @@ static int dw_dp_rockchip_bind(struct device *dev, struct device *master, void *
 	}
 
 	/*
-	 * The bridge chain bus format negotiation already honours the
-	 * requested color format; these are the formats the DW DP output
-	 * format table offers.
+	 * The DW DP bridge applies the requested color format to its output
+	 * formats; these are the formats its output format table offers.
 	 */
 	ret = drm_connector_attach_color_format_property(connector,
 							 BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444) |
