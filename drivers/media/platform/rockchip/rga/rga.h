@@ -150,6 +150,7 @@ struct rga_frame *rga_get_frame(struct rga_ctx *ctx, enum v4l2_buf_type type);
 
 int rga_check_scaling(const struct rga_hw *hw, const struct v4l2_rect *crop_in,
 		      const struct v4l2_rect *crop_out, u32 rotate);
+int rga_check_rotation(const struct rga_hw *hw, const void *in_fmt, u32 rotate);
 
 /* RGA Buffers Manage */
 extern const struct vb2_ops rga_qops;
@@ -215,6 +216,11 @@ struct rga_hw {
 	 * are pulsed.
 	 */
 	void (*reset)(struct rga_core *core);
+	/*
+	 * Optional, returns false if the input format can't be rotated by
+	 * 90 or 270 degrees.
+	 */
+	bool (*can_rotate_90)(const void *in_fmt);
 	struct rockchip_rga_version (*get_version)(struct rga_core *core);
 	void *(*adjust_and_map_format)(struct rga_ctx *ctx,
 				       struct v4l2_pix_format_mplane *format,

@@ -65,9 +65,18 @@ static bool rga3_is_yuv10b(const struct rga3_fmt *fmt)
 	       fmt->hw_format == RGA3_COLOR_FMT_YUV422_10B;
 }
 
+/* The RGA3 can't rotate YUV 4:2:2 by 90 or 270 degrees, only mirror it */
+static bool rga3_can_rotate_90(const void *in_fmt)
+{
+	const struct rga3_fmt *fmt = in_fmt;
+
+	return fmt->hw_format != RGA3_COLOR_FMT_YUV422 &&
+	       fmt->hw_format != RGA3_COLOR_FMT_YUV422_10B;
+}
+
 /*
- * Map the transformations to the RGA3 command buffer.
- * Currently this is just the scaling settings and a fixed alpha value.
+ * Map the transformations to the RGA3 command buffer: the orientation, the
+ * scaling settings and a fixed alpha value.
  */
 static void rga3_cmd_set_trans_info(struct rga_ctx *ctx)
 {
@@ -76,14 +85,44 @@ static void rga3_cmd_set_trans_info(struct rga_ctx *ctx)
 	unsigned int reg;
 	u16 hor_scl_fac, ver_scl_fac;
 	const struct rga3_fmt *in = ctx->in.fmt;
+	bool rot, xmirror, ymirror;
 
-	/* Support basic input cropping to support 1088px inputs */
-	src_h = ctx->in.crop.height;
-	src_w = ctx->in.crop.width;
+	/*
+	 * The window rotates the picture by 90 degrees clockwise and then
+	 * mirrors the rotated picture (xmirror flips it horizontally, ymirror
+	 * vertically). 180 degrees are both mirrors, 270 degrees both mirrors
+	 * and the 90 degree rotation. The V4L2 flips apply to the source,
+	 * before the rotation, so with a 90 degree rotation a horizontal flip
+	 * of the source is a vertical mirror of the rotated picture and the
+	 * other way round.
+	 */
+	rot = ctx->rotate == 90 || ctx->rotate == 270;
+	xmirror = rot ? ctx->vflip : ctx->hflip;
+	ymirror = rot ? ctx->hflip : ctx->vflip;
+	if (ctx->rotate == 180 || ctx->rotate == 270) {
+		xmirror = !xmirror;
+		ymirror = !ymirror;
+	}
+
+	/*
+	 * Support basic input cropping to support 1088px inputs.
+	 * The window rotates before it scales, so a rotated source is
+	 * scaled with its width and height swapped.
+	 */
+	if (rot) {
+		src_h = ctx->in.crop.width;
+		src_w = ctx->in.crop.height;
+	} else {
+		src_h = ctx->in.crop.height;
+		src_w = ctx->in.crop.width;
+	}
 	dst_h = ctx->out.pix.height;
 	dst_w = ctx->out.pix.width;
 
 	reg = RGA3_WIN0_RD_CTRL - RGA3_FIRST_CMD_REG;
+	cmd[reg >> 2] |= FIELD_PREP(RGA3_WIN_ROT, rot)
+		      |  FIELD_PREP(RGA3_WIN_XMIRROR, xmirror)
+		      |  FIELD_PREP(RGA3_WIN_YMIRROR, ymirror);
 	cmd[reg >> 2] |= FIELD_PREP(RGA3_WIN_SCALE_HOR_UP, dst_w > src_w)
 		      |  FIELD_PREP(RGA3_WIN_SCALE_HOR_BYPASS, dst_w == src_w)
 		      |  FIELD_PREP(RGA3_WIN_SCALE_VER_UP, dst_h > src_h)
@@ -569,12 +608,13 @@ const struct rga_hw rga3_hw = {
 	.max_dst_height = RGA3_MAX_OUTPUT_HEIGHT,
 	.max_scaling_factor = RGA3_MAX_SCALING_FACTOR,
 	.stride_alignment = 16,
-	.features = 0,
+	.features = RGA_FEATURE_FLIP | RGA_FEATURE_ROTATE,
 
 	.setup_cmdbuf = rga3_hw_setup_cmdbuf,
 	.start = rga3_hw_start,
 	.handle_irq = rga3_handle_irq,
 	.reset = rga3_soft_reset,
+	.can_rotate_90 = rga3_can_rotate_90,
 	.get_version = rga3_get_version,
 	.enum_format = rga3_enum_format,
 	.adjust_and_map_format = rga3_adjust_and_map_format,
