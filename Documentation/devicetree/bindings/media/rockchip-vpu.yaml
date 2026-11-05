@@ -37,7 +37,16 @@ properties:
           - const: rockchip,rk3568-vpu
 
   reg:
-    maxItems: 1
+    minItems: 1
+    items:
+      - description: VPU registers
+      - description: AVS+ decoder registers
+
+  reg-names:
+    minItems: 1
+    items:
+      - const: vpu
+      - const: avsd
 
   interrupts:
     minItems: 1
@@ -86,6 +95,19 @@ required:
   - interrupt-names
   - clocks
   - clock-names
+
+allOf:
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: rockchip,rk3588-vpu121
+    then:
+      properties:
+        reg:
+          maxItems: 1
+        reg-names: false
 
 additionalProperties: false
 
