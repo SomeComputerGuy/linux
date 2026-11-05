@@ -398,8 +398,9 @@ static int hantro_try_ctrl(struct v4l2_ctrl *ctrl)
 	} else if (ctrl->id == V4L2_CID_STATELESS_MPEG2_SEQUENCE) {
 		const struct v4l2_ctrl_mpeg2_sequence *seq = ctrl->p_new.p_mpeg2_sequence;
 
+		/* MPEG-1 sequences come with the MPEG-1 coded format only */
 		if (seq->flags & V4L2_MPEG2_SEQ_FLAG_MPEG1 &&
-		    !ctx->dev->variant->mpeg1_dec)
+		    ctx->vpu_src_fmt->fourcc != V4L2_PIX_FMT_MPEG1_SLICE)
 			return -EINVAL;
 	} else if (ctrl->id == V4L2_CID_STATELESS_MPEG2_PICTURE) {
 		const struct v4l2_ctrl_mpeg2_picture *pic = ctrl->p_new.p_mpeg2_picture;
@@ -410,7 +411,7 @@ static int hantro_try_ctrl(struct v4l2_ctrl *ctrl)
 		/* Full pel vectors only exist in MPEG-1 */
 		if (pic->flags & (V4L2_MPEG2_PIC_FLAG_FULL_PEL_FORWARD |
 				  V4L2_MPEG2_PIC_FLAG_FULL_PEL_BACKWARD) &&
-		    !ctx->dev->variant->mpeg1_dec)
+		    ctx->vpu_src_fmt->fourcc != V4L2_PIX_FMT_MPEG1_SLICE)
 			return -EINVAL;
 	} else if (ctrl->id == V4L2_CID_STATELESS_AVS_SEQUENCE) {
 		const struct v4l2_ctrl_avs_sequence *seq = ctrl->p_new.p_avs_sequence;
