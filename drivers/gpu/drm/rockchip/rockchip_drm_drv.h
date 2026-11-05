@@ -20,6 +20,8 @@
 #define ROCKCHIP_MAX_FB_BUFFER	3
 #define ROCKCHIP_MAX_CONNECTOR	2
 #define ROCKCHIP_MAX_CRTC	4
+/* Most hardware windows of a VOP2 */
+#define ROCKCHIP_VOP2_MAX_WINS	8
 
 /*
  * display output interface supported by rockchip lcdc
