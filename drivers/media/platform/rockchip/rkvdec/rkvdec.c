@@ -511,6 +511,38 @@ static const struct rkvdec_decoded_fmt_desc rkvdec_vdpu381_vp9_decoded_fmts[] = 
 	},
 };
 
+static const struct rkvdec_ctrl_desc vdpu381_avs2_ctrl_descs[] = {
+	{
+		.cfg.id = V4L2_CID_STATELESS_AVS2_SEQUENCE,
+		.cfg.ops = &rkvdec_ctrl_ops,
+	},
+	{
+		.cfg.id = V4L2_CID_STATELESS_AVS2_PICTURE,
+	},
+	{
+		.cfg.id = V4L2_CID_STATELESS_AVS2_WEIGHT_QUANT,
+	},
+	{
+		.cfg.id = V4L2_CID_STATELESS_AVS2_ALF,
+	},
+};
+
+static const struct rkvdec_ctrls vdpu381_avs2_ctrls = {
+	.ctrls = vdpu381_avs2_ctrl_descs,
+	.num_ctrls = ARRAY_SIZE(vdpu381_avs2_ctrl_descs),
+};
+
+static const struct rkvdec_decoded_fmt_desc rkvdec_avs2_decoded_fmts[] = {
+	{
+		.fourcc = V4L2_PIX_FMT_NV12,
+		.image_fmt = RKVDEC_IMG_FMT_420_8BIT,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_NV15,
+		.image_fmt = RKVDEC_IMG_FMT_420_10BIT,
+	},
+};
+
 static const struct rkvdec_coded_fmt_desc rkvdec_coded_fmts[] = {
 	{
 		.fourcc = V4L2_PIX_FMT_HEVC_SLICE,
@@ -628,6 +660,21 @@ static const struct rkvdec_coded_fmt_desc vdpu381_coded_fmts[] = {
 		.num_decoded_fmts = ARRAY_SIZE(rkvdec_vdpu381_vp9_decoded_fmts),
 		.decoded_fmts = rkvdec_vdpu381_vp9_decoded_fmts,
 		.flags = RKVDEC_FMT_FLAG_PIPELINE,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_AVS2_FRAME,
+		.frmsize = {
+			.min_width = 64,
+			.max_width = 65472,
+			.step_width = 64,
+			.min_height = 64,
+			.max_height = 65472,
+			.step_height = 16,
+		},
+		.ctrls = &vdpu381_avs2_ctrls,
+		.ops = &rkvdec_vdpu381_avs2_fmt_ops,
+		.num_decoded_fmts = ARRAY_SIZE(rkvdec_avs2_decoded_fmts),
+		.decoded_fmts = rkvdec_avs2_decoded_fmts,
 	}
 };
 
