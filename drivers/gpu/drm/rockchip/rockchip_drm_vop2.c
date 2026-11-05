@@ -1147,6 +1147,50 @@ static void vop2_crtc_put_aclk_boost(struct vop2_video_port *vp)
 		clk_set_rate(vop2->aclk, VOP2_ACLK_RATE_DEFAULT);
 }
 
+/*
+ * Switch the windows of both halves off while video port 0 still runs (the
+ * plane disables are written already), and wait for the frame start that
+ * applies that. Video port 1 has no timing of its own: it stays in standby
+ * (its reset state) and only works while it is merged into video port 0,
+ * so its windows only stop cleanly at a frame start of video port 0.
+ * Stopping video port 0 with them still on may leave them in the middle
+ * of a fetch until the next splice. The vendor kernel too switches all
+ * windows off with a config done and waits for that before the standby.
+ */
+static void vop2_crtc_splice_stop_windows(struct vop2_video_port *vp)
+{
+	struct vop2 *vop2 = vp->vop2;
+	u32 mask = BIT(vp->id) | BIT(vp->data->splice_vp);
+	u32 val;
+	int ret;
+
+	vop2_cfg_done(vp);
+
+	ret = read_poll_timeout(vop2_readl, val, !(val & mask), 1000, 100 * 1000,
+				false, vop2, RK3568_REG_CFG_DONE);
+	if (ret)
+		drm_info(vop2->drm, "wait for vp%d windows off timeout\n", vp->id);
+}
+
+static void vop2_crtc_splice_disable(struct vop2_video_port *vp)
+{
+	struct vop2 *vop2 = vp->vop2;
+	struct vop2_video_port *svp = &vop2->vps[vp->data->splice_vp];
+
+	regmap_clear_bits(vop2->map, RK3568_LUT_PORT_SEL,
+			  RK3588_LUT_PORT_SEL__PORT01_MERGE_EN);
+
+	if (vop2->lut_regs)
+		vop2_vp_dsp_lut_disable(svp);
+
+	mutex_lock(&vop2->ovl_lock);
+	vp->ovl_layers = vp->nlayers;
+	svp->ovl_layers = svp->nlayers;
+	mutex_unlock(&vop2->ovl_lock);
+
+	vp->splice = false;
+}
+
 static void vop2_crtc_atomic_disable(struct drm_crtc *crtc,
 				     struct drm_atomic_commit *state)
 {
@@ -1162,6 +1206,9 @@ static void vop2_crtc_atomic_disable(struct drm_crtc *crtc,
 
 	old_crtc_state = drm_atomic_get_old_crtc_state(state, crtc);
 	drm_atomic_helper_disable_planes_on_crtc(old_crtc_state, false);
+
+	if (vp->splice)
+		vop2_crtc_splice_stop_windows(vp);
 
 	drm_crtc_vblank_off(crtc);
 
@@ -1184,6 +1231,9 @@ static void vop2_crtc_atomic_disable(struct drm_crtc *crtc,
 		drm_info(vop2->drm, "wait for vp%d dsp_hold timeout\n", vp->id);
 
 	vop2_crtc_disable_irq(vp, VP_INT_DSP_HOLD_VALID);
+
+	if (vp->splice)
+		vop2_crtc_splice_disable(vp);
 
 	if (vop2->pll_hw_users & BIT(vp->id)) {
 		vop2->pll_hw_users &= ~BIT(vp->id);
@@ -1221,6 +1271,144 @@ out_unlock:
 
 		crtc->state->event = NULL;
 	}
+}
+
+/*
+ * A CRTC splices if its mode is wider than its video port can show: the
+ * video port shows the left half of the active area, its splice video
+ * port the right half, both on the timing of the first one.
+ */
+static bool vop2_crtc_wants_splice(struct vop2_video_port *vp,
+				   const struct drm_crtc_state *crtc_state)
+{
+	if (vp->vop2->splice_master != vp || !crtc_state->enable)
+		return false;
+
+	return crtc_state->adjusted_mode.hdisplay > vp->data->max_output.width;
+}
+
+/* Splicing is decided on a modeset only, then kept until the next one */
+static bool vop2_crtc_state_splice(struct vop2_video_port *vp,
+				   const struct drm_crtc_state *crtc_state)
+{
+	if (drm_atomic_crtc_needs_modeset(crtc_state))
+		return vop2_crtc_wants_splice(vp, crtc_state);
+
+	return to_rockchip_crtc_state(crtc_state)->splice;
+}
+
+/*
+ * Split the source and destination rectangles of a plane on a splicing CRTC
+ * with an active area hdisplay pixels wide into the parts the two video
+ * ports show: [0] the left half, [1] the right half, with its destination
+ * relative to the start of the right half. A part is empty (zero width) if
+ * the plane doesn't reach into that half. The source is split in
+ * proportion to the destination, the left part rounded down to a width
+ * that keeps the right part at a whole pixel of every plane of the
+ * framebuffer.
+ */
+static void vop2_splice_rects(const struct drm_plane_state *pstate, u16 hdisplay,
+			      struct drm_rect src[2], struct drm_rect dst[2])
+{
+	const struct drm_format_info *info = pstate->fb->format;
+	int half = hdisplay / 2;
+	int dst_w = drm_rect_width(&pstate->dst);
+	int left_dst_w = clamp(half - pstate->dst.x1, 0, dst_w);
+	unsigned int align = 1;
+	u64 left_src_w;
+
+	src[0] = pstate->src;
+	src[1] = pstate->src;
+	dst[0] = pstate->dst;
+	dst[1] = pstate->dst;
+
+	dst[0].x2 = dst[0].x1 + left_dst_w;
+	dst[1].x1 = max(pstate->dst.x1, half) - half;
+	dst[1].x2 = max(pstate->dst.x2 - half, dst[1].x1);
+
+	if (!left_dst_w) {
+		src[0].x2 = src[0].x1;
+		return;
+	}
+
+	if (left_dst_w == dst_w) {
+		src[1].x1 = src[1].x2;
+		return;
+	}
+
+	if (info->is_yuv && info->num_planes > 1)
+		align = info->hsub;
+	/* Pixels packed in blocks (NV15, ...): keep the address a whole byte */
+	if (drm_format_info_block_width(info, 0) > 1)
+		align = max(align, 2 * drm_format_info_block_width(info, 0));
+
+	left_src_w = div_u64((u64)drm_rect_width(&pstate->src) * left_dst_w, dst_w) >> 16;
+	left_src_w = rounddown(left_src_w, align);
+
+	src[0].x2 = src[0].x1 + (left_src_w << 16);
+	src[1].x1 = src[0].x2;
+}
+
+/*
+ * The parts of a plane on a splicing CRTC must each be a valid window
+ * (TRM 7.4.3: no rotation in splice mode, a Cluster window scales down
+ * badly across the halves).
+ */
+static int vop2_plane_splice_check(struct vop2_win *win,
+				   const struct drm_plane_state *pstate,
+				   const struct drm_crtc_state *cstate)
+{
+	struct vop2 *vop2 = win->vop2;
+	struct drm_rect src[2], dst[2];
+	int i;
+
+	if (pstate->rotation & (DRM_MODE_ROTATE_90 | DRM_MODE_ROTATE_270 |
+				DRM_MODE_REFLECT_X)) {
+		drm_dbg_kms(vop2->drm, "%s: no rotation or X mirror on a splicing CRTC\n",
+			    win->data->name);
+		return -EINVAL;
+	}
+
+	vop2_splice_rects(pstate, cstate->adjusted_mode.hdisplay, src, dst);
+
+	for (i = 0; i < 2; i++) {
+		int src_w = drm_rect_width(&src[i]) >> 16;
+		int dst_w = drm_rect_width(&dst[i]);
+
+		if (!dst_w)
+			continue;
+
+		if (src_w < 4 || dst_w < 4) {
+			drm_dbg_kms(vop2->drm,
+				    "%s: %s part %dx%d->%d is narrower than 4 pixels\n",
+				    win->data->name, i ? "right" : "left", src_w,
+				    drm_rect_height(&src[i]) >> 16, dst_w);
+			return -EINVAL;
+		}
+
+		if (src_w > vop2->data->max_input.width) {
+			drm_dbg_kms(vop2->drm, "%s: %s part source width %d, max %d\n",
+				    win->data->name, i ? "right" : "left", src_w,
+				    vop2->data->max_input.width);
+			return -EINVAL;
+		}
+
+		if (!vop2_cluster_window(win) && src_w > dst_w && (src_w & 1)) {
+			drm_dbg_kms(vop2->drm,
+				    "Esmart windows cannot downscale odd-width source regions\n");
+			return -EINVAL;
+		}
+	}
+
+	if (vop2_cluster_window(win) && drm_rect_width(&dst[0]) &&
+	    drm_rect_width(&dst[1]) &&
+	    drm_rect_width(&pstate->src) > drm_rect_width(&pstate->dst) << 16) {
+		drm_dbg_kms(vop2->drm, "%s: no Cluster downscaling across the halves\n",
+			    win->data->name);
+		return -EINVAL;
+	}
+
+	return 0;
 }
 
 static int vop2_plane_atomic_check(struct drm_plane *plane,
@@ -1281,8 +1469,19 @@ static int vop2_plane_atomic_check(struct drm_plane *plane,
 		return -EINVAL;
 	}
 
-	if (src_w > vop2_data->max_input.width ||
-	    src_h > vop2_data->max_input.height) {
+	if (vop2_crtc_state_splice(vp, cstate)) {
+		ret = vop2_plane_splice_check(win, pstate, cstate);
+		if (ret)
+			return ret;
+	} else if (src_w > vop2_data->max_input.width) {
+		drm_dbg_kms(vop2->drm, "Invalid source: %dx%d. max input: %dx%d\n",
+			    src_w, src_h,
+			    vop2_data->max_input.width,
+			    vop2_data->max_input.height);
+		return -EINVAL;
+	}
+
+	if (src_h > vop2_data->max_input.height) {
 		drm_dbg_kms(vop2->drm, "Invalid source: %dx%d. max input: %dx%d\n",
 			    src_w, src_h,
 			    vop2_data->max_input.width,
@@ -1534,8 +1733,12 @@ static u64 vop2_axi_port_peak(const struct vop2_axi_slot *s, int n, u8 bus)
  */
 static int vop2_axi_check(struct vop2 *vop2, struct drm_atomic_commit *state)
 {
+	const struct vop2_splice_state *splice = NULL;
+	struct rockchip_crtc_state *vcstate;
 	int n = vop2->registered_num_wins;
 	struct vop2_axi_slot *s;
+	u32 borrowed = 0;
+	u8 vp_id;
 	u64 old_peak[VOP2_SYS_AXI_BUS_NUM];
 	unsigned long flags;
 	bool changed = false;
@@ -1544,6 +1747,16 @@ static int vop2_axi_check(struct vop2 *vop2, struct drm_atomic_commit *state)
 
 	if (!(vop2->data->feature & VOP2_FEATURE_AXI_BALANCE))
 		return 0;
+
+	if (vop2->splice_master) {
+		struct drm_private_state *priv;
+
+		priv = drm_atomic_get_new_private_obj_state(state, &vop2->splice_obj);
+		if (priv) {
+			splice = container_of(priv, struct vop2_splice_state, base);
+			borrowed = splice->borrowed;
+		}
+	}
 
 	s = kcalloc(n, sizeof(*s), GFP_KERNEL);
 	if (!s)
@@ -1581,13 +1794,47 @@ static int vop2_axi_check(struct vop2 *vop2, struct drm_atomic_commit *state)
 			cstate = drm_atomic_get_new_crtc_state(state, pstate->crtc);
 
 		if (!cstate || !cstate->active) {
-			s[i].active = false;
-			s[i].assigned = false;
+			/* Unless it shows the right half of another plane */
+			if (!(borrowed & BIT(i))) {
+				s[i].active = false;
+				s[i].assigned = false;
+			}
 			continue;
 		}
 
-		vop2_win_axi_fetch(pstate, &pstate->src, &pstate->dst,
-				   to_vop2_video_port(pstate->crtc)->id,
+		vcstate = to_rockchip_crtc_state(cstate);
+		vp_id = to_vop2_video_port(pstate->crtc)->id;
+		if (vcstate->splice) {
+			struct drm_rect src[2], dst[2];
+			u8 p = vcstate->splice_win[i];
+
+			vop2_splice_rects(pstate, cstate->adjusted_mode.hdisplay, src, dst);
+			s[i].active = drm_rect_width(&dst[0]);
+			if (s[i].active)
+				vop2_win_axi_fetch(pstate, &src[0], &dst[0], vp_id,
+						   &cstate->adjusted_mode, &s[i].f);
+			else
+				s[i].assigned = false;
+
+			/* Known once vop2_splice_check() ran */
+			if (!splice || !p)
+				continue;
+
+			/*
+			 * The right half is fetched at the same time as the
+			 * left one: account it on the same video port.
+			 */
+			p--;
+			s[p].active = drm_rect_width(&dst[1]);
+			if (s[p].active)
+				vop2_win_axi_fetch(pstate, &src[1], &dst[1], vp_id,
+						   &cstate->adjusted_mode, &s[p].f);
+			else
+				s[p].assigned = false;
+			continue;
+		}
+
+		vop2_win_axi_fetch(pstate, &pstate->src, &pstate->dst, vp_id,
 				   &cstate->adjusted_mode, &s[i].f);
 		s[i].active = true;
 	}
@@ -1636,6 +1883,36 @@ out:
 	return ret;
 }
 
+static void vop2_win_stop(struct vop2_win *win)
+{
+	vop2_win_put_axi_bus(win);
+	vop2_win_disable(win);
+	vop2_win_write(win, VOP2_WIN_YUV_CLIP, 0);
+}
+
+/*
+ * Stop using the window that showed the right half of the plane of win,
+ * and switch it off unless another plane took it over (write_hw is false
+ * if the video port is off).
+ */
+static void vop2_win_put_splice_partner(struct vop2_win *win, bool write_hw)
+{
+	struct vop2_win *partner = win->splice_partner;
+
+	if (!partner)
+		return;
+
+	win->splice_partner = NULL;
+	if (partner->splice_owner != win)
+		return;
+
+	partner->splice_owner = NULL;
+	if (write_hw)
+		vop2_win_stop(partner);
+	else
+		vop2_win_put_axi_bus(partner);
+}
+
 static void vop2_plane_atomic_disable(struct drm_plane *plane,
 				      struct drm_atomic_commit *state)
 {
@@ -1643,6 +1920,10 @@ static void vop2_plane_atomic_disable(struct drm_plane *plane,
 	struct vop2_win *win = to_vop2_win(plane);
 	struct vop2 *vop2 = win->vop2;
 	struct vop2_video_port *vp;
+
+	/* The window shows the right half of a plane on a splicing CRTC */
+	if (win->splice_owner)
+		return;
 
 	drm_dbg(vop2->drm, "%s disable\n", win->data->name);
 
@@ -1652,14 +1933,19 @@ static void vop2_plane_atomic_disable(struct drm_plane *plane,
 		old_pstate = drm_atomic_get_old_plane_state(state, plane);
 
 	if (old_pstate) {
-		if (!old_pstate->crtc)
+		if (!old_pstate->crtc) {
+			vop2_win_put_splice_partner(win, false);
 			return;
+		}
 
 		vp = to_vop2_video_port(old_pstate->crtc);
-		if (!vp->enabled)
+		if (!vp->enabled) {
+			vop2_win_put_splice_partner(win, false);
 			return;
+		}
 	}
 
+	vop2_win_put_splice_partner(win, true);
 	vop2_win_disable(win);
 	vop2_win_write(win, VOP2_WIN_YUV_CLIP, 0);
 }
@@ -1958,6 +2244,12 @@ static void vop2_plane_atomic_update(struct drm_plane *plane,
 	struct drm_crtc *crtc = pstate->crtc;
 	struct vop2_win *win = to_vop2_win(plane);
 	struct vop2_video_port *vp = to_vop2_video_port(crtc);
+	struct vop2 *vop2 = win->vop2;
+	struct rockchip_crtc_state *vcstate;
+	struct vop2_win *partner;
+	struct drm_rect src[2], dst[2];
+	u16 hdisplay;
+	u8 partner_id;
 
 	/*
 	 * can't update plane when vop2 is disabled.
@@ -1973,8 +2265,42 @@ static void vop2_plane_atomic_update(struct drm_plane *plane,
 		return;
 	}
 
-	vop2_win_update(win, vp, pstate, &pstate->src, &pstate->dst,
-			crtc->state->adjusted_mode.hdisplay);
+	/* The plane took its window back from a splicing plane */
+	if (win->splice_owner) {
+		win->splice_owner->splice_partner = NULL;
+		win->splice_owner = NULL;
+	}
+
+	vcstate = to_rockchip_crtc_state(crtc->state);
+	hdisplay = crtc->state->adjusted_mode.hdisplay;
+	if (!vcstate->splice) {
+		vop2_win_put_splice_partner(win, true);
+		vop2_win_update(win, vp, pstate, &pstate->src, &pstate->dst, hdisplay);
+		return;
+	}
+
+	partner_id = vcstate->splice_win[win - vop2->win];
+	partner = partner_id ? &vop2->win[partner_id - 1] : NULL;
+	if (win->splice_partner != partner)
+		vop2_win_put_splice_partner(win, true);
+
+	vop2_splice_rects(pstate, hdisplay, src, dst);
+
+	if (drm_rect_width(&dst[0]))
+		vop2_win_update(win, vp, pstate, &src[0], &dst[0], hdisplay / 2);
+	else
+		vop2_win_stop(win);
+
+	if (WARN_ON(!partner))
+		return;
+
+	win->splice_partner = partner;
+	partner->splice_owner = win;
+
+	if (drm_rect_width(&dst[1]))
+		vop2_win_update(partner, vp, pstate, &src[1], &dst[1], hdisplay / 2);
+	else
+		vop2_win_stop(partner);
 }
 
 static const struct drm_plane_helper_funcs vop2_plane_helper_funcs = {
@@ -2023,7 +2349,15 @@ static enum drm_mode_status vop2_crtc_mode_valid(struct drm_crtc *crtc,
 {
 	struct vop2_video_port *vp = to_vop2_video_port(crtc);
 
-	if (mode->hdisplay > vp->data->max_output.width)
+	/*
+	 * Wider modes need the splice video port, if it is in use the atomic
+	 * check refuses them. TRM 7.4.3.4: 8 pixel aligned.
+	 */
+	if (mode->hdisplay > vp->data->max_output.width &&
+	    (vp->vop2->splice_master != vp ||
+	     mode->hdisplay > vp->data->splice_max_output.width ||
+	     mode->vdisplay > vp->data->splice_max_output.height ||
+	     mode->hdisplay % 8))
 		return MODE_BAD_HVALUE;
 
 	if (mode->clock > vp->data->max_pixel_clock_rate / 1000)
@@ -2090,18 +2424,26 @@ static void vop2_crtc_atomic_try_set_gamma(struct vop2 *vop2,
 					   struct drm_crtc *crtc,
 					   struct drm_crtc_state *crtc_state)
 {
+	struct vop2_video_port *svp = vp->splice ? &vop2->vps[vp->data->splice_vp] : NULL;
+
 	if (!vop2->lut_regs)
 		return;
 
 	if (!crtc_state->gamma_lut) {
 		vop2_vp_dsp_lut_disable(vp);
+		if (svp)
+			vop2_vp_dsp_lut_disable(svp);
 		return;
 	}
 
-	if (vop2_supports_seamless_gamma_lut_update(vop2))
+	if (vop2_supports_seamless_gamma_lut_update(vop2)) {
 		vop2_crtc_atomic_set_gamma_seamless(vop2, vp, crtc);
-	else
+		/* The splice video port applies the LUT to the right half */
+		if (svp)
+			vop2_crtc_atomic_set_gamma_seamless(vop2, svp, crtc);
+	} else {
 		vop2_crtc_atomic_set_gamma_rk356x(vop2, vp, crtc);
+	}
 }
 
 static inline void vop2_crtc_atomic_try_set_gamma_locked(struct vop2 *vop2,
@@ -2186,6 +2528,8 @@ static void vop2_bgcolor_setup(struct drm_crtc *crtc, bool force,
 	}
 
 	vop2_vp_write(vp, RK3568_VP_DSP_BG, val);
+	if (new_vcstate->splice)
+		vop2_vp_write(&vp->vop2->vps[vp->data->splice_vp], RK3568_VP_DSP_BG, val);
 }
 
 static void vop2_post_config(struct drm_crtc *crtc, bool force,
@@ -2388,6 +2732,37 @@ static void vop2_crtc_set_dclk_parent(struct vop2_video_port *vp,
 			vp->id, p, ret);
 }
 
+/*
+ * Merge the output of the splice video port, which shows the right half of
+ * the active area, into the one of vp (TRM 7.4.3.3). The splice video port
+ * runs on the timing of vp: only what it does before the post line buffer
+ * is set up, like the vendor kernel does.
+ */
+static void vop2_crtc_splice_enable(struct vop2_video_port *vp,
+				    struct rockchip_crtc_state *vcstate,
+				    u32 dsp_ctrl)
+{
+	struct vop2 *vop2 = vp->vop2;
+	struct vop2_video_port *svp = &vop2->vps[vp->data->splice_vp];
+	u32 mask = RK3568_VP_DSP_CTRL__DITHER_DOWN_MODE |
+		   RK3568_VP_DSP_CTRL__DITHER_DOWN_SEL |
+		   RK3568_VP_DSP_CTRL__DITHER_DOWN_EN |
+		   RK3568_VP_DSP_CTRL__PRE_DITHER_DOWN_EN;
+	u32 val;
+
+	val = vop2_vp_read(svp, RK3568_VP_DSP_CTRL);
+	val = (val & ~mask) | (dsp_ctrl & mask);
+	vop2_vp_write(svp, RK3568_VP_DSP_CTRL, val);
+
+	vop2_bcsh_setup(svp, vcstate);
+
+	/* Takes effect immediately, before the timing of vp starts */
+	regmap_set_bits(vop2->map, RK3568_LUT_PORT_SEL,
+			RK3588_LUT_PORT_SEL__PORT01_MERGE_EN);
+
+	vp->splice = true;
+}
+
 static void vop2_crtc_atomic_enable(struct drm_crtc *crtc,
 				    struct drm_atomic_commit *state)
 {
@@ -2564,6 +2939,9 @@ static void vop2_crtc_atomic_enable(struct drm_crtc *crtc,
 		if (!vop2->pll_held && !clk_rate_exclusive_get(vop2->pll_v0))
 			vop2->pll_held = true;
 	}
+
+	if (vcstate->splice)
+		vop2_crtc_splice_enable(vp, vcstate, dsp_ctrl);
 
 	vop2_post_config(crtc, true, crtc_state, old_crtc_state);
 	vop2_bcsh_setup(vp, vcstate);
@@ -3025,7 +3403,14 @@ static int vop2_crtc_atomic_check(struct drm_crtc *crtc,
 	struct drm_plane *plane;
 	int nplanes = 0;
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+	struct rockchip_crtc_state *vcstate = to_rockchip_crtc_state(crtc_state);
+	unsigned int nlayers = vp->nlayers;
 	int ret;
+
+	vcstate->splice = vop2_crtc_state_splice(vp, crtc_state);
+	/* The layers of both video ports are split between them */
+	if (vcstate->splice)
+		nlayers = (vp->nlayers + vp->vop2->vps[vp->data->splice_vp].nlayers) / 2;
 
 	ret = vop2_crtc_atomic_check_gamma(vp, crtc, state, crtc_state);
 	if (ret)
@@ -3038,8 +3423,11 @@ static int vop2_crtc_atomic_check(struct drm_crtc *crtc,
 	drm_atomic_crtc_state_for_each_plane(plane, crtc_state)
 		nplanes++;
 
-	if (nplanes > vp->nlayers)
+	if (nplanes > nlayers) {
+		drm_dbg_kms(vp->vop2->drm, "vp%d: %d planes, max %u%s\n", vp->id,
+			    nplanes, nlayers, vcstate->splice ? " (splice)" : "");
 		return -EINVAL;
+	}
 
 	return vop2_axi_check(vp->vop2, state);
 }
@@ -3216,9 +3604,16 @@ static int vop2_crtc_state_dump(struct drm_crtc *crtc, struct seq_file *s)
 		   mode->hsync_end, mode->htotal);
 	seq_printf(s, "\tV: %d %d %d %d\n", mode->vdisplay, mode->vsync_start,
 		   mode->vsync_end, mode->vtotal);
+	if (vcstate->splice)
+		seq_printf(s, "\tsplice: right half on Video Port%d\n", vp->data->splice_vp);
 
 	drm_atomic_crtc_for_each_plane(plane, crtc) {
+		struct vop2_win *win = to_vop2_win(plane);
+		u8 partner = vcstate->splice ? vcstate->splice_win[win - vp->vop2->win] : 0;
+
 		vop2_plane_state_dump(s, plane);
+		if (partner)
+			seq_printf(s, "\tright half: %s\n", vp->vop2->win[partner - 1].data->name);
 	}
 
 	return 0;
@@ -3390,6 +3785,280 @@ static const struct drm_crtc_funcs vop2_crtc_funcs = {
 	.late_register = vop2_crtc_late_register,
 };
 
+static struct vop2_splice_state *to_vop2_splice_state(struct drm_private_state *state)
+{
+	return container_of(state, struct vop2_splice_state, base);
+}
+
+/* Windows of the same type can show the two halves of one plane */
+static bool vop2_win_can_splice(const struct vop2_win *a, const struct vop2_win *b)
+{
+	return a->data->formats == b->data->formats &&
+	       a->data->nformats == b->data->nformats &&
+	       a->data->format_modifiers == b->data->format_modifiers &&
+	       vop2_cluster_window(a) == vop2_cluster_window(b);
+}
+
+/*
+ * Whether the plane of a window is unused in the new state. A plane that
+ * isn't in the state is locked, so that a commit that takes it waits for
+ * this one, and then sees that it shows the right half of another plane.
+ */
+static int vop2_win_plane_unused(struct drm_atomic_commit *state,
+				 struct vop2_win *win, bool *unused)
+{
+	struct drm_plane_state *pstate;
+	int ret;
+
+	pstate = drm_atomic_get_new_plane_state(state, &win->base);
+	if (!pstate) {
+		ret = drm_modeset_lock(&win->base.mutex, state->acquire_ctx);
+		if (ret)
+			return ret;
+
+		pstate = win->base.state;
+	}
+
+	*unused = !pstate->crtc;
+
+	return 0;
+}
+
+/*
+ * Give every plane of a splicing CRTC a second window for the right half
+ * of the active area: a window of the same type whose plane is unused, on
+ * the other AXI port if possible. Planes keep their window as long as it
+ * stays unused, a plane that is enabled on a window the splicing CRTC uses
+ * makes it take another one, or fails if there is none.
+ *
+ * The splice video port can't be a CRTC of its own while it splices.
+ *
+ * Returns 1 if the state changed and must be checked again, 0 if it is
+ * valid, or a negative error code.
+ */
+static int vop2_splice_check(struct vop2 *vop2, struct drm_atomic_commit *state)
+{
+	u8 partner[ROCKCHIP_VOP2_MAX_WINS] = { };
+	struct vop2_video_port *vp = vop2->splice_master;
+	struct drm_plane_state *old_pstate, *new_pstate;
+	struct drm_crtc_state *crtc_state, *scrtc_state;
+	struct vop2_splice_state *new, *old;
+	struct rockchip_crtc_state *vcstate;
+	struct drm_private_state *priv;
+	struct vop2_video_port *svp;
+	bool need, had, recheck = false;
+	struct drm_plane *plane;
+	u32 used = 0, masters = 0;
+	int i, ret;
+
+	if (!vp)
+		return 0;
+
+	svp = &vop2->vps[vp->data->splice_vp];
+
+	crtc_state = drm_atomic_get_new_crtc_state(state, &vp->crtc);
+	scrtc_state = svp->crtc.port ?
+		      drm_atomic_get_new_crtc_state(state, &svp->crtc) : NULL;
+
+	/*
+	 * The windows only change in a commit with the CRTC, whose lock it
+	 * holds then: page flips of a CRTC that doesn't splice leave them
+	 * alone.
+	 */
+	need = crtc_state && (to_rockchip_crtc_state(crtc_state)->splice ||
+			      to_vop2_splice_state(vop2->splice_obj.state)->borrowed);
+	if (scrtc_state && scrtc_state->enable)
+		need = true;
+	for_each_oldnew_plane_in_state(state, plane, old_pstate, new_pstate, i)
+		if (plane->funcs == &vop2_plane_funcs && new_pstate->crtc &&
+		    !old_pstate->crtc)
+			need = true;
+
+	if (!need)
+		return 0;
+
+	had = drm_atomic_get_new_private_obj_state(state, &vop2->splice_obj);
+	priv = drm_atomic_get_private_obj_state(state, &vop2->splice_obj);
+	if (IS_ERR(priv))
+		return PTR_ERR(priv);
+
+	new = to_vop2_splice_state(priv);
+	old = to_vop2_splice_state(drm_atomic_get_old_private_obj_state(state,
+									&vop2->splice_obj));
+
+	/* A plane takes a window back that the splicing CRTC uses */
+	if (!crtc_state && old->borrowed) {
+		for_each_oldnew_plane_in_state(state, plane, old_pstate, new_pstate, i) {
+			if (plane->funcs != &vop2_plane_funcs || !new_pstate->crtc ||
+			    old_pstate->crtc ||
+			    !(old->borrowed & BIT(to_vop2_win(plane) - vop2->win)))
+				continue;
+
+			drm_dbg_kms(vop2->drm, "%s: in use for the right half of vp%d\n",
+				    to_vop2_win(plane)->data->name, vp->id);
+
+			crtc_state = drm_atomic_get_crtc_state(state, &vp->crtc);
+			if (IS_ERR(crtc_state))
+				return PTR_ERR(crtc_state);
+
+			ret = drm_atomic_add_affected_planes(state, &vp->crtc);
+			if (ret)
+				return ret;
+
+			recheck = true;
+			break;
+		}
+	}
+
+	if (scrtc_state && scrtc_state->enable && !crtc_state) {
+		crtc_state = drm_atomic_get_crtc_state(state, &vp->crtc);
+		if (IS_ERR(crtc_state))
+			return PTR_ERR(crtc_state);
+
+		recheck = true;
+	}
+
+	if (!crtc_state)
+		return 0;
+
+	vcstate = to_rockchip_crtc_state(crtc_state);
+
+	if (vcstate->splice && svp->crtc.port) {
+		if (!scrtc_state) {
+			scrtc_state = drm_atomic_get_crtc_state(state, &svp->crtc);
+			if (IS_ERR(scrtc_state))
+				return PTR_ERR(scrtc_state);
+
+			recheck = true;
+		}
+
+		if (scrtc_state->enable) {
+			drm_dbg_kms(vop2->drm, "vp%d: can't splice, vp%d is in use\n",
+				    vp->id, svp->id);
+			return -EINVAL;
+		}
+	}
+
+	if (vcstate->splice) {
+		drm_atomic_crtc_state_for_each_plane(plane, crtc_state)
+			masters |= BIT(to_vop2_win(plane) - vop2->win);
+		used = masters;
+
+		/* Keep the windows that are still unused */
+		drm_atomic_crtc_state_for_each_plane(plane, crtc_state) {
+			int m = to_vop2_win(plane) - vop2->win;
+			int q = old->partner[m] - 1;
+			bool unused;
+
+			if (q < 0 || (used & BIT(q)) ||
+			    !vop2_win_can_splice(&vop2->win[m], &vop2->win[q]))
+				continue;
+
+			ret = vop2_win_plane_unused(state, &vop2->win[q], &unused);
+			if (ret)
+				return ret;
+
+			if (unused) {
+				partner[m] = q + 1;
+				used |= BIT(q);
+			}
+		}
+
+		drm_atomic_crtc_state_for_each_plane(plane, crtc_state) {
+			struct vop2_win *win = to_vop2_win(plane);
+			int m = win - vop2->win;
+			int q, best = -1;
+			bool unused;
+
+			if (partner[m])
+				continue;
+
+			for (q = 0; q < vop2->registered_num_wins; q++) {
+				struct vop2_win *w = &vop2->win[q];
+
+				if ((used & BIT(q)) || !vop2_win_can_splice(win, w))
+					continue;
+
+				ret = vop2_win_plane_unused(state, w, &unused);
+				if (ret)
+					return ret;
+
+				if (!unused)
+					continue;
+
+				if (best < 0)
+					best = q;
+
+				/* Fetch the two halves through both AXI ports */
+				if (w->data->axi_bus_id != win->data->axi_bus_id) {
+					best = q;
+					break;
+				}
+			}
+
+			if (best < 0) {
+				drm_dbg_kms(vop2->drm,
+					    "vp%d: no window left for the right half of %s\n",
+					    vp->id, win->data->name);
+				return -EINVAL;
+			}
+
+			partner[m] = best + 1;
+			used |= BIT(best);
+		}
+	}
+
+	if (memcmp(new->partner, partner, sizeof(partner)) ||
+	    memcmp(vcstate->splice_win, partner, sizeof(partner)) ||
+	    new->borrowed != (used & ~masters))
+		recheck = true;
+
+	memcpy(new->partner, partner, sizeof(partner));
+	memcpy(vcstate->splice_win, partner, sizeof(partner));
+	new->borrowed = used & ~masters;
+
+	/* The AXI fetch check only knows the right halves from here on */
+	return recheck || !had;
+}
+
+static struct drm_private_state *vop2_splice_duplicate_state(struct drm_private_obj *obj)
+{
+	struct vop2_splice_state *state;
+
+	state = kmemdup(to_vop2_splice_state(obj->state), sizeof(*state), GFP_KERNEL);
+	if (!state)
+		return NULL;
+
+	__drm_atomic_helper_private_obj_duplicate_state(obj, &state->base);
+
+	return &state->base;
+}
+
+static void vop2_splice_destroy_state(struct drm_private_obj *obj,
+				      struct drm_private_state *state)
+{
+	kfree(to_vop2_splice_state(state));
+}
+
+static struct drm_private_state *vop2_splice_create_state(struct drm_private_obj *obj)
+{
+	struct vop2_splice_state *state;
+
+	state = kzalloc_obj(*state);
+	if (!state)
+		return ERR_PTR(-ENOMEM);
+
+	__drm_atomic_helper_private_obj_create_state(obj, &state->base);
+
+	return &state->base;
+}
+
+static const struct drm_private_state_funcs vop2_splice_state_funcs = {
+	.atomic_create_state = vop2_splice_create_state,
+	.atomic_duplicate_state = vop2_splice_duplicate_state,
+	.atomic_destroy_state = vop2_splice_destroy_state,
+};
+
 /**
  * vop2_atomic_check - check the resources the VOP2 video ports share
  * @drm: DRM device
@@ -3402,7 +4071,7 @@ int vop2_atomic_check(struct drm_device *drm, struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *crtc_state;
 	struct drm_crtc *crtc;
-	int i;
+	int i, ret, recheck;
 
 	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
 		struct vop2 *vop2;
@@ -3412,7 +4081,15 @@ int vop2_atomic_check(struct drm_device *drm, struct drm_atomic_commit *state)
 
 		vop2 = to_vop2_video_port(crtc)->vop2;
 
-		return vop2->pll_plan ? vop2_pll_plan(vop2, state) : 0;
+		recheck = vop2_splice_check(vop2, state);
+		if (recheck < 0)
+			return recheck;
+
+		ret = vop2->pll_plan ? vop2_pll_plan(vop2, state) : 0;
+		if (ret < 0)
+			return ret;
+
+		return recheck || ret;
 	}
 
 	return 0;
@@ -3966,6 +4643,39 @@ static int vop2_pll_init(struct vop2 *vop2)
 	return 0;
 }
 
+/*
+ * A video port with a CRTC splices with the help of its splice video port
+ * (VOP2_VP_FEATURE_SPLICE), which then can't drive an output of its own.
+ */
+static int vop2_splice_init(struct vop2 *vop2)
+{
+	int i, ret;
+
+	for (i = 0; i < vop2->data->nr_vps; i++) {
+		struct vop2_video_port *vp = &vop2->vps[i];
+
+		if (!(vp->data->feature & VOP2_VP_FEATURE_SPLICE) || !vp->crtc.port ||
+		    vp->data->splice_vp >= vop2->data->nr_vps)
+			continue;
+
+		ret = drm_atomic_private_obj_init(vop2->drm, &vop2->splice_obj,
+						  &vop2_splice_state_funcs);
+		if (ret)
+			return ret;
+
+		vop2->splice_master = vp;
+
+		/* Framebuffers as wide as the splice output */
+		vop2->drm->mode_config.max_width =
+			max_t(int, vop2->drm->mode_config.max_width,
+			      vp->data->splice_max_output.width);
+
+		return 0;
+	}
+
+	return 0;
+}
+
 static int vop2_bind(struct device *dev, struct device *master, void *data)
 {
 	struct platform_device *pdev = to_platform_device(dev);
@@ -4127,6 +4837,10 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 	if (ret)
 		goto err_crtcs;
 
+	ret = vop2_splice_init(vop2);
+	if (ret)
+		goto err_pll;
+
 	if (vop2->version >= VOP_VERSION_RK3576) {
 		struct drm_crtc *crtc;
 
@@ -4158,7 +4872,7 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 		if (IS_ERR(vop2->rgb)) {
 			if (PTR_ERR(vop2->rgb) == -EPROBE_DEFER) {
 				ret = PTR_ERR(vop2->rgb);
-				goto err_crtcs;
+				goto err_splice;
 			}
 			vop2->rgb = NULL;
 		}
@@ -4170,6 +4884,16 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 
 	return 0;
 
+err_splice:
+	if (vop2->splice_master) {
+		drm_atomic_private_obj_fini(&vop2->splice_obj);
+		vop2->splice_master = NULL;
+	}
+err_pll:
+	if (vop2->pll_plan) {
+		drm_atomic_private_obj_fini(&vop2->pll_obj);
+		vop2->pll_plan = false;
+	}
 err_crtcs:
 	vop2_destroy_crtcs(vop2);
 
@@ -4186,6 +4910,9 @@ static void vop2_unbind(struct device *dev, struct device *master, void *data)
 		rockchip_rgb_fini(vop2->rgb);
 
 	vop2_destroy_crtcs(vop2);
+
+	if (vop2->splice_master)
+		drm_atomic_private_obj_fini(&vop2->splice_obj);
 
 	if (vop2->pll_plan)
 		drm_atomic_private_obj_fini(&vop2->pll_obj);
