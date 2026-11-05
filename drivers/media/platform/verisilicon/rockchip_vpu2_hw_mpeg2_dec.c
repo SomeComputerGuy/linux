@@ -172,9 +172,12 @@ int rockchip_vpu2_mpeg2_dec_run(struct hantro_ctx *ctx)
 	 * from MPEG-2 in the inverse quantisation mismatch control and has
 	 * full pel motion vectors. Userspace fills the MPEG-2 extension
 	 * fields with the MPEG-1 values. MPEG-1 has frame pictures only, and
-	 * full pel vectors do not exist in MPEG-2.
+	 * full pel vectors do not exist in MPEG-2. The coded format says
+	 * which one is decoded, the sequence flag has to agree with it.
 	 */
-	mpeg1 = seq->flags & V4L2_MPEG2_SEQ_FLAG_MPEG1;
+	mpeg1 = ctx->vpu_src_fmt->fourcc == V4L2_PIX_FMT_MPEG1_SLICE;
+	if (mpeg1 != !!(seq->flags & V4L2_MPEG2_SEQ_FLAG_MPEG1))
+		return -EINVAL;
 	if (mpeg1 ? pic->picture_structure != V4L2_MPEG2_PIC_FRAME :
 		    pic->flags & (V4L2_MPEG2_PIC_FLAG_FULL_PEL_FORWARD |
 				  V4L2_MPEG2_PIC_FLAG_FULL_PEL_BACKWARD))
