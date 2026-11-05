@@ -332,6 +332,38 @@ static void iep_set_dst_meta(struct iep_ctx *ctx, struct vb2_v4l2_buffer *src,
 			      ctx->dst_fmt.plane_fmt[0].sizeimage);
 }
 
+/*
+ * In field-rate mode both CAPTURE buffers of a job come from one OUTPUT
+ * buffer. The first carries the OUTPUT timestamp, the second one is placed
+ * half a frame period later. The period is taken from real timestamps only:
+ *  - the previous OUTPUT buffer of this stream, once there is one;
+ *  - for the first frame after STREAMON, the next OUTPUT buffer, if
+ *    userspace has queued it by the time the job starts.
+ * If neither is available, or the timestamps do not increase, the offset is
+ * 0 and both CAPTURE buffers carry the OUTPUT timestamp. The period is not
+ * guessed, and VIDIOC_S_PARM cannot supply it because mem2mem devices other
+ * than encoders do not implement it. Userspace that wants distinct
+ * timestamps from the first frame on queues two OUTPUT buffers before the
+ * later of the two STREAMON calls.
+ *
+ * Must be called after @src has been removed from the ready queue.
+ */
+static u64 iep_second_field_offset(struct iep_ctx *ctx,
+				   struct vb2_v4l2_buffer *src)
+{
+	u64 ts = src->vb2_buf.timestamp;
+	struct vb2_v4l2_buffer *next;
+
+	if (ctx->prev_ts_valid)
+		return ts > ctx->prev_ts ? (ts - ctx->prev_ts) / 2 : 0;
+
+	next = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+	if (next && next->vb2_buf.timestamp > ts)
+		return (next->vb2_buf.timestamp - ts) / 2;
+
+	return 0;
+}
+
 static void iep_device_run(void *priv)
 {
 	struct iep_ctx *ctx = priv;
@@ -398,11 +430,7 @@ static void iep_device_run(void *priv)
 		dst1 = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
 		ctx->job_dst[1] = dst1;
 		ctx->job_ndst = 2;
-
-		if (ctx->prev_ts_valid &&
-		    src->vb2_buf.timestamp > ctx->prev_ts)
-			half_period = (src->vb2_buf.timestamp -
-				       ctx->prev_ts) / 2;
+		half_period = iep_second_field_offset(ctx, src);
 	}
 	ctx->prev_ts = src->vb2_buf.timestamp;
 	ctx->prev_ts_valid = true;
