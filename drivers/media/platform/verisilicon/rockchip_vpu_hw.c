@@ -338,8 +338,9 @@ static const struct hantro_fmt rockchip_vdpu2_dec_fmts[] = {
 };
 
 /*
- * The RK3588 VPU121 with its AVS+ decoder: the VDPU2 formats, plus AVS1
- * and AVS+ decoded by the AVS+ decoder.
+ * The RK3588 VPU121 with its AVS+ decoder: the VDPU2 formats, in the same
+ * order as rockchip_vdpu2_dec_fmts, plus AVS1 and AVS+ decoded by the AVS+
+ * decoder.
  */
 static const struct hantro_fmt rk3588_vpu121_avsd_dec_fmts[] = {
 	{
@@ -369,6 +370,19 @@ static const struct hantro_fmt rk3588_vpu121_avsd_dec_fmts[] = {
 	},
 	{
 		.fourcc = V4L2_PIX_FMT_MPEG2_SLICE,
+		.codec_mode = HANTRO_MODE_MPEG2_DEC,
+		.max_depth = 2,
+		.frmsize = {
+			.min_width = FMT_MIN_WIDTH,
+			.max_width = FMT_FHD_WIDTH,
+			.step_width = MB_DIM,
+			.min_height = FMT_MIN_HEIGHT,
+			.max_height = FMT_FHD_HEIGHT,
+			.step_height = MB_DIM,
+		},
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_MPEG1_SLICE,
 		.codec_mode = HANTRO_MODE_MPEG2_DEC,
 		.max_depth = 2,
 		.frmsize = {
@@ -621,6 +635,10 @@ static const struct hantro_variant rk3588_vpu121_avsd_variant;
 static int rk3588_vpu121_hw_init(struct hantro_dev *vpu)
 {
 	int ret;
+
+	/* The AVS+ variant has every VDPU2 format, and AVS */
+	BUILD_BUG_ON(ARRAY_SIZE(rk3588_vpu121_avsd_dec_fmts) !=
+		     ARRAY_SIZE(rockchip_vdpu2_dec_fmts) + 1);
 
 	ret = rockchip_avsd_hw_init(vpu);
 	if (ret)
