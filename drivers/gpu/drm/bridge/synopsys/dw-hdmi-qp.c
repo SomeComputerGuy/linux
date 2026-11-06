@@ -690,6 +690,15 @@ static void dw_hdmi_qp_bridge_atomic_enable(struct drm_bridge *bridge,
 
 	dw_hdmi_qp_mod(hdmi, HDCP2_BYPASS, HDCP2_BYPASS, HDCP2LOGIC_CONFIG0);
 
+	/*
+	 * Keep data islands out of the HDCP rekey keep-out window whether or
+	 * not the link is encrypted, so they never overlap the window in which
+	 * an HDCP capable sink looks for the encryption status signalling.
+	 */
+	if (connector->display_info.is_hdmi)
+		dw_hdmi_qp_mod(hdmi, KEEPOUT_REKEY_ALWAYS, KEEPOUT_REKEY_CFG,
+			       FRAME_COMPOSER_CONFIG9);
+
 	drm_atomic_helper_connector_hdmi_update_infoframes(connector, state);
 
 	ret = drm_connector_hdmi_enable_frl(connector, conn_state);
