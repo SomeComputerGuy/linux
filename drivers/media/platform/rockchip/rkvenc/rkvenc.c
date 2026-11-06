@@ -757,6 +757,33 @@ static void rkvenc_read_feedback(struct rkvenc_core *core,
 	fb->cycles = readl_relaxed(r + VEPU580_DBG_FRAME_CYC);
 }
 
+/* Add the status of one hardware pass to that of the earlier ones. */
+static void rkvenc_add_feedback(struct rkvenc_feedback *sum,
+				const struct rkvenc_feedback *fb, bool first)
+{
+	unsigned int i;
+
+	if (first) {
+		*sum = *fb;
+		return;
+	}
+
+	sum->int_sta |= fb->int_sta;
+	sum->bs_len += fb->bs_len;
+	sum->sse += fb->sse;
+	sum->qp_sum += fb->qp_sum;
+	sum->madi += fb->madi;
+	sum->madp += fb->madp;
+	sum->intra_blocks += fb->intra_blocks;
+	for (i = 0; i < RKVENC_PNUM_COUNT; i++)
+		sum->pnum[i] += fb->pnum[i];
+	if (fb->qp_min >= 0 && (sum->qp_min < 0 || fb->qp_min < sum->qp_min))
+		sum->qp_min = fb->qp_min;
+	if (fb->qp_max > sum->qp_max)
+		sum->qp_max = fb->qp_max;
+	sum->cycles += fb->cycles;
+}
+
 static void rkvenc_release_core(struct rkvenc_core *core)
 {
 	struct rkvenc_dev *rkvenc = core->rkvenc;
@@ -850,6 +877,8 @@ static void rkvenc_device_run(void *priv)
 	core->run.src = src;
 	core->run.dst = dst;
 	core->run.hdr_bytes = 0;
+	core->run.pass = 0;
+	memset(&core->run.fb, 0, sizeof(core->run.fb));
 
 	req = src->vb2_buf.req_obj.req;
 	if (req)
@@ -925,6 +954,25 @@ static irqreturn_t rkvenc_irq_thread(int irq, void *priv)
 		dev_err(core->dev, "encode error, irq status %#x\n", sta);
 		state = VB2_BUF_STATE_ERROR;
 		rkvenc_hw_reset(core);
+	} else {
+		const struct rkvenc_codec_ops *ops =
+			core->curr_ctx->coded_fmt_desc->ops;
+		int ret = 0;
+
+		rkvenc_add_feedback(&core->run.fb, &fb, !core->run.pass);
+
+		/* Pictures encoded in several passes, e.g. HEVC tile columns */
+		if (ops->next_pass)
+			ret = ops->next_pass(core->curr_ctx, core, &core->run);
+		if (ret > 0) {
+			core->run.pass++;
+			rkvenc_hw_start(core);
+			pm_runtime_put_noidle(core->dev);
+			return IRQ_HANDLED;
+		}
+		if (ret < 0)
+			state = VB2_BUF_STATE_ERROR;
+		fb = core->run.fb;
 	}
 
 	pm_runtime_put_noidle(core->dev);

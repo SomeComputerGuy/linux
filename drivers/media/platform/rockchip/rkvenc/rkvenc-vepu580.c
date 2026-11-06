@@ -203,7 +203,8 @@ int vepu580_alloc_line_buf(struct rkvenc_ctx *ctx)
 	unsigned int width = ALIGN(ctx->coded_fmt.fmt.pix_mp.width,
 				   ctx->coded_fmt_desc->size_align);
 
-	if (width <= VEPU580_LINE_BUF_MAX_WIDTH)
+	if (!ctx->coded_fmt_desc->ext_line_buf ||
+	    width <= VEPU580_LINE_BUF_MAX_WIDTH)
 		return 0;
 
 	return rkvenc_alloc_aux(ctx->dev, &ctx->line_buf,
@@ -490,45 +491,29 @@ void vepu580_setup_h264_tuning(struct rkvenc_dev *rkvenc,
 }
 
 /*
- * HEVC motion estimation: the same search window as H.264 (+-44 x +-28
- * pixels), with the CIME cache sized in 64x64 CTU columns and 4-line row
- * groups.
+ * HEVC coarse integer motion estimation (CIME) cache, sized in 64x64 CTU
+ * columns and 4-line row groups, for the CTU columns the search window can
+ * reach from a tile of @tile_w CTU columns starting at column @tile_x (the
+ * whole picture when it is not split into tiles).
  */
-void vepu580_setup_hevc_me(struct rkvenc_core *core, unsigned int width,
-			   unsigned int height, bool colmv_stor, bool colmv_load)
+void vepu580_setup_hevc_cime(struct rkvenc_core *core, unsigned int width,
+			     unsigned int tile_x, unsigned int tile_w)
 {
 	const unsigned int cache_max = 2464;
-	unsigned int width_mbs = DIV_ROUND_UP(width, 16);
-	unsigned int height_mbs = DIV_ROUND_UP(height, 16);
-	unsigned int cols = DIV_ROUND_UP(width, 64);
-	unsigned int blk_w = 44, blk_h = 28, hal;
-	unsigned int srch_w, srch_h, rx, ry, cur_w, rows, rows_max;
+	u32 rnge = core->shadow[VEPU580_ME_RNGE / 4];
+	unsigned int srch_w = FIELD_GET(VEPU580_ME_RNGE_CME_SRCH_H, rnge) * 4;
+	unsigned int srch_h = FIELD_GET(VEPU580_ME_RNGE_CME_SRCH_V, rnge) * 4;
+	unsigned int pic_cols = DIV_ROUND_UP(width, 64);
+	unsigned int reach = DIV_ROUND_UP(srch_w, 16);
+	unsigned int first, last, cols;
+	unsigned int rx, ry, cur_w, rows, rows_max;
 	unsigned int rama_h, ramb_h, l2_tag;
 
-	if (blk_w / 4 * 2 > (width_mbs * 2 + 1) / 2)
-		blk_w = (width_mbs * 2 + 1) / 2 / 2 * 4;
-
-	hal = ALIGN(height_mbs * 16, 64);
-	if (blk_h / 4 > hal / 128 * 4)
-		blk_h = hal / 128 * 16;
-
-	rkvenc_set(core, VEPU580_ME_RNGE,
-		   FIELD_PREP(VEPU580_ME_RNGE_CME_SRCH_H, blk_w / 4) |
-		   FIELD_PREP(VEPU580_ME_RNGE_CME_SRCH_V, blk_h / 4) |
-		   FIELD_PREP(VEPU580_ME_RNGE_RME_SRCH_H, 7) |
-		   FIELD_PREP(VEPU580_ME_RNGE_RME_SRCH_V, 5) |
-		   FIELD_PREP(VEPU580_ME_RNGE_DLT_FRM_NUM, 1));
-
-	rkvenc_set(core, VEPU580_ME_CFG,
-		   FIELD_PREP(VEPU580_ME_CFG_PMV_MDST_H, 5) |
-		   FIELD_PREP(VEPU580_ME_CFG_PMV_MDST_V, 5) |
-		   FIELD_PREP(VEPU580_ME_CFG_PMV_NUM, 2) |
-		   (colmv_stor ? VEPU580_ME_CFG_COLMV_STOR : 0) |
-		   (colmv_load ? VEPU580_ME_CFG_COLMV_LOAD : 0));
-
 	/* Search window in pixels, with a zero global motion vector. */
-	srch_w = blk_w;
-	srch_h = blk_h;
+	first = tile_x > reach ? tile_x - reach : 0;
+	last = min(tile_x + tile_w - 1 + reach, pic_cols - 1);
+	cols = last - first + 1;
+
 	rx = (16 - srch_w % 16) % 16;
 	ry = (4 - srch_h % 4) % 4;
 	cur_w = min(DIV_ROUND_UP(rx + 2 * srch_w, 16) + 1, cols);
@@ -551,14 +536,20 @@ void vepu580_setup_hevc_me(struct rkvenc_core *core, unsigned int width,
 	if (cache_max < (rama_h - 4) * cols * 4 + ramb_h * 4 * cur_w)
 		rama_h -= 4;
 
-	if (cols <= 8)
+	/*
+	 * The L2 cache maps at most 4096 pixel columns: wider pictures (which
+	 * are split into tiles) keep the default mapping, as in MPP.
+	 */
+	if (pic_cols <= 8)
 		l2_tag = 0;
-	else if (cols <= 16)
+	else if (pic_cols <= 16)
 		l2_tag = 1;
-	else if (cols <= 32)
+	else if (pic_cols <= 32)
 		l2_tag = 2;
-	else
+	else if (pic_cols <= 64)
 		l2_tag = 3;
+	else
+		l2_tag = 0;
 
 	rkvenc_set(core, VEPU580_ME_CACH,
 		   FIELD_PREP(VEPU580_ME_CACH_CME_RAMA_MAX,
@@ -566,6 +557,39 @@ void vepu580_setup_hevc_me(struct rkvenc_core *core, unsigned int width,
 		   FIELD_PREP(VEPU580_ME_CACH_CME_RAMA_H, rama_h) |
 		   FIELD_PREP(VEPU580_ME_CACH_CACH_L2_TAG, l2_tag) |
 		   FIELD_PREP(VEPU580_ME_CACH_CME_LINEBUF_W, cols));
+}
+
+/*
+ * HEVC motion estimation: the same search window as H.264 (+-44 x +-28
+ * pixels). The CIME cache depends on the tile, see vepu580_setup_hevc_cime().
+ */
+void vepu580_setup_hevc_me(struct rkvenc_core *core, unsigned int width,
+			   unsigned int height, bool colmv_stor, bool colmv_load)
+{
+	unsigned int width_mbs = DIV_ROUND_UP(width, 16);
+	unsigned int height_mbs = DIV_ROUND_UP(height, 16);
+	unsigned int blk_w = 44, blk_h = 28, hal;
+
+	if (blk_w / 4 * 2 > (width_mbs * 2 + 1) / 2)
+		blk_w = (width_mbs * 2 + 1) / 2 / 2 * 4;
+
+	hal = ALIGN(height_mbs * 16, 64);
+	if (blk_h / 4 > hal / 128 * 4)
+		blk_h = hal / 128 * 16;
+
+	rkvenc_set(core, VEPU580_ME_RNGE,
+		   FIELD_PREP(VEPU580_ME_RNGE_CME_SRCH_H, blk_w / 4) |
+		   FIELD_PREP(VEPU580_ME_RNGE_CME_SRCH_V, blk_h / 4) |
+		   FIELD_PREP(VEPU580_ME_RNGE_RME_SRCH_H, 7) |
+		   FIELD_PREP(VEPU580_ME_RNGE_RME_SRCH_V, 5) |
+		   FIELD_PREP(VEPU580_ME_RNGE_DLT_FRM_NUM, 1));
+
+	rkvenc_set(core, VEPU580_ME_CFG,
+		   FIELD_PREP(VEPU580_ME_CFG_PMV_MDST_H, 5) |
+		   FIELD_PREP(VEPU580_ME_CFG_PMV_MDST_V, 5) |
+		   FIELD_PREP(VEPU580_ME_CFG_PMV_NUM, 2) |
+		   (colmv_stor ? VEPU580_ME_CFG_COLMV_STOR : 0) |
+		   (colmv_load ? VEPU580_ME_CFG_COLMV_LOAD : 0));
 }
 
 /*
