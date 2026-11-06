@@ -499,6 +499,7 @@ static const struct rkvenc_ctrls rkvenc_h264_ctrls = {
 const struct rkvenc_coded_fmt_desc rkvenc_h264_fmt_desc = {
 	.fourcc = V4L2_PIX_FMT_H264_SLICE,
 	.size_align = 16,
+	.ext_line_buf = true,
 	.frmsize = {
 		.min_width = 64,
 		/* Wider than 4096 with the external line buffer. */

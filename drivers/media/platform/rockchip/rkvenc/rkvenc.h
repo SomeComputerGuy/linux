@@ -98,6 +98,10 @@ struct rkvenc_run {
 	struct vb2_v4l2_buffer *dst;
 	/* Bytes written by software at the start of @dst (parameter sets). */
 	unsigned int hdr_bytes;
+	/* Hardware pass of the picture, counted from 0. */
+	unsigned int pass;
+	/* Status read-back of the finished passes, summed. */
+	struct rkvenc_feedback fb;
 };
 
 /**
@@ -107,6 +111,11 @@ struct rkvenc_run {
  * @stop: called on STREAMOFF, frees codec state
  * @run: prepare the job: produce software headers and fill @core's shadow
  *	 registers (codec syntax, rate control and references)
+ * @next_pass: optional, called after each hardware pass that finished without
+ *	       error, with the status of the passes so far summed in @run->fb.
+ *	       Returns 1 after updating @core's shadow registers for another
+ *	       pass of the same picture, 0 when the picture is complete, or a
+ *	       negative error code.
  * @done: called after the hardware finished; @fb holds the status read-back.
  *	  The backend sets the CAPTURE payload and may change @state.
  */
@@ -116,6 +125,8 @@ struct rkvenc_codec_ops {
 	void (*stop)(struct rkvenc_ctx *ctx);
 	int (*run)(struct rkvenc_ctx *ctx, struct rkvenc_core *core,
 		   struct rkvenc_run *run);
+	int (*next_pass)(struct rkvenc_ctx *ctx, struct rkvenc_core *core,
+			 struct rkvenc_run *run);
 	void (*done)(struct rkvenc_ctx *ctx, struct rkvenc_run *run,
 		     const struct rkvenc_feedback *fb,
 		     enum vb2_buffer_state *state);
@@ -130,10 +141,13 @@ struct rkvenc_ctrls {
  * struct rkvenc_coded_fmt_desc - coded (CAPTURE) format description
  * @size_align: alignment of the encoded picture size (enc_rsl), the
  *		hardware pads the source up to it
+ * @ext_line_buf: pictures wider than 4096 pixels are encoded in one pass
+ *		  with the external line buffer
  */
 struct rkvenc_coded_fmt_desc {
 	u32 fourcc;
 	unsigned int size_align;
+	bool ext_line_buf;
 	struct v4l2_frmsize_stepwise frmsize;
 	const struct rkvenc_ctrls *ctrls;
 	const struct rkvenc_codec_ops *ops;
@@ -209,10 +223,19 @@ struct rkvenc_h264_ctx {
 
 /**
  * struct rkvenc_hevc_ctx - HEVC per-context state
+ * @enc: HEVC stateless encode core
+ * @hw_rc: the current picture uses the hardware row rate control
+ * @tile_buf: loop filter data at the tile column boundaries, one part of
+ *	      @tile_buf_size bytes per tile column (pictures wider than 4096)
+ * @tile_buf_size: size of one part of @tile_buf
+ * @tile: tile column the current hardware pass encodes
  */
 struct rkvenc_hevc_ctx {
 	struct v4l2_hevc_enc enc;
 	bool hw_rc;
+	struct rkvenc_aux_buf tile_buf;
+	size_t tile_buf_size;
+	unsigned int tile;
 };
 
 struct rkvenc_ctx {
@@ -247,6 +270,12 @@ static inline void rkvenc_or(struct rkvenc_core *core, u32 reg, u32 val)
 	core->shadow[reg / 4] |= val;
 }
 
+static inline void rkvenc_update(struct rkvenc_core *core, u32 reg, u32 mask,
+				 u32 val)
+{
+	core->shadow[reg / 4] = (core->shadow[reg / 4] & ~mask) | (val & mask);
+}
+
 /* Shared VEPU580 programming helpers (rkvenc-vepu580.c). */
 int rkvenc_alloc_aux(struct rkvenc_dev *rkvenc, struct rkvenc_aux_buf *buf,
 		     size_t size, bool kernel_mapping);
@@ -262,6 +291,8 @@ void vepu580_setup_h264_tuning(struct rkvenc_dev *rkvenc,
 			       struct rkvenc_core *core, bool intra);
 void vepu580_setup_hevc_me(struct rkvenc_core *core, unsigned int width,
 			   unsigned int height, bool colmv_stor, bool colmv_load);
+void vepu580_setup_hevc_cime(struct rkvenc_core *core, unsigned int width,
+			     unsigned int tile_x, unsigned int tile_w);
 void vepu580_setup_hevc_tuning(struct rkvenc_core *core, bool intra);
 
 /**
