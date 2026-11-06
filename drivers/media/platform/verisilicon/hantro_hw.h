@@ -73,6 +73,35 @@ struct hantro_aux_buf {
 /* Number of registers programmed for an H.264 encode on the VEPU2. */
 #define ROCKCHIP_VPU2_H264_ENC_NUM_REGS		184
 
+/* Number of macroblock rate control checkpoints of the VEPU2. */
+#define ROCKCHIP_VPU2_H264_ENC_CHECKPOINTS	10
+
+/**
+ * struct hantro_h264_enc_mb_rc_ref - Reference of the macroblock rate control
+ * @words:	Cumulative word count reached at each checkpoint.
+ * @bits:	Size of the picture in bits, 0 if there is no reference.
+ */
+struct hantro_h264_enc_mb_rc_ref {
+	u32 words[ROCKCHIP_VPU2_H264_ENC_CHECKPOINTS];
+	u64 bits;
+};
+
+/**
+ * struct hantro_h264_enc_mb_rc - Macroblock (checkpoint) rate control state
+ * @ref:	Last picture of each type, P (0) and I (1).
+ * @count:	Number of checkpoints of the current picture, 0 when off.
+ * @intra:	The current picture is an I picture.
+ * @qp_min:	Lowest macroblock QP of the current picture.
+ * @qp_max:	Highest macroblock QP of the current picture.
+ */
+struct hantro_h264_enc_mb_rc {
+	struct hantro_h264_enc_mb_rc_ref ref[2];
+	unsigned int count;
+	bool intra;
+	unsigned int qp_min;
+	unsigned int qp_max;
+};
+
 /**
  * struct hantro_h264_enc_hw_ctx - Per context data specific to H264 encoding.
  * @enc:		H.264 stateless encode core state.
@@ -80,12 +109,14 @@ struct hantro_aux_buf {
  *			cabac_init_idc value.
  * @strm_offset:	Offset of the hardware stream in the destination
  *			buffer, aligned down to 8 bytes.
+ * @mb_rc:		Macroblock rate control state.
  * @regs:		Registers of the encode run being prepared.
  */
 struct hantro_h264_enc_hw_ctx {
 	struct v4l2_h264_enc enc;
 	struct hantro_aux_buf cabac_tbl;
 	unsigned int strm_offset;
+	struct hantro_h264_enc_mb_rc mb_rc;
 	u32 regs[ROCKCHIP_VPU2_H264_ENC_NUM_REGS];
 };
 
