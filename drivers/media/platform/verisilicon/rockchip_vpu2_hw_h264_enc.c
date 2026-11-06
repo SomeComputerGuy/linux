@@ -28,6 +28,10 @@
  *   so the hardware can only encode I and P pictures with a single
  *   reference picture, with the sliding window process.
  *
+ * - In the bitrate modes, the hardware adjusts the QP inside the picture
+ *   at up to 10 checkpoints, from the difference between the cumulative
+ *   word count reached and a target, see vepu2_h264_enc_setup_mb_rc().
+ *
  * - The hardware reads the picture to encode, a single reference picture
  *   and writes the reconstructed picture, both in a semi-planar 4:2:0
  *   format with the dimensions aligned to macroblocks. These are internal
@@ -35,6 +39,8 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/math64.h>
+#include <linux/moduleparam.h>
 #include <linux/unaligned.h>
 #include <media/v4l2-h264-enc.h>
 #include <media/v4l2-mem2mem.h>
@@ -63,6 +69,37 @@
 
 /* The status register holds half of the sum of the macroblock QPs. */
 #define VEPU2_REG_QP_SUM_DIV2_MASK		GENMASK(31, 11)
+
+/*
+ * Macroblock rate control: the checkpoint targets and results count words
+ * in units of 32, the error levels in units of 4. There are 6 error levels
+ * and 7 QP deltas.
+ */
+#define VEPU2_H264_MB_RC_TARGET_UNIT		32
+#define VEPU2_H264_MB_RC_TARGET_MAX		0xffff
+#define VEPU2_H264_MB_RC_ERR_UNIT		4
+#define VEPU2_H264_MB_RC_ERR_LEVELS		6
+#define VEPU2_H264_MB_RC_MAX_DISTANCE		0xfff
+/* Error level step: 1/8 of the expected word count of the picture. */
+#define VEPU2_H264_MB_RC_STEP_SHIFT		3
+/*
+ * A reference picture needs at least this many target units per checkpoint
+ * on average, so that its profile is more than the rounding of the counts.
+ */
+#define VEPU2_H264_MB_RC_MIN_UNITS		2
+
+static unsigned int vepu2_h264_mb_rc_qp_range = 4;
+module_param_named(h264_mb_rc_qp_range, vepu2_h264_mb_rc_qp_range, uint, 0644);
+MODULE_PARM_DESC(h264_mb_rc_qp_range,
+		 "H.264 CBR/VBR: maximum macroblock QP change from the picture QP by the checkpoint rate control (0 = picture-level rate control only)");
+
+/*
+ * QP delta for each error level, the error being the target minus the word
+ * count reached: over the target (negative error) raises the QP.
+ */
+static const s8 vepu2_h264_mb_rc_delta_qp[VEPU2_H264_MB_RC_ERR_LEVELS + 1] = {
+	3, 2, 1, 0, -1, -2, -3
+};
 
 /* Mode decision tables, indexed by QP. */
 static const u8 h264_prev_mode_favor[52] = {
@@ -469,6 +506,149 @@ static int vepu2_h264_enc_set_buffers(struct hantro_ctx *ctx,
 	return (hdr_size - h264_ctx->strm_offset) * 8;
 }
 
+/*
+ * Macroblock rate control, in CBR and VBR modes: the hardware checks the
+ * word count reached at up to 10 checkpoints, evenly spaced in macroblocks,
+ * against a target, and changes the QP of the next macroblocks by a delta
+ * that depends on the error, within [qp_min, qp_max].
+ *
+ * The targets are the word counts reached at the checkpoints by the last
+ * picture of the same type, scaled by the ratio of the size target of this
+ * picture to the size of that one: the content is expected to be spread
+ * the same way. The error levels are steps of 1/8 of the expected word
+ * count of the picture. Without a reference picture of the same type, the
+ * checkpoints only measure the picture, with a constant QP.
+ */
+static void vepu2_h264_enc_setup_mb_rc(struct hantro_ctx *ctx, bool intra)
+{
+	struct hantro_h264_enc_hw_ctx *h264_ctx = &ctx->h264_enc;
+	struct hantro_h264_enc_mb_rc *mb_rc = &h264_ctx->mb_rc;
+	struct hantro_h264_enc_mb_rc_ref *ref = &mb_rc->ref[intra];
+	struct v4l2_h264_enc *enc = &h264_ctx->enc;
+	const struct v4l2_h264_enc_rc *rc = &enc->rc;
+	const struct v4l2_h264_enc_state *state = &enc->state_active;
+	unsigned int range = READ_ONCE(vepu2_h264_mb_rc_qp_range);
+	unsigned int mb_height = MB_HEIGHT(ctx->src_fmt.height);
+	unsigned int mbs = MB_WIDTH(ctx->src_fmt.width) * mb_height;
+	unsigned int count, distance, i;
+	u32 targets[ROCKCHIP_VPU2_H264_ENC_CHECKPOINTS];
+	s32 errors[VEPU2_H264_MB_RC_ERR_LEVELS];
+	u64 target_bits = (u64)rc->size * 8;
+	u64 total, step;
+	u32 reg;
+
+	mb_rc->count = 0;
+	mb_rc->intra = intra;
+	mb_rc->qp_min = rc->qp;
+	mb_rc->qp_max = rc->qp;
+
+	count = min(mb_height - 1, ROCKCHIP_VPU2_H264_ENC_CHECKPOINTS);
+	if (!range || !count || !target_bits || !rc->mode ||
+	    (rc->mode->type != V4L2_H264_ENC_RC_TYPE_CBR &&
+	     rc->mode->type != V4L2_H264_ENC_RC_TYPE_VBR)) {
+		memset(mb_rc->ref, 0, sizeof(mb_rc->ref));
+		vepu2_h264_set(h264_ctx, VEPU_REG_QP_VAL,
+			       VEPU_REG_H264_LUMA_INIT_QP(rc->qp) |
+			       VEPU_REG_H264_QP_MAX(rc->qp) |
+			       VEPU_REG_H264_QP_MIN(rc->qp) |
+			       VEPU_REG_H264_CHKPT_DISTANCE(0));
+		return;
+	}
+
+	distance = min(mbs / (count + 1), VEPU2_H264_MB_RC_MAX_DISTANCE);
+	mb_rc->count = count;
+
+	for (i = 0; i < ARRAY_SIZE(targets); i++)
+		targets[i] = VEPU2_H264_MB_RC_TARGET_MAX;
+	memset(errors, 0, sizeof(errors));
+
+	if (ref->bits) {
+		for (i = 0; i < count; i++) {
+			u64 t = mul_u64_u64_div_u64(ref->words[i], target_bits,
+						    ref->bits);
+
+			targets[i] = min_t(u64, t / VEPU2_H264_MB_RC_TARGET_UNIT + 1,
+					   VEPU2_H264_MB_RC_TARGET_MAX);
+		}
+
+		/* Expected word count of the whole picture. */
+		total = div_u64((u64)ref->words[count - 1] * mbs,
+				count * distance);
+		total = mul_u64_u64_div_u64(total, target_bits, ref->bits);
+		step = DIV_ROUND_UP_ULL(total >> VEPU2_H264_MB_RC_STEP_SHIFT,
+					VEPU2_H264_MB_RC_ERR_UNIT);
+		/* Not finer than the rounding of the targets. */
+		step = clamp_t(u64, step,
+			       VEPU2_H264_MB_RC_TARGET_UNIT / VEPU2_H264_MB_RC_ERR_UNIT,
+			       S16_MAX / 3);
+
+		for (i = 0; i < VEPU2_H264_MB_RC_ERR_LEVELS; i++) {
+			int level = i < VEPU2_H264_MB_RC_ERR_LEVELS / 2 ?
+				    (int)i - 3 : (int)i - 2;
+
+			errors[i] = level * (s32)step;
+		}
+
+		mb_rc->qp_min = max_t(int, state->qp_min, (int)rc->qp - range);
+		mb_rc->qp_max = min(state->qp_max, rc->qp + range);
+	}
+
+	for (i = 0; i < ROCKCHIP_VPU2_H264_ENC_CHECKPOINTS / 2; i++)
+		vepu2_h264_set(h264_ctx, VEPU_REG_CHECKPOINT(i),
+			       VEPU_REG_CHECKPOINT_CHECK1(targets[2 * i]) |
+			       VEPU_REG_CHECKPOINT_CHECK0(targets[2 * i + 1]));
+
+	for (i = 0; i < VEPU2_H264_MB_RC_ERR_LEVELS / 2; i++)
+		vepu2_h264_set(h264_ctx, VEPU_REG_CHKPT_WORD_ERR(i),
+			       VEPU_REG_CHKPT_WORD_ERR_CHK1(errors[2 * i]) |
+			       VEPU_REG_CHKPT_WORD_ERR_CHK0(errors[2 * i + 1]));
+
+	reg = 0;
+	for (i = 0; ref->bits && i <= VEPU2_H264_MB_RC_ERR_LEVELS; i++)
+		reg |= (vepu2_h264_mb_rc_delta_qp[i] & 0xf) << (4 * i);
+	vepu2_h264_set(h264_ctx, VEPU_REG_CHKPT_DELTA_QP, reg);
+
+	vepu2_h264_set(h264_ctx, VEPU_REG_QP_VAL,
+		       VEPU_REG_H264_LUMA_INIT_QP(rc->qp) |
+		       VEPU_REG_H264_QP_MAX(mb_rc->qp_max) |
+		       VEPU_REG_H264_QP_MIN(mb_rc->qp_min) |
+		       VEPU_REG_H264_CHKPT_DISTANCE(distance));
+}
+
+/*
+ * Keep the word counts reached at the checkpoints as the reference of the
+ * next picture of the same type. The results have 16 bits and wrap around.
+ * A picture that reaches less than VEPU2_H264_MB_RC_MIN_UNITS target units
+ * per checkpoint is no reference. The limit does not grow with the picture
+ * size: at low bitrates the P pictures use far less than a word per
+ * macroblock and still need the checkpoints.
+ */
+static void vepu2_h264_enc_read_mb_rc(struct hantro_ctx *ctx, u32 bits)
+{
+	struct hantro_dev *vpu = ctx->core;
+	struct hantro_h264_enc_mb_rc *mb_rc = &ctx->h264_enc.mb_rc;
+	struct hantro_h264_enc_mb_rc_ref *ref = &mb_rc->ref[mb_rc->intra];
+	u32 prev = 0, wrap = 0;
+	unsigned int i;
+
+	if (!mb_rc->count)
+		return;
+
+	for (i = 0; i < mb_rc->count; i++) {
+		u32 reg = vepu_read(vpu, VEPU_REG_CHECKPOINT(i / 2));
+		u32 val = i & 1 ? reg & 0xffff : reg >> 16;
+
+		if (val < prev)
+			wrap += VEPU2_H264_MB_RC_TARGET_MAX + 1;
+		prev = val;
+		ref->words[i] = (val + wrap) * VEPU2_H264_MB_RC_TARGET_UNIT;
+	}
+
+	ref->bits = ref->words[mb_rc->count - 1] >=
+		    mb_rc->count * VEPU2_H264_MB_RC_MIN_UNITS *
+		    VEPU2_H264_MB_RC_TARGET_UNIT ? bits : 0;
+}
+
 static void vepu2_h264_enc_set_params(struct hantro_ctx *ctx,
 				      unsigned int first_free_bit)
 {
@@ -550,14 +730,11 @@ static void vepu2_h264_enc_set_params(struct hantro_ctx *ctx,
 		       VEPU_REG_FRAME_NUM(encode->frame_num));
 
 	/*
-	 * Constant QP for the whole picture: the macroblock rate control,
-	 * with its checkpoints and MAD based QP adjustment, is disabled.
+	 * Picture QP, adjusted by the macroblock rate control in the bitrate
+	 * modes. The MAD based QP adjustment is not used.
 	 */
-	vepu2_h264_set(h264_ctx, VEPU_REG_QP_VAL,
-		       VEPU_REG_H264_LUMA_INIT_QP(qp) |
-		       VEPU_REG_H264_QP_MAX(qp) |
-		       VEPU_REG_H264_QP_MIN(qp) |
-		       VEPU_REG_H264_CHKPT_DISTANCE(0));
+	vepu2_h264_enc_setup_mb_rc(ctx, encode->slice_type ==
+				   V4L2_H264_SLICE_TYPE_I);
 
 	/* Mode decision. */
 	vepu2_h264_set(h264_ctx, VEPU_REG_INTRA_INTER_MODE,
@@ -700,8 +877,9 @@ void rockchip_vpu2_h264_enc_done(struct hantro_ctx *ctx)
 
 	qp_sum = FIELD_GET(VEPU2_REG_QP_SUM_DIV2_MASK,
 			   vepu_read(vpu, VEPU_REG_QP_SUM_DIV2)) * 2;
-	vpu_debug(4, "H.264 frame %u: %zu bytes, average QP %u (target %u)\n",
-		  encode->frame_num, bytesused, qp_sum / mbs, enc->rc.qp);
+	vpu_debug(4, "H.264 frame %u: %zu bytes (target %lu), average QP %u (picture %u, MB %u..%u)\n",
+		  encode->frame_num, bytesused, enc->rc.size, qp_sum / mbs,
+		  enc->rc.qp, h264_ctx->mb_rc.qp_min, h264_ctx->mb_rc.qp_max);
 
 	if (bytesused <= hdr_size + 5 ||
 	    bytesused > vb2_plane_size(&dst_buf->vb2_buf, 0)) {
@@ -718,6 +896,8 @@ void rockchip_vpu2_h264_enc_done(struct hantro_ctx *ctx)
 	nal = (u8 *)vb2_plane_vaddr(&dst_buf->vb2_buf, 0) + hdr_size;
 	if (nal[0] == 0 && nal[1] == 0 && nal[2] == 0 && nal[3] == 1)
 		nal[4] = (nal[4] & ~0x60) | ((encode->nal_ref_idc & 3) << 5);
+
+	vepu2_h264_enc_read_mb_rc(ctx, bits);
 
 	vb2_set_plane_payload(&dst_buf->vb2_buf, 0, bytesused);
 
