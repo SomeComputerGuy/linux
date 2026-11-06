@@ -624,6 +624,9 @@ const struct rga_hw rga3_hw = {
 	.max_dst_height = RGA3_MAX_OUTPUT_HEIGHT,
 	.max_scaling_factor = RGA3_MAX_SCALING_FACTOR,
 	.stride_alignment = 16,
+	/* the virtual strides are 15-bit word counts, 16 byte aligned */
+	.max_bytesperline = ALIGN_DOWN(0x7fff * 4, 16),
+	.has_chroma_stride = true,
 	.features = RGA_FEATURE_FLIP | RGA_FEATURE_ROTATE,
 
 	.setup_cmdbuf = rga3_hw_setup_cmdbuf,

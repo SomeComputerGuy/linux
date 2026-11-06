@@ -204,6 +204,10 @@ struct rga_hw {
 	u32 max_dst_width, max_dst_height;
 	u8 max_scaling_factor;
 	u8 stride_alignment;
+	/* Largest bytesperline the core can address */
+	u32 max_bytesperline;
+	/* The chroma plane has a stride of its own, not one derived from luma */
+	bool has_chroma_stride;
 	u8 features;
 
 	/*

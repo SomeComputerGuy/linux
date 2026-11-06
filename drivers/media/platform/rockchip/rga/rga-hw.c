@@ -46,6 +46,11 @@ rga_get_corner_addrs(struct rga_frame *frm, struct rga_addrs *addrs,
 	unsigned int x_div = 0,
 		     y_div = 0, y_stride = 0, uv_stride = 0, pixel_width = 0;
 
+	/*
+	 * The stride can be larger than the width needs, the bytes per pixel
+	 * come from the format.
+	 */
+
 	lt = &corner_addrs.left_top;
 	lb = &corner_addrs.left_bottom;
 	rt = &corner_addrs.right_top;
@@ -63,7 +68,7 @@ rga_get_corner_addrs(struct rga_frame *frm, struct rga_addrs *addrs,
 	y_div = format_info->vdiv;
 	y_stride = frm->pix.plane_fmt[0].bytesperline;
 	uv_stride = y_stride / x_div;
-	pixel_width = y_stride / frm->pix.width;
+	pixel_width = format_info->bpp[0] / format_info->bpp_div[0];
 
 	lt->y_addr = addrs->y_addr + y * y_stride + x * pixel_width;
 	lt->u_addr = addrs->u_addr + (y / y_div) * uv_stride + x / x_div;
@@ -612,6 +617,8 @@ const struct rga_hw rga2_hw = {
 	.max_dst_height = MAX_DST_HEIGHT,
 	.max_scaling_factor = MAX_SCALING_FACTOR,
 	.stride_alignment = 4,
+	/* the virtual strides are 15-bit word counts */
+	.max_bytesperline = 0x7fff * 4,
 	.features = RGA_FEATURE_FLIP
 		  | RGA_FEATURE_ROTATE
 		  | RGA_FEATURE_BG_COLOR
