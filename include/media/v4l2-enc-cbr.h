@@ -18,6 +18,11 @@
  * @bitrate: bitrate the state was set up for, 0 before the first picture
  * @nominal: nominal picture size in bits (bitrate times frame interval)
  * @qp_q8: QP of the P pictures in 1/256 units, -1 before the first picture
+ * @qp_intra_ref_q8: @qp_q8 when the previous I picture was coded, -1 before
+ *		     the first I picture
+ * @qp_intra_add_q8: QP increase of the I pictures after I pictures larger
+ *		     than their share of the GOP at the largest I/P ratio
+ * @qp_pic: QP of the current picture
  * @ratio: I/P picture size ratio in 1/16 units
  * @gop: measured IDR period in pictures, 0 until two I pictures were seen
  * @since_i: pictures coded since the last I picture
@@ -39,6 +44,9 @@ struct v4l2_enc_cbr {
 	u32 bitrate;
 	u64 nominal;
 	int qp_q8;
+	int qp_intra_ref_q8;
+	int qp_intra_add_q8;
+	int qp_pic;
 	unsigned int ratio;
 	unsigned int gop;
 	unsigned int since_i;
