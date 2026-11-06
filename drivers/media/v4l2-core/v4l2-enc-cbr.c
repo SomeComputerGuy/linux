@@ -4,7 +4,12 @@
  *
  * One QP state is kept for the stream: it is the QP of the P (and B)
  * pictures, and I pictures are coded a fixed number of steps below it, so
- * that the quality of the reference pictures stays even across GOPs. Each
+ * that the quality of the reference pictures stays even across GOPs. The
+ * I pictures take the mean of the state now and at the previous I picture,
+ * so that a drift of the state over a GOP (static content, where P pictures
+ * are cheap) moves the size of the next I picture by half as much, and an
+ * I picture that exceeded its share of the GOP at the largest I/P size
+ * ratio raises the QP of the following I pictures until they fit. Each
  * picture gets a size target from a GOP plan, in which an I picture is
  * "ratio" times the size of a P picture, with the ratio and the IDR period
  * measured on the stream. The difference between the coded size so far and
@@ -39,6 +44,15 @@
 #define CBR_RATIO_INIT		160
 #define CBR_RATIO_MIN		24
 #define CBR_RATIO_MAX		480
+/*
+ * The I QP increase after oversized I pictures: at most 4 QP (1/256 units)
+ * per I picture for an I picture twice its largest share, and in all at most
+ * a quarter QP per QP step below 45, up to 6 QP (more where the QP is low,
+ * where a QP step changes the size by fewer bits).
+ */
+#define CBR_INTRA_ADD_STEP	(4 * 256)
+#define CBR_INTRA_ADD_QP_END	45
+#define CBR_INTRA_ADD_MAX	(6 * 256)
 /* P pictures after an I picture when the I/P size ratio is measured */
 #define CBR_RATIO_PICS		4
 /* QP errors up to this are corrected by 1/8 per picture, 1/256 units */
@@ -85,9 +99,9 @@ static u64 cbr_nominal(u32 bitrate, const struct v4l2_fract *timeperframe)
 				  timeperframe->denominator), 1);
 }
 
-/* Planned size of an I or P picture of the current GOP */
-static u64 cbr_plan(const struct v4l2_enc_cbr *cbr, unsigned int fps,
-		    bool intra)
+/* Planned size of an I or P picture of the current GOP at an I/P ratio */
+static u64 cbr_plan_ratio(const struct v4l2_enc_cbr *cbr, unsigned int fps,
+			  bool intra, unsigned int ratio)
 {
 	unsigned int gop = cbr->gop;
 	u64 p;
@@ -98,11 +112,41 @@ static u64 cbr_plan(const struct v4l2_enc_cbr *cbr, unsigned int fps,
 	if (gop <= 1)
 		return cbr->nominal;
 
-	p = div_u64(cbr->nominal * gop * 16, cbr->ratio + 16 * (gop - 1));
+	p = div_u64(cbr->nominal * gop * 16, ratio + 16 * (gop - 1));
 	if (intra)
-		p = div_u64(p * cbr->ratio, 16);
+		p = div_u64(p * ratio, 16);
 
 	return max_t(u64, p, 1);
+}
+
+static u64 cbr_plan(const struct v4l2_enc_cbr *cbr, unsigned int fps,
+		    bool intra)
+{
+	return cbr_plan_ratio(cbr, fps, intra, cbr->ratio);
+}
+
+/*
+ * QP of an I picture: the mean of the QP state now and at the previous I
+ * picture (the current state weighs 70% when it rose from 33 or below to 35
+ * or above: content that got much harder), plus the increase after
+ * oversized I pictures, less the I QP delta. All-intra streams use the
+ * state alone, which then follows the I pictures fully.
+ */
+static int cbr_qp_intra(const struct v4l2_enc_cbr *cbr)
+{
+	int cur = cbr->qp_q8, ref = cbr->qp_intra_ref_q8, q8;
+
+	if (cbr->gop == 1 || ref < 0)
+		q8 = cur;
+	else if (cur >= 35 * 256 && ref <= 33 * 256)
+		q8 = (3 * ref + 7 * cur) / 10;
+	else
+		q8 = (ref + cur) / 2;
+
+	if (cbr->gop != 1)
+		q8 += cbr->qp_intra_add_q8;
+
+	return DIV_ROUND_CLOSEST(q8, 256) - cbr->qp_delta_intra;
 }
 
 /*
@@ -165,6 +209,7 @@ int v4l2_enc_cbr_begin(struct v4l2_enc_cbr *cbr, u32 bitrate,
 	if (!cbr->bitrate) {
 		cbr->ratio = CBR_RATIO_INIT;
 		cbr->qp_q8 = -1;
+		cbr->qp_intra_ref_q8 = -1;
 	}
 
 	if (cbr->bitrate != bitrate || cbr->nominal != nominal) {
@@ -190,6 +235,9 @@ int v4l2_enc_cbr_begin(struct v4l2_enc_cbr *cbr, u32 bitrate,
 		cbr->qp_q8 = clamp_t(int, qp, qp_min, qp_max) * 256;
 	}
 
+	cbr->qp_pic = intra ? cbr_qp_intra(cbr) :
+			      DIV_ROUND_CLOSEST(cbr->qp_q8, 256);
+
 	/*
 	 * The buffer holds the coded minus the nominal sizes. Within a GOP the
 	 * plan expects it to go up by the excess of the I picture and back
@@ -214,6 +262,9 @@ int v4l2_enc_cbr_begin(struct v4l2_enc_cbr *cbr, u32 bitrate,
 		 cbr->nominal, cbr->plan_bits, cbr->target_bits);
 	pr_debug("  buffer: %lld bits, expected: %lld bits, gop: %u, ratio: %u",
 		 cbr->buffer_bits, expected, cbr->gop, cbr->ratio);
+	pr_debug("  intra: %d, picture QP %d, I state ref %d/256, I add %d/256",
+		 intra, cbr->qp_pic, cbr->qp_intra_ref_q8,
+		 cbr->qp_intra_add_q8);
 
 	return 0;
 }
@@ -227,12 +278,7 @@ EXPORT_SYMBOL_GPL(v4l2_enc_cbr_begin);
  */
 int v4l2_enc_cbr_qp(const struct v4l2_enc_cbr *cbr)
 {
-	int qp = DIV_ROUND_CLOSEST(cbr->qp_q8, 256);
-
-	if (cbr->intra)
-		qp -= cbr->qp_delta_intra;
-
-	return qp;
+	return cbr->qp_pic;
 }
 EXPORT_SYMBOL_GPL(v4l2_enc_cbr_qp);
 
@@ -248,9 +294,11 @@ void v4l2_enc_cbr_end(struct v4l2_enc_cbr *cbr, u64 bits,
 		      const struct v4l2_fract *timeperframe, int qp_min,
 		      int qp_max)
 {
-	s64 limit = cbr->nominal * CBR_BUFFER_SECONDS * cbr_fps(timeperframe);
+	unsigned int fps = cbr_fps(timeperframe);
+	s64 limit = cbr->nominal * CBR_BUFFER_SECONDS * fps;
 	unsigned int ratio;
 	int err, step;
+	s64 cap, add;
 
 	if (!cbr->bitrate || !cbr->target_bits)
 		return;
@@ -285,6 +333,30 @@ void v4l2_enc_cbr_end(struct v4l2_enc_cbr *cbr, u64 bits,
 		 * estimate: only all-intra streams steer the QP fully with it.
 		 */
 		cbr->i_bits = bits;
+
+		/*
+		 * Above its share of the GOP at the largest I/P ratio, an I
+		 * picture is more than the P pictures of the plan can make
+		 * up for: raise the QP of the next I pictures by up to 4 QP
+		 * per picture (at twice the share), and lower the increase
+		 * again as I pictures come out below the share.
+		 */
+		cap = cbr_plan_ratio(cbr, fps, true, CBR_RATIO_MAX);
+		if (cbr->gop != 1 && (bits > cap || cbr->qp_intra_add_q8)) {
+			add = div64_s64(((s64)bits - cap) * CBR_INTRA_ADD_STEP,
+					cap);
+			add = clamp_t(s64, add, -CBR_INTRA_ADD_STEP,
+				      CBR_INTRA_ADD_STEP) +
+			      cbr->qp_intra_add_q8;
+			cbr->qp_intra_add_q8 =
+				clamp_t(s64, add, 0,
+					clamp((CBR_INTRA_ADD_QP_END -
+					       cbr->qp_pic) * 64, 0,
+					      CBR_INTRA_ADD_MAX));
+		}
+
+		/* The state the next I picture takes the mean with */
+		cbr->qp_intra_ref_q8 = cbr->qp_q8;
 		cbr->qp_q8 += cbr->gop == 1 ? step : step / 4;
 	}
 
