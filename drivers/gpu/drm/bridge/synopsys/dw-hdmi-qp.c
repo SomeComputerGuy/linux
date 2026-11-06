@@ -1179,19 +1179,14 @@ static int dw_hdmi_qp_cec_enable(struct drm_bridge *bridge, bool enable)
 {
 	struct dw_hdmi_qp *hdmi = dw_hdmi_qp_from_bridge(bridge);
 	unsigned int irqs;
-	u32 swdisable;
 
 	if (!enable) {
 		dw_hdmi_qp_write(hdmi, 0, CEC_INT_MASK_N);
 		dw_hdmi_qp_write(hdmi, ~0, CEC_INT_CLEAR);
 
-		swdisable = dw_hdmi_qp_read(hdmi, GLOBAL_SWDISABLE);
-		swdisable = swdisable | CEC_SWDISABLE;
-		dw_hdmi_qp_write(hdmi, swdisable, GLOBAL_SWDISABLE);
+		dw_hdmi_qp_mod(hdmi, CEC_SWDISABLE, CEC_SWDISABLE, GLOBAL_SWDISABLE);
 	} else {
-		swdisable = dw_hdmi_qp_read(hdmi, GLOBAL_SWDISABLE);
-		swdisable = swdisable & ~CEC_SWDISABLE;
-		dw_hdmi_qp_write(hdmi, swdisable, GLOBAL_SWDISABLE);
+		dw_hdmi_qp_mod(hdmi, 0, CEC_SWDISABLE, GLOBAL_SWDISABLE);
 
 		dw_hdmi_qp_write(hdmi, ~0, CEC_INT_CLEAR);
 		dw_hdmi_qp_write(hdmi, 1, CEC_LOCK_CONTROL);
