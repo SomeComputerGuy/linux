@@ -474,6 +474,11 @@ static struct rga3_fmt rga3_formats[] = {
 		.yuv10b_endian = 1,
 	},
 	{
+		.fourcc = V4L2_PIX_FMT_NV20,
+		.hw_format = RGA3_COLOR_FMT_YUV422_10B,
+		.yuv10b_compact = 1,
+	},
+	{
 		.fourcc = V4L2_PIX_FMT_NV16M,
 		.hw_format = RGA3_COLOR_FMT_YUV422,
 	},
