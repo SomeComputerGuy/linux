@@ -156,6 +156,27 @@ static void rga_cmd_set_dst_addr(struct rga_ctx *ctx, dma_addr_t dma_addr)
 	dest[reg >> 2] |= 0x7 << 8;
 }
 
+/*
+ * The mirror bits of the RGA2 flip the picture after the rotation: the X
+ * mirror flips it horizontally and the Y mirror vertically, in the
+ * orientation of the destination. The V4L2 flips apply to the source,
+ * before the rotation, so with a rotation by 90 or 270 degrees a horizontal
+ * flip of the source is a vertical mirror of the destination and the other
+ * way round. Both mirrors commute with the rotation by 180 degrees.
+ */
+static unsigned int rga_get_mirror_mode(struct rga_ctx *ctx)
+{
+	bool swap = ctx->rotate == 90 || ctx->rotate == 270;
+	unsigned int mir_mode = 0;
+
+	if (swap ? ctx->vflip : ctx->hflip)
+		mir_mode |= RGA_SRC_MIRR_MODE_X;
+	if (swap ? ctx->hflip : ctx->vflip)
+		mir_mode |= RGA_SRC_MIRR_MODE_Y;
+
+	return mir_mode;
+}
+
 static void rga_cmd_set_trans_info(struct rga_ctx *ctx)
 {
 	u32 *dest = ctx->cmdbuf_virt;
@@ -221,11 +242,7 @@ static void rga_cmd_set_trans_info(struct rga_ctx *ctx)
 		}
 	}
 
-	if (ctx->vflip)
-		src_info.data.mir_mode |= RGA_SRC_MIRR_MODE_X;
-
-	if (ctx->hflip)
-		src_info.data.mir_mode |= RGA_SRC_MIRR_MODE_Y;
+	src_info.data.mir_mode = rga_get_mirror_mode(ctx);
 
 	switch (ctx->rotate) {
 	case 90:
@@ -345,7 +362,7 @@ static void rga_cmd_set_dst_info(struct rga_ctx *ctx,
 	struct rga_corners_addrs corner_addrs;
 	u32 *dest = ctx->cmdbuf_virt;
 	unsigned int dst_h, dst_w, dst_x, dst_y;
-	unsigned int mir_mode = 0;
+	unsigned int mir_mode;
 	unsigned int rot_mode = 0;
 
 	dst_h = ctx->out.crop.height;
@@ -353,10 +370,7 @@ static void rga_cmd_set_dst_info(struct rga_ctx *ctx,
 	dst_x = ctx->out.crop.left;
 	dst_y = ctx->out.crop.top;
 
-	if (ctx->vflip)
-		mir_mode |= RGA_SRC_MIRR_MODE_X;
-	if (ctx->hflip)
-		mir_mode |= RGA_SRC_MIRR_MODE_Y;
+	mir_mode = rga_get_mirror_mode(ctx);
 
 	switch (ctx->rotate) {
 	case 90:
