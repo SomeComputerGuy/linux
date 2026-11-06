@@ -75,6 +75,19 @@ static bool rga3_can_rotate_90(const void *in_fmt)
 }
 
 /*
+ * The offset and the width of a 10-bit YUV window must be aligned to 4 pixels
+ * (TRM part 2, 5.6.3), the common code aligns YUV rectangles to 2 pixels.
+ */
+static void rga3_align_rect(const void *fmt, struct v4l2_rect *r)
+{
+	if (!rga3_is_yuv10b(fmt))
+		return;
+
+	r->left = ALIGN_DOWN(r->left, 4);
+	r->width = ALIGN_DOWN(r->width, 4);
+}
+
+/*
  * Map the transformations to the RGA3 command buffer: the orientation, the
  * scaling settings and a fixed alpha value.
  */
@@ -105,7 +118,6 @@ static void rga3_cmd_set_trans_info(struct rga_ctx *ctx)
 	}
 
 	/*
-	 * Support basic input cropping to support 1088px inputs.
 	 * The window rotates before it scales, so a rotated source is
 	 * scaled with its width and height swapped.
 	 */
@@ -116,8 +128,8 @@ static void rga3_cmd_set_trans_info(struct rga_ctx *ctx)
 		src_h = ctx->in.crop.height;
 		src_w = ctx->in.crop.width;
 	}
-	dst_h = ctx->out.pix.height;
-	dst_w = ctx->out.pix.width;
+	dst_h = ctx->out.crop.height;
+	dst_w = ctx->out.crop.width;
 
 	reg = RGA3_WIN0_RD_CTRL - RGA3_FIRST_CMD_REG;
 	cmd[reg >> 2] |= FIELD_PREP(RGA3_WIN_ROT, rot)
@@ -184,18 +196,12 @@ static void rga3_cmd_set_win0_format(struct rga_ctx *ctx)
 	const struct rga3_fmt *in = ctx->in.fmt;
 	const struct rga3_fmt *out = ctx->out.fmt;
 	const struct v4l2_format_info *in_fmt, *out_fmt;
-	unsigned int act_h, act_w, src_h, src_w;
+	const struct v4l2_rect *crop = &ctx->in.crop;
 	bool r2y, y2r;
 	u8 rd_format;
 	const struct v4l2_pix_format_mplane *csc_pix;
 	u8 csc_mode;
 	unsigned int reg;
-
-	act_h = ctx->in.pix.height;
-	act_w = ctx->in.pix.width;
-	/* Support basic input cropping to support 1088px inputs */
-	src_h = ctx->in.crop.height;
-	src_w = ctx->in.crop.width;
 
 	in_fmt = v4l2_format_info(in->fourcc);
 	out_fmt = v4l2_format_info(out->fourcc);
@@ -248,13 +254,19 @@ static void rga3_cmd_set_win0_format(struct rga_ctx *ctx)
 	else
 		cmd[reg >> 2] = ctx->in.pix.plane_fmt[0].bytesperline >> 2;
 
-	/* set size */
-	reg = RGA3_WIN0_ACT_SIZE - RGA3_FIRST_CMD_REG;
-	cmd[reg >> 2] = FIELD_PREP(RGA3_WIDTH, act_w)
-		      | FIELD_PREP(RGA3_HEIGHT, act_h);
+	/*
+	 * The source size is the whole picture, the window reads the crop
+	 * rectangle of it: the actual offset and size.
+	 */
 	reg = RGA3_WIN0_SRC_SIZE - RGA3_FIRST_CMD_REG;
-	cmd[reg >> 2] = FIELD_PREP(RGA3_WIDTH, src_w)
-		      | FIELD_PREP(RGA3_HEIGHT, src_h);
+	cmd[reg >> 2] = FIELD_PREP(RGA3_WIDTH, ctx->in.pix.width)
+		      | FIELD_PREP(RGA3_HEIGHT, ctx->in.pix.height);
+	reg = RGA3_WIN0_ACT_OFF - RGA3_FIRST_CMD_REG;
+	cmd[reg >> 2] = FIELD_PREP(RGA3_WIDTH, crop->left)
+		      | FIELD_PREP(RGA3_HEIGHT, crop->top);
+	reg = RGA3_WIN0_ACT_SIZE - RGA3_FIRST_CMD_REG;
+	cmd[reg >> 2] = FIELD_PREP(RGA3_WIDTH, crop->width)
+		      | FIELD_PREP(RGA3_HEIGHT, crop->height);
 }
 
 /* Map the output pixel format to the command buffer */
@@ -267,8 +279,12 @@ static void rga3_cmd_set_wr_format(struct rga_ctx *ctx)
 	u8 wr_format;
 	unsigned int reg;
 
-	dst_h = ctx->out.pix.height;
-	dst_w = ctx->out.pix.width;
+	/*
+	 * Without a second window the write channel has no offset, the
+	 * compose rectangle starts at the origin of the frame.
+	 */
+	dst_h = ctx->out.crop.height;
+	dst_w = ctx->out.crop.width;
 
 	out_fmt = v4l2_format_info(out->fourcc);
 
@@ -615,6 +631,7 @@ const struct rga_hw rga3_hw = {
 	.handle_irq = rga3_handle_irq,
 	.reset = rga3_soft_reset,
 	.can_rotate_90 = rga3_can_rotate_90,
+	.align_rect = rga3_align_rect,
 	.get_version = rga3_get_version,
 	.enum_format = rga3_enum_format,
 	.adjust_and_map_format = rga3_adjust_and_map_format,

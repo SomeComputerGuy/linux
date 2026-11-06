@@ -787,6 +787,25 @@ static int vidioc_s_selection(struct file *file, void *priv,
 		return -EINVAL;
 	}
 
+	/*
+	 * Both cores need the offset and the size of a YUV rectangle aligned
+	 * to the chroma subsampling, some formats need more. Without an
+	 * offset of the destination, compose rectangles start at the origin.
+	 */
+	if (v4l2_is_format_yuv(v4l2_format_info(f->pix.pixelformat))) {
+		s->r.left = ALIGN_DOWN(s->r.left, 2);
+		s->r.top = ALIGN_DOWN(s->r.top, 2);
+		s->r.width = ALIGN_DOWN(s->r.width, 2);
+		s->r.height = ALIGN_DOWN(s->r.height, 2);
+	}
+	if (rga->hw->align_rect)
+		rga->hw->align_rect(f->fmt, &s->r);
+	if (s->target == V4L2_SEL_TGT_COMPOSE &&
+	    !(rga->hw->features & RGA_FEATURE_DST_OFFSET)) {
+		s->r.left = 0;
+		s->r.top = 0;
+	}
+
 	if (s->r.left + s->r.width > f->pix.width ||
 	    s->r.top + s->r.height > f->pix.height ||
 	    s->r.width < rga->hw->min_width || s->r.height < rga->hw->min_height) {
