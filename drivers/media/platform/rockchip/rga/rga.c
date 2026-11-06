@@ -576,6 +576,74 @@ static int vidioc_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
 	return 0;
 }
 
+/*
+ * Keep a bytesperline of userspace that is larger than the format needs, for
+ * instance the stride of a buffer that another device allocated, as long as
+ * the core can address it. The other planes of a single memory plane follow
+ * the luma stride; a core without a chroma stride of its own derives it from
+ * the luma stride for separate memory planes too.
+ */
+static void rga_apply_bytesperline(const struct rga_hw *hw,
+				   struct v4l2_pix_format_mplane *pix_fmt,
+				   const u32 *user_bpl)
+{
+	const struct v4l2_format_info *info;
+	unsigned int i, align, luma;
+	u32 bpl;
+
+	info = v4l2_format_info(pix_fmt->pixelformat);
+	if (!info)
+		return;
+
+	align = hw->stride_alignment;
+	/* a chroma stride derived from luma must stay aligned as well */
+	if (info->comp_planes > 1 &&
+	    (info->mem_planes == 1 || !hw->has_chroma_stride))
+		align *= DIV_ROUND_UP(info->hdiv * info->bpp[0], info->bpp[1]);
+
+	luma = pix_fmt->plane_fmt[0].bytesperline;
+	bpl = ALIGN(user_bpl[0], align);
+	if (bpl > luma && bpl <= hw->max_bytesperline)
+		luma = bpl;
+
+	if (info->mem_planes == 1) {
+		struct v4l2_plane_pix_format *plane = &pix_fmt->plane_fmt[0];
+
+		if (luma == plane->bytesperline)
+			return;
+
+		plane->bytesperline = luma;
+		plane->sizeimage = luma * pix_fmt->height;
+		for (i = 1; i < info->comp_planes; i++)
+			plane->sizeimage += luma * info->bpp[i] /
+					    (info->hdiv * info->bpp[0]) *
+					    DIV_ROUND_UP(pix_fmt->height, info->vdiv);
+		return;
+	}
+
+	for (i = 0; i < info->mem_planes; i++) {
+		struct v4l2_plane_pix_format *plane = &pix_fmt->plane_fmt[i];
+		unsigned int height = pix_fmt->height;
+
+		if (i == 0) {
+			bpl = luma;
+		} else {
+			height = DIV_ROUND_UP(height, info->vdiv);
+			bpl = luma * info->bpp[i] / (info->hdiv * info->bpp[0]);
+			if (hw->has_chroma_stride) {
+				u32 user = ALIGN(user_bpl[i], hw->stride_alignment);
+
+				bpl = plane->bytesperline;
+				if (user > bpl && user <= hw->max_bytesperline)
+					bpl = user;
+			}
+		}
+
+		plane->bytesperline = bpl;
+		plane->sizeimage = bpl * height;
+	}
+}
+
 static int vidioc_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
 {
 	struct v4l2_pix_format_mplane *pix_fmt = &f->fmt.pix_mp;
@@ -589,6 +657,9 @@ static int vidioc_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
 		.step_width = 1,
 		.step_height = 1,
 	};
+	u32 user_bpl[VIDEO_MAX_PLANES];
+	u32 pixelformat;
+	unsigned int i;
 
 	/*
 	 * Technically 4:2:2 YUV formats don't need a step_height of 2.
@@ -624,11 +695,19 @@ static int vidioc_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
 		pix_fmt->xfer_func = frm->pix.xfer_func;
 	}
 
+	for (i = 0; i < VIDEO_MAX_PLANES; i++)
+		user_bpl[i] = i < pix_fmt->num_planes ?
+			      pix_fmt->plane_fmt[i].bytesperline : 0;
+	pixelformat = pix_fmt->pixelformat;
+
 	hw->adjust_and_map_format(ctx, pix_fmt, V4L2_TYPE_IS_OUTPUT(f->type));
 
 	v4l2_apply_frmsize_constraints(&pix_fmt->width, &pix_fmt->height, &frmsize);
 	v4l2_fill_pixfmt_mp_aligned(pix_fmt, pix_fmt->pixelformat,
 				    pix_fmt->width, pix_fmt->height, hw->stride_alignment);
+	/* the strides of another format don't apply */
+	if (pix_fmt->pixelformat == pixelformat)
+		rga_apply_bytesperline(hw, pix_fmt, user_bpl);
 	pix_fmt->field = V4L2_FIELD_NONE;
 
 	return 0;
