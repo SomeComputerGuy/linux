@@ -15,10 +15,12 @@
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
+#include <linux/string_choices.h>
 #include <linux/phy/phy.h>
 #include <linux/unaligned.h>
 
 #include <drm/bridge/dw_dp.h>
+#include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_bridge.h>
 #include <drm/drm_bridge_connector.h>
@@ -382,6 +384,9 @@ struct dw_dp {
 	bool usbc_mode;
 	bool usbc_hpd;
 	bool pm_active;
+	/* Pipeline resets for a lost link in a row, and when the last was */
+	unsigned int link_resets;
+	unsigned long link_reset_time;
 
 	struct drm_bridge *next_bridge;
 
@@ -1896,6 +1901,8 @@ static bool dw_dp_needs_link_retrain(struct dw_dp *dp)
 	if (drm_dp_dpcd_read_link_status(&dp->aux, link_status) < 0)
 		return false;
 
+	dev_dbg(dp->dev, "link status: %*ph\n", DP_LINK_STATUS_SIZE, link_status);
+
 	/* Retrain if Channel EQ or CR not ok */
 	return !drm_dp_channel_eq_ok(link_status, dp->link.lanes);
 }
@@ -2606,6 +2613,9 @@ static void dw_dp_bridge_oob_notify(struct drm_bridge *bridge,
 	bool was_high = dp->usbc_hpd;
 	int ret;
 
+	dev_dbg(dp->dev, "OOB HPD event: %s (was %s)\n", str_high_low(hpd_high),
+		str_high_low(was_high));
+
 	dp->usbc_hpd = hpd_high;
 
 	PM_RUNTIME_ACQUIRE_AUTOSUSPEND(dp->dev, pm);
@@ -2666,31 +2676,96 @@ static const struct drm_bridge_funcs dw_dp_bridge_funcs = {
 	.dp_audio_mute_stream = dw_dp_audio_mute_stream,
 };
 
-static int dw_dp_link_retrain(struct dw_dp *dp)
+/* Resets in a row (each within this time of the previous one) to give up after */
+#define DW_DP_MAX_LINK_RESETS		3
+#define DW_DP_LINK_RESET_WINDOW		(10 * HZ)
+
+/*
+ * Check the link of an enabled output after an HPD short pulse and, if the
+ * sink lost it, retrain it with a full modeset of the pipeline, as i915 and
+ * amdgpu do: the stream is stopped, the link trained with the sink in D0 and
+ * the stream started again. Training under a running stream instead
+ * reprograms the PHY rate while the controller keeps sending video, which
+ * the sink does not necessarily recover from.
+ */
+static int dw_dp_link_check(struct dw_dp *dp, struct drm_modeset_acquire_ctx *ctx)
 {
 	struct drm_device *dev = dp->bridge.dev;
+	struct drm_connector *connector;
+	struct drm_crtc_state *crtc_state;
+	struct drm_crtc *crtc;
+	bool lost;
+	int ret;
+
+	connector = drm_atomic_get_connector_for_encoder(dp->bridge.encoder, ctx);
+	if (IS_ERR(connector)) {
+		/* Not bound to a connector: nothing to check */
+		ret = PTR_ERR(connector);
+		return ret == -EINVAL ? 0 : ret;
+	}
+
+	ret = drm_modeset_lock(&dev->mode_config.connection_mutex, ctx);
+	if (ret)
+		return ret;
+
+	crtc = connector->state->crtc;
+	if (!crtc)
+		return 0;
+
+	ret = drm_modeset_lock(&crtc->mutex, ctx);
+	if (ret)
+		return ret;
+
+	crtc_state = crtc->state;
+	if (!crtc_state->active)
+		return 0;
+
+	/*
+	 * A commit that has not reached the hardware yet enables or disables
+	 * the link itself, and trains it when it enables it.
+	 */
+	if (crtc_state->commit &&
+	    !try_wait_for_completion(&crtc_state->commit->hw_done))
+		return 0;
+
+	scoped_guard(mutex, &dp->link_lock) {
+		lost = dw_dp_needs_link_retrain(dp);
+		if (!lost) {
+			dp->link_resets = 0;
+			return 0;
+		}
+
+		if (time_after(jiffies, dp->link_reset_time + DW_DP_LINK_RESET_WINDOW))
+			dp->link_resets = 0;
+
+		if (dp->link_resets >= DW_DP_MAX_LINK_RESETS) {
+			dev_warn_ratelimited(dp->dev, "link lost again after %u resets, giving up\n",
+					     dp->link_resets);
+			return 0;
+		}
+
+		dp->link_resets++;
+		dp->link_reset_time = jiffies;
+	}
+
+	dev_dbg(dp->dev, "link lost, resetting the pipeline (%u)\n", dp->link_resets);
+
+	return drm_atomic_helper_reset_crtc(crtc, ctx);
+}
+
+static int dw_dp_link_retrain(struct dw_dp *dp)
+{
 	struct drm_modeset_acquire_ctx ctx;
 	int ret;
 
 	drm_modeset_acquire_init(&ctx, 0);
 	for (;;) {
-		ret = drm_modeset_lock(&dev->mode_config.connection_mutex, &ctx);
+		ret = dw_dp_link_check(dp, &ctx);
 		if (ret != -EDEADLK)
 			break;
 
 		drm_modeset_backoff(&ctx);
 	}
-
-	if (!ret) {
-		/* A modeset may have disabled the link or trained it since */
-		scoped_guard(mutex, &dp->link_lock) {
-			if (dw_dp_needs_link_retrain(dp)) {
-				dev_dbg(dp->dev, "Retraining link\n");
-				ret = dw_dp_link_train(dp);
-			}
-		}
-	}
-
 	drm_modeset_drop_locks(&ctx);
 	drm_modeset_acquire_fini(&ctx);
 
@@ -2756,15 +2831,21 @@ static void dw_dp_hpd_work(struct work_struct *work)
 			long_hpd = true;
 		} else {
 			drm_dp_cec_irq(&dp->aux);
-
-			if (dw_dp_needs_link_retrain(dp)) {
-				ret = dw_dp_link_retrain(dp);
-				if (ret)
-					dev_warn(dp->dev, "Retrain link failed\n");
-			}
 		}
 
 		phy_power_off(dp->phy);
+
+		/*
+		 * Check the link once any commit in flight is done with it:
+		 * one that enables the link may finish training only after
+		 * the sink sent this pulse. An enabled link keeps the PHY
+		 * powered for the AUX channel.
+		 */
+		if (!long_hpd) {
+			ret = dw_dp_link_retrain(dp);
+			if (ret)
+				dev_warn(dp->dev, "Retrain link failed: %d\n", ret);
+		}
 	}
 
 	if (long_hpd)
