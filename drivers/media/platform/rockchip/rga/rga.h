@@ -191,6 +191,8 @@ enum rga_irq_status {
 #define RGA_FEATURE_FLIP	BIT(0)
 #define RGA_FEATURE_ROTATE	BIT(1)
 #define RGA_FEATURE_BG_COLOR	BIT(2)
+/* The destination rectangle (compose) can start anywhere in the frame */
+#define RGA_FEATURE_DST_OFFSET	BIT(3)
 
 struct rga_hw {
 	const char *card_type;
@@ -221,6 +223,11 @@ struct rga_hw {
 	 * 90 or 270 degrees.
 	 */
 	bool (*can_rotate_90)(const void *in_fmt);
+	/*
+	 * Optional, aligns a crop or compose rectangle further than the
+	 * common alignment of YUV rectangles to 2 pixels.
+	 */
+	void (*align_rect)(const void *fmt, struct v4l2_rect *r);
 	struct rockchip_rga_version (*get_version)(struct rga_core *core);
 	void *(*adjust_and_map_format)(struct rga_ctx *ctx,
 				       struct v4l2_pix_format_mplane *format,

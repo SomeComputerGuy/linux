@@ -614,7 +614,8 @@ const struct rga_hw rga2_hw = {
 	.stride_alignment = 4,
 	.features = RGA_FEATURE_FLIP
 		  | RGA_FEATURE_ROTATE
-		  | RGA_FEATURE_BG_COLOR,
+		  | RGA_FEATURE_BG_COLOR
+		  | RGA_FEATURE_DST_OFFSET,
 
 	.setup_cmdbuf = rga_hw_setup_cmdbuf,
 	.start = rga_hw_start,
