@@ -22,6 +22,7 @@
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_bridge.h>
 #include <drm/drm_bridge_connector.h>
+#include <drm/drm_crtc_helper.h>
 #include <drm/display/drm_dp_helper.h>
 #include <drm/display/drm_hdmi_audio_helper.h>
 #include <drm/display/drm_hdmi_helper.h>
@@ -271,6 +272,7 @@ struct dw_dp_link_caps {
 	bool fast_training;
 	bool channel_coding;
 	bool ssc;
+	bool msa_timing_par_ignored;
 };
 
 struct dw_dp_link_train_set {
@@ -293,6 +295,8 @@ struct dw_dp_link {
 	unsigned int rate;
 	unsigned int lanes;
 	bool enabled;
+	/* The sink ignores the MSA timing: the video timing may vary (VRR) */
+	bool ignore_msa;
 	u8 sink_count;
 	u8 vsc_sdp_supported;
 	struct dw_dp_link_caps caps;
@@ -318,6 +322,7 @@ struct dw_dp_bridge_state {
 	u8 bpc;
 	u8 bpp;
 	enum drm_colorspace colorspace;
+	bool vrr;
 };
 
 struct dw_dp_sdp {
@@ -656,6 +661,8 @@ static int dw_dp_link_read_caps(struct dw_dp *dp, struct drm_connector *connecto
 	link->caps.fast_training = drm_dp_fast_training_cap(link->dpcd);
 	link->caps.channel_coding = drm_dp_channel_coding_supported(link->dpcd);
 	link->caps.ssc = !!(link->dpcd[DP_MAX_DOWNSPREAD] & DP_MAX_DOWNSPREAD_0_5);
+	link->caps.msa_timing_par_ignored =
+		drm_dp_sink_can_do_video_without_timing_msa(link->dpcd);
 
 	return 0;
 }
@@ -679,6 +686,7 @@ static int dw_dp_link_parse(struct dw_dp *dp, struct drm_connector *connector)
 	guard(mutex)(&dp->link_lock);
 
 	new.enabled = link->enabled;
+	new.ignore_msa = link->ignore_msa;
 	new.train = link->train;
 	if (link->enabled) {
 		new.rate = link->rate;
@@ -790,6 +798,8 @@ static int dw_dp_link_configure(struct dw_dp *dp)
 		return ret;
 
 	buf[0] = link->caps.ssc ? DP_SPREAD_AMP_0_5 : 0;
+	if (link->ignore_msa)
+		buf[0] |= DP_MSA_TIMING_PAR_IGNORE_EN;
 	buf[1] = link->caps.channel_coding ? DP_SET_ANSI_8B10B : 0;
 
 	ret = drm_dp_dpcd_write(&dp->aux, DP_DOWNSPREAD_CTRL, buf, sizeof(buf));
@@ -1777,6 +1787,34 @@ static ssize_t dw_dp_aux_transfer(struct drm_dp_aux *aux,
  * 2. the minimum hsync should be 9 pixel;
  * 3. the minimum hbp should be 16 pixel;
  */
+/*
+ * DisplayPort Adaptive-Sync: the sink takes the timing from the stream rather
+ * than from the MSA, and its EDID has a continuous refresh rate range (only
+ * then the EDID parser fills in the monitor range). Like other drivers, ask
+ * for a range of more than 10 Hz.
+ */
+static bool dw_dp_vrr_capable(struct dw_dp *dp, struct drm_connector *connector)
+{
+	const struct drm_monitor_range_info *range =
+		&connector->display_info.monitor_range;
+
+	if (!connector->vrr_capable_property)
+		return false;
+
+	if (!range->min_vfreq || range->max_vfreq <= range->min_vfreq + 10)
+		return false;
+
+	guard(mutex)(&dp->link_lock);
+
+	return dp->link.caps.msa_timing_par_ignored;
+}
+
+static bool dw_dp_bridge_vrr_capable(struct drm_bridge *bridge,
+				     struct drm_connector *connector)
+{
+	return dw_dp_vrr_capable(bridge_to_dp(bridge), connector);
+}
+
 static int dw_dp_bridge_atomic_check(struct drm_bridge *bridge,
 				     struct drm_bridge_state *bridge_state,
 				     struct drm_crtc_state *crtc_state,
@@ -1839,6 +1877,25 @@ static int dw_dp_bridge_atomic_check(struct drm_bridge *bridge,
 	}
 
 	drm_mode_copy(mode, adjusted_mode);
+
+	/*
+	 * VRR: the CRTC stretches the vertical front porch of the mode down to
+	 * the lowest refresh rate of the sink. Without a range for this mode
+	 * the refresh rate stays fixed.
+	 */
+	state->vrr = false;
+	if (crtc_state->vrr_enabled) {
+		const struct drm_monitor_range_info *range =
+			&conn_state->connector->display_info.monitor_range;
+
+		if (dw_dp_vrr_capable(dp, conn_state->connector) &&
+		    !drm_crtc_helper_vrr_set_range(crtc_state, range->min_vfreq,
+						   range->max_vfreq))
+			state->vrr = true;
+		else
+			memset(&crtc_state->vrr_state, 0,
+			       sizeof(crtc_state->vrr_state));
+	}
 
 	return 0;
 }
@@ -1917,6 +1974,7 @@ static void dw_dp_link_disable(struct dw_dp *dp)
 	link->train.clock_recovered = false;
 	link->train.channel_equalized = false;
 	link->enabled = false;
+	link->ignore_msa = false;
 }
 
 static int dw_dp_link_enable(struct dw_dp *dp)
@@ -2270,6 +2328,10 @@ static void dw_dp_bridge_atomic_enable(struct drm_bridge *bridge,
 	}
 
 	scoped_guard(mutex, &dp->link_lock) {
+		struct dw_dp_bridge_state *bstate = dw_dp_get_bridge_state(dp);
+
+		dp->link.ignore_msa = bstate && bstate->vrr;
+
 		ret = dw_dp_link_enable(dp);
 		if (ret < 0) {
 			dev_err(dp->dev, "failed to enable link: %d\n", ret);
@@ -2689,6 +2751,7 @@ static const struct drm_bridge_funcs dw_dp_bridge_funcs = {
 	.atomic_disable = dw_dp_bridge_atomic_disable,
 	.detect = dw_dp_bridge_detect,
 	.edid_read = dw_dp_bridge_edid_read,
+	.vrr_capable = dw_dp_bridge_vrr_capable,
 	.oob_notify = dw_dp_bridge_oob_notify,
 
 	.dp_audio_startup = dw_dp_audio_startup,
