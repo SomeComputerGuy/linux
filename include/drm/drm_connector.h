@@ -1707,6 +1707,14 @@ struct drm_connector_hdmi_funcs {
 	 * optional.
 	 */
 	struct drm_connector_infoframe_funcs spd;
+
+	/**
+	 * @vtem:
+	 *
+	 * Set of callbacks for handling the VTEM EMP. These callbacks are
+	 * optional.
+	 */
+	struct drm_connector_infoframe_funcs vtem;
 };
 
 /**

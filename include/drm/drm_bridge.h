@@ -812,6 +812,29 @@ struct drm_bridge_funcs {
 					const u8 *buffer, size_t len);
 
 	/**
+	 * @hdmi_clear_vtem_emp:
+	 *
+	 * This callback clears the emp in the hardware during commit.
+	 *
+	 * This callback is optional but it must be implemented by bridges that
+	 * set the DRM_BRIDGE_OP_HDMI_VTEM_EMP flag in their
+	 * &drm_bridge->ops.
+	 */
+	int (*hdmi_clear_vtem_emp)(struct drm_bridge *bridge);
+
+	/**
+	 * @hdmi_write_spd_infoframe:
+	 *
+	 * Program the emp into the hardware.
+	 *
+	 * This callback is optional but it must be implemented by bridges that
+	 * set the DRM_BRIDGE_OP_HDMI_VTEM_EMP flag in their
+	 * &drm_bridge->ops.
+	 */
+	int (*hdmi_write_vtem_emp)(struct drm_bridge *bridge,
+				   const u8 *buffer, size_t len);
+
+	/**
 	 * @hdmi_clear_audio_infoframe:
 	 *
 	 * This callback clears the infoframes in the hardware during commit.
@@ -1148,6 +1171,12 @@ enum drm_bridge_ops {
 	 * &drm_bridge_funcs->hdmi_clear_spd_infoframe callbacks.
 	 */
 	DRM_BRIDGE_OP_HDMI_SPD_INFOFRAME = BIT(10),
+	/**
+	 * @DRM_BRIDGE_OP_HDMI_VTEM_EMP: The bridge supports
+	 * &drm_bridge_funcs->hdmi_write_vtem_emp and
+	 * &drm_bridge_funcs->hdmi_clear_vtem_emp callbacks.
+	 */
+	DRM_BRIDGE_OP_HDMI_VTEM_EMP = BIT(11),
 };
 
 /**
