@@ -817,6 +817,7 @@ static int hdmi_generate_avi_infoframe(const struct drm_connector *connector,
 	drm_hdmi_avi_infoframe_quant_range(frame, connector, mode, rgb_quant_range);
 	drm_hdmi_avi_infoframe_colorimetry(frame, conn_state);
 	drm_hdmi_avi_infoframe_bars(frame, conn_state);
+	drm_hdmi_avi_infoframe_content_type(frame, conn_state);
 
 	infoframe->set = true;
 
@@ -1266,6 +1267,7 @@ int drm_atomic_helper_connector_hdmi_check(struct drm_connector *connector,
 	    old_conn_state->hdmi.frl_rate_per_lane != new_conn_state->hdmi.frl_rate_per_lane ||
 	    old_conn_state->hdmi.frl_lanes != new_conn_state->hdmi.frl_lanes ||
 	    old_conn_state->colorspace != new_conn_state->colorspace ||
+	    old_conn_state->content_type != new_conn_state->content_type ||
 	    !drm_connector_atomic_hdr_metadata_equal(old_conn_state, new_conn_state)) {
 		struct drm_crtc *crtc = new_conn_state->crtc;
 		struct drm_crtc_state *crtc_state;
