@@ -1128,6 +1128,10 @@ hdmi_infoframe_pack(union hdmi_infoframe *frame,
 		length = hdmi_vendor_any_infoframe_pack(&frame->vendor,
 							buffer, size);
 		break;
+	case HDMI_INFOFRAME_TYPE_EMP:
+		length = hdmi_emp_infoframe_vtem_pack(&frame->vtem,
+						      buffer, size);
+		break;
 	default:
 		WARN(1, "Bad infoframe type %d\n", frame->any.type);
 		length = -EINVAL;
@@ -1139,9 +1143,11 @@ EXPORT_SYMBOL(hdmi_infoframe_pack);
 
 static const char *hdmi_infoframe_type_get_name(enum hdmi_infoframe_type type)
 {
-	if (type < 0x80 || type > 0x9f)
+	if (type < 0x7F || type > 0x9f)
 		return "Invalid";
 	switch (type) {
+	case HDMI_INFOFRAME_TYPE_EMP:
+		return "EMP";
 	case HDMI_INFOFRAME_TYPE_VENDOR:
 		return "Vendor";
 	case HDMI_INFOFRAME_TYPE_AVI:
@@ -1661,6 +1667,29 @@ hdmi_vendor_any_infoframe_log(const char *level,
 	}
 }
 
+static void
+hdmi_emp_infoframe_vtem_log(const char *level,
+			    struct device *dev,
+			    const struct hdmi_emp_infoframe_vtem *frame)
+{
+	hdmi_infoframe_log_header(level, dev,
+				  (const struct hdmi_any_infoframe *)frame);
+
+	hdmi_log("    game vrr enabled: %u\n", frame->game_vrr_en);
+	hdmi_log("    fva factor minus 1: %u\n", frame->fva_factor_m1);
+	hdmi_log("    m_const: %u\n", frame->m_const);
+	hdmi_log("    base vertical front porch: %u\n", frame->base_vfront);
+	hdmi_log("    base refresh rate: %u\n", frame->base_refresh_rate);
+}
+
+static void
+hdmi_emp_infoframe_log(const char *level,
+		       struct device *dev,
+		       const union hdmi_infoframe *frame)
+{
+	/* Only support VTEM for now */
+	hdmi_emp_infoframe_vtem_log(level, dev, &frame->vtem);
+}
 /**
  * hdmi_infoframe_log() - log info of HDMI infoframe
  * @level: logging level
@@ -1686,6 +1715,9 @@ void hdmi_infoframe_log(const char *level,
 		break;
 	case HDMI_INFOFRAME_TYPE_DRM:
 		hdmi_drm_infoframe_log(level, dev, &frame->drm);
+		break;
+	case HDMI_INFOFRAME_TYPE_EMP:
+		hdmi_emp_infoframe_log(level, dev, frame);
 		break;
 	}
 }
@@ -2066,3 +2098,66 @@ int hdmi_infoframe_unpack(union hdmi_infoframe *frame,
 	return ret;
 }
 EXPORT_SYMBOL(hdmi_infoframe_unpack);
+
+/**
+ * hdmi_emp_infoframe_vtem_init() - initialize an HDMI VTEM EMP
+ * @emp: HDMI VTEM EMP
+ */
+void hdmi_emp_infoframe_vtem_init(struct hdmi_emp_infoframe_vtem *emp)
+{
+	memset(emp, 0, sizeof(*emp));
+	emp->type = HDMI_INFOFRAME_TYPE_EMP;
+}
+EXPORT_SYMBOL(hdmi_emp_infoframe_vtem_init);
+
+/**
+ * hdmi_emp_infoframe_vtem_pack() - pack a vtem into a binary buffer
+ * @vtem: pointer to &struct hdmi_emp_infoframe_vtem to pack
+ * @buffer: pointer to pre-allocated output buffer
+ * @size: maximum size in bytes of @buffer
+ *
+ * Pack a VTEM infoframe struct into a binary buffer in a way that's suitable
+ * to be sent out over the wire.
+ *
+ * Returns the number of bytes packed into the binary buffer or a negative
+ * error code on failure.
+ */
+ssize_t hdmi_emp_infoframe_vtem_pack(struct hdmi_emp_infoframe_vtem *vtem,
+				     void *buffer, size_t size)
+{
+	u8 *ptr = buffer;
+
+	if (size < HDMI_INFOFRAME_SIZE(VTEM))
+		return -EINVAL;
+
+	/* 4 bits max */
+	if (vtem->fva_factor_m1 > 0xF)
+		return -EINVAL;
+
+	memset(buffer, 0, size);
+
+	/* Header Data */
+	ptr[0] = vtem->type;
+	ptr[1] = BIT(7) | BIT(6);
+	ptr[2] = 0;
+
+	ptr[3] = BIT(7) | BIT(2);
+
+	ptr[4] = 0;
+	ptr[5] = 1;
+	ptr[6] = 0;
+	ptr[7] = 1;
+	ptr[8] = 0;
+	ptr[9] = 4;
+
+	/* This is where the VTEM part starts */
+	ptr[10] = (vtem->fva_factor_m1 << 4) |
+		  (vtem->m_const ? BIT(1) : 0) |
+		  (vtem->game_vrr_en ? BIT(0) : 0);
+	ptr[11] = vtem->base_vfront;
+	ptr[12] = vtem->base_refresh_rate >> 8 & 0x3;
+	ptr[13] = vtem->base_refresh_rate & 0xFF;
+
+	return 14;
+}
+EXPORT_SYMBOL(hdmi_emp_infoframe_vtem_pack);
