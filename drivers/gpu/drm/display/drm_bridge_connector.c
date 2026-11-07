@@ -726,6 +726,33 @@ static int drm_bridge_connector_frl_set_ffe_level(struct drm_connector *connecto
 	return bridge->funcs->hdmi_frl_set_ffe_level(bridge, ffe_level);
 }
 
+static int drm_bridge_connector_clear_vtem_emp(struct drm_connector *connector)
+{
+	struct drm_bridge_connector *bridge_connector =
+		to_drm_bridge_connector(connector);
+	struct drm_bridge *bridge;
+
+	bridge = bridge_connector->bridge_hdmi;
+	if (!bridge)
+		return -EINVAL;
+
+	return bridge->funcs->hdmi_clear_vtem_emp(bridge);
+}
+
+static int drm_bridge_connector_write_vtem_emp(struct drm_connector *connector,
+					       const u8 *buffer, size_t len)
+{
+	struct drm_bridge_connector *bridge_connector =
+		to_drm_bridge_connector(connector);
+	struct drm_bridge *bridge;
+
+	bridge = bridge_connector->bridge_hdmi;
+	if (!bridge)
+		return -EINVAL;
+
+	return bridge->funcs->hdmi_write_vtem_emp(bridge, buffer, len);
+}
+
 static const struct drm_edid *
 drm_bridge_connector_read_edid(struct drm_connector *connector)
 {
@@ -770,6 +797,11 @@ static const struct drm_connector_infoframe_funcs drm_bridge_connector_hdmi_hdr_
 static const struct drm_connector_infoframe_funcs drm_bridge_connector_hdmi_spd_infoframe = {
 	.clear_infoframe = drm_bridge_connector_clear_spd_infoframe,
 	.write_infoframe = drm_bridge_connector_write_spd_infoframe,
+};
+
+static const struct drm_connector_infoframe_funcs drm_bridge_connector_hdmi_vtem_emp = {
+	.clear_infoframe = drm_bridge_connector_clear_vtem_emp,
+	.write_infoframe = drm_bridge_connector_write_vtem_emp,
 };
 
 static int drm_bridge_connector_audio_startup(struct drm_connector *connector)
@@ -1071,6 +1103,11 @@ struct drm_connector *drm_bridge_connector_init(struct drm_device *drm,
 			     !bridge->funcs->hdmi_frl_fallback_tmds))
 				return ERR_PTR(-EINVAL);
 
+			if (bridge->ops & DRM_BRIDGE_OP_HDMI_VTEM_EMP &&
+			    (!bridge->funcs->hdmi_write_vtem_emp ||
+			     !bridge->funcs->hdmi_clear_vtem_emp))
+				return ERR_PTR(-EINVAL);
+
 			bridge_connector->bridge_hdmi = drm_bridge_get(bridge);
 		}
 
@@ -1232,6 +1269,10 @@ struct drm_connector *drm_bridge_connector_init(struct drm_device *drm,
 				bridge_connector->hdmi_funcs.frl_set_ffe_level =
 					drm_bridge_connector_frl_set_ffe_level;
 		}
+
+		if (bridge_connector->bridge_hdmi->ops & DRM_BRIDGE_OP_HDMI_VTEM_EMP)
+			bridge_connector->hdmi_funcs.vtem =
+				drm_bridge_connector_hdmi_vtem_emp;
 
 		ret = drmm_connector_hdmi_init(drm, connector,
 					       &drm_bridge_connector_funcs,
