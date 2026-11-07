@@ -6331,6 +6331,10 @@ static void drm_parse_hdmi_forum_scds(struct drm_connector *connector,
 		dsc_support = true;
 	}
 
+	/* hf_scds[8] is payload byte 8: it is present if the payload has 8 bytes */
+	if (cea_db_payload_len(hf_scds) >= 8)
+		hdmi->allm = hf_scds[8] & DRM_EDID_ALLM;
+
 	drm_parse_vrr_info(hdmi, hf_scds);
 
 	/* A non-zero VRRmin is what declares HDMI VRR support */
