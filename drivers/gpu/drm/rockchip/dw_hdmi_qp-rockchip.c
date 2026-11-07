@@ -298,7 +298,6 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 					 struct drm_crtc_state *crtc_state,
 					 struct drm_connector_state *conn_state)
 {
-	struct drm_connector *connector = conn_state->connector;
 	struct rockchip_crtc_state *s = to_rockchip_crtc_state(crtc_state);
 	struct rockchip_hdmi_qp *hdmi = to_rockchip_hdmi_qp(encoder);
 	union phy_configure_opts phy_cfg;
@@ -355,10 +354,6 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 			conn_state->colorspace);
 		return ret;
 	}
-
-	if (connector->vrr_capable_property)
-		drm_connector_set_vrr_capable_property(connector,
-			drm_display_info_is_vrr_capable(&connector->display_info));
 
 	return 0;
 }
