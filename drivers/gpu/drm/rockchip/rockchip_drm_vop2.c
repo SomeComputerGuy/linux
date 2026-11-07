@@ -26,6 +26,7 @@
 #include <drm/drm_atomic_uapi.h>
 #include <drm/drm_blend.h>
 #include <drm/drm_crtc.h>
+#include <drm/drm_crtc_helper.h>
 #include <linux/debugfs.h>
 #include <drm/drm_debugfs.h>
 #include <drm/drm_flip_work.h>
@@ -3038,6 +3039,25 @@ static void vop2_crtc_atomic_begin(struct drm_crtc *crtc,
 	vop2->ops->setup_overlay(vp);
 }
 
+static void vop2_vp_set_vrr_vtotal(struct vop2_video_port *vp, unsigned int vtotal)
+{
+	const u32 mask = RK3568_VP_DSP_VTOTAL_VS_END__DSP_VTOTAL |
+			 RK3568_VP_DSP_VTOTAL_VS_END__IMD;
+
+	if (!vtotal) {
+		vop2_vp_update_bits(vp, RK3568_VP_DSP_VTOTAL_VS_END,
+				    RK3568_VP_DSP_VTOTAL_VS_END__IMD, 0);
+		return;
+	}
+
+	/* Value is 13 bits at most, saturate it if too large */
+	if (vtotal > RK3568_VP_DSP_VTOTAL_VS_END__DSP_VTOTAL >> 16)
+		vtotal = RK3568_VP_DSP_VTOTAL_VS_END__DSP_VTOTAL >> 16;
+
+	vop2_vp_update_bits(vp, RK3568_VP_DSP_VTOTAL_VS_END, mask,
+			    vtotal << 16 | RK3568_VP_DSP_VTOTAL_VS_END__IMD);
+}
+
 static void vop2_crtc_atomic_flush(struct drm_crtc *crtc,
 				   struct drm_atomic_commit *state)
 {
@@ -3061,6 +3081,11 @@ static void vop2_crtc_atomic_flush(struct drm_crtc *crtc,
 	}
 
 	spin_lock_irq(&crtc->dev->event_lock);
+
+	if (crtc_state->vrr_enabled) {
+		if (drm_crtc_helper_vrr_flush(crtc_state))
+			vop2_vp_set_vrr_vtotal(vp, crtc_state->vrr_state.cur_vtotal);
+	}
 
 	if (crtc->state->event) {
 		/*
@@ -3771,6 +3796,30 @@ static irqreturn_t rk3576_vp_isr(int irq, void *data)
 	return ret;
 }
 
+static void vop2_vp_handle_vblank(struct vop2_video_port *vp)
+{
+	struct drm_crtc *crtc = &vp->crtc;
+	struct vop2 *vop2 = vp->vop2;
+	u32 val;
+
+	guard(spinlock)(&crtc->dev->event_lock);
+
+	if (!vp->event)
+		return;
+
+	val = vop2_readl(vop2, RK3568_REG_CFG_DONE);
+
+	if (!(val & BIT(vp->id))) {
+		drm_crtc_send_vblank_event(crtc, vp->event);
+		vp->event = NULL;
+		drm_crtc_vblank_put(crtc);
+
+		if (crtc->state->vrr_enabled)
+			if (drm_crtc_helper_vrr_vsync(crtc->state))
+				vop2_vp_set_vrr_vtotal(vp, crtc->state->vrr_state.cur_vtotal);
+	}
+}
+
 static irqreturn_t vop2_isr(int irq, void *data)
 {
 	struct vop2 *vop2 = data;
@@ -3802,18 +3851,7 @@ static irqreturn_t vop2_isr(int irq, void *data)
 
 			if (irqs & VP_INT_FS_FIELD) {
 				drm_crtc_handle_vblank(crtc);
-				spin_lock(&crtc->dev->event_lock);
-				if (vp->event) {
-					u32 val = vop2_readl(vop2, RK3568_REG_CFG_DONE);
-
-					if (!(val & BIT(vp->id))) {
-						drm_crtc_send_vblank_event(crtc, vp->event);
-						vp->event = NULL;
-						drm_crtc_vblank_put(crtc);
-					}
-				}
-				spin_unlock(&crtc->dev->event_lock);
-
+				vop2_vp_handle_vblank(vp);
 				ret = IRQ_HANDLED;
 			}
 
