@@ -26,7 +26,6 @@
 #include <drm/drm_atomic_uapi.h>
 #include <drm/drm_blend.h>
 #include <drm/drm_crtc.h>
-#include <drm/drm_crtc_helper.h>
 #include <linux/debugfs.h>
 #include <drm/drm_debugfs.h>
 #include <drm/drm_flip_work.h>
@@ -1243,6 +1242,10 @@ static void vop2_crtc_atomic_disable(struct drm_crtc *crtc,
 		vop2_crtc_splice_stop_windows(vp);
 
 	drm_crtc_vblank_off(crtc);
+
+	spin_lock_irq(&crtc->dev->event_lock);
+	vp->vrr_active = false;
+	spin_unlock_irq(&crtc->dev->event_lock);
 
 	/*
 	 * Vop standby will take effect at end of current frame,
@@ -2944,6 +2947,10 @@ static void vop2_crtc_atomic_enable(struct drm_crtc *crtc,
 		    (act_end - us_to_vertical_line(mode, 0)) << 16 | act_end);
 
 	vop2_vp_write(vp, RK3568_VP_DSP_VTOTAL_VS_END, vtotal << 16 | vsync_len);
+	spin_lock_irq(&crtc->dev->event_lock);
+	vp->vrr_active = false;
+	vp->vrr_cur_vtotal = 0;
+	spin_unlock_irq(&crtc->dev->event_lock);
 
 	if (mode->flags & DRM_MODE_FLAG_DBLCLK) {
 		dsp_ctrl |= RK3568_VP_DSP_CTRL__CORE_DCLK_DIV;
@@ -3448,6 +3455,12 @@ static int vop2_crtc_atomic_check(struct drm_crtc *crtc,
 	if (vcstate->splice)
 		nlayers = (vp->nlayers + vp->vop2->vps[vp->data->splice_vp].nlayers) / 2;
 
+	/* VRR only adjusts the timing of this video port, not a splice partner */
+	if (crtc_state->vrr_enabled && vcstate->splice) {
+		drm_dbg_kms(vp->vop2->drm, "VRR is not supported with splice\n");
+		return -EINVAL;
+	}
+
 	ret = vop2_crtc_atomic_check_gamma(vp, crtc, state, crtc_state);
 	if (ret)
 		return ret;
@@ -3480,23 +3493,28 @@ static void vop2_crtc_atomic_begin(struct drm_crtc *crtc,
 	vop2->ops->setup_overlay(vp);
 }
 
-static void vop2_vp_set_vrr_vtotal(struct vop2_video_port *vp, unsigned int vtotal)
+/*
+ * Set the vtotal of the frame being scanned out, with immediate effect: a
+ * vtotal at or below the current line ends the frame now, a larger one
+ * stretches its vertical front porch. Called with the event_lock held.
+ */
+static void vop2_vp_set_vrr_vtotal(struct vop2_video_port *vp, u16 vtotal)
 {
 	const u32 mask = RK3568_VP_DSP_VTOTAL_VS_END__DSP_VTOTAL |
 			 RK3568_VP_DSP_VTOTAL_VS_END__IMD;
 
-	if (!vtotal) {
-		vop2_vp_update_bits(vp, RK3568_VP_DSP_VTOTAL_VS_END,
-				    RK3568_VP_DSP_VTOTAL_VS_END__IMD, 0);
-		return;
-	}
+	lockdep_assert_held(&vp->crtc.dev->event_lock);
 
 	/* Value is 13 bits at most, saturate it if too large */
 	if (vtotal > RK3568_VP_DSP_VTOTAL_VS_END__DSP_VTOTAL >> 16)
 		vtotal = RK3568_VP_DSP_VTOTAL_VS_END__DSP_VTOTAL >> 16;
 
+	if (vtotal == vp->vrr_cur_vtotal)
+		return;
+
 	vop2_vp_update_bits(vp, RK3568_VP_DSP_VTOTAL_VS_END, mask,
 			    vtotal << 16 | RK3568_VP_DSP_VTOTAL_VS_END__IMD);
+	vp->vrr_cur_vtotal = vtotal;
 }
 
 static void vop2_crtc_atomic_flush(struct drm_crtc *crtc,
@@ -3523,9 +3541,17 @@ static void vop2_crtc_atomic_flush(struct drm_crtc *crtc,
 
 	spin_lock_irq(&crtc->dev->event_lock);
 
-	if (crtc_state->vrr_enabled) {
-		if (drm_crtc_helper_vrr_flush(crtc_state))
-			vop2_vp_set_vrr_vtotal(vp, crtc_state->vrr_state.cur_vtotal);
+	/*
+	 * VRR: the new frame is ready (the configuration is marked done
+	 * above), so end the stretched front porch of the current frame at the
+	 * earliest point, the vtotal of the highest refresh rate. The next
+	 * frame start stretches it again (vop2_vp_handle_vblank()).
+	 */
+	vp->vrr_active = vp->enabled && crtc_state->vrr_enabled;
+	if (vp->vrr_active) {
+		vp->vrr_base_vtotal = crtc_state->vrr_state.base_vtotal;
+		vp->vrr_max_vtotal = crtc_state->vrr_state.max_vtotal;
+		vop2_vp_set_vrr_vtotal(vp, vp->vrr_base_vtotal);
 	}
 
 	if (crtc->state->event) {
@@ -4245,24 +4271,26 @@ static void vop2_vp_handle_vblank(struct vop2_video_port *vp)
 {
 	struct drm_crtc *crtc = &vp->crtc;
 	struct vop2 *vop2 = vp->vop2;
-	u32 val;
+	bool cfg_pending;
 
 	guard(spinlock)(&crtc->dev->event_lock);
 
-	if (!vp->event)
-		return;
+	cfg_pending = vop2_readl(vop2, RK3568_REG_CFG_DONE) & BIT(vp->id);
 
-	val = vop2_readl(vop2, RK3568_REG_CFG_DONE);
-
-	if (!(val & BIT(vp->id))) {
+	if (vp->event && !cfg_pending) {
 		drm_crtc_send_vblank_event(crtc, vp->event);
 		vp->event = NULL;
 		drm_crtc_vblank_put(crtc);
-
-		if (crtc->state->vrr_enabled)
-			if (drm_crtc_helper_vrr_vsync(crtc->state))
-				vop2_vp_set_vrr_vtotal(vp, crtc->state->vrr_state.cur_vtotal);
 	}
+
+	/*
+	 * VRR: stretch the frame that starts now up to the lowest refresh
+	 * rate, unless a configuration is still waiting to be latched: then
+	 * keep the vtotal of the highest refresh rate, so that it shows at
+	 * the next frame start without waiting for a stretched frame.
+	 */
+	if (vp->vrr_active && !cfg_pending)
+		vop2_vp_set_vrr_vtotal(vp, vp->vrr_max_vtotal);
 }
 
 static irqreturn_t vop2_isr(int irq, void *data)

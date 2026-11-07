@@ -381,6 +381,17 @@ struct vop2_video_port {
 	struct vop2_win *primary_plane;
 	struct drm_pending_vblank_event *event;
 
+	/*
+	 * VRR, all protected by the drm event_lock: whether the active state
+	 * has VRR enabled, its vtotal at the highest and at the lowest refresh
+	 * rate, and the vtotal the video port is set to (0: the mode's vtotal,
+	 * as programmed by the modeset).
+	 */
+	bool vrr_active;
+	u16 vrr_base_vtotal;
+	u16 vrr_max_vtotal;
+	u16 vrr_cur_vtotal;
+
 	unsigned int nlayers;
 	/**
 	 * @ovl_layers: layers of the overlay assigned to the video port in
