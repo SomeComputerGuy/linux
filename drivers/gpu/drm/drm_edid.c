@@ -6254,6 +6254,25 @@ static void drm_parse_dsc_info(struct drm_hdmi_dsc_cap *hdmi_dsc,
 		hdmi_dsc->total_chunk_kbytes = hf_scds[13] & DRM_EDID_DSC_TOTAL_CHUNK_KBYTES;
 }
 
+static void drm_parse_vrr_info(struct drm_display_info *info, const u8 *hf_scds)
+{
+	struct drm_monitor_range_info *range = &info->monitor_range;
+	const int pld_len = cea_db_payload_len(hf_scds);
+
+	if (pld_len < 10)
+		return;
+
+	if (!range->min_vfreq)
+		range->min_vfreq = FIELD_GET(DRM_EDID_VRR_MIN_MASK, hf_scds[9]);
+
+	if (pld_len < 11)
+		return;
+
+	if (!range->max_vfreq)
+		range->max_vfreq = (FIELD_GET(DRM_EDID_VRR_MAX_UPPER_MASK, hf_scds[9]) << 8) |
+				    hf_scds[10];
+}
+
 /* Sink Capability Data Structure */
 static void drm_parse_hdmi_forum_scds(struct drm_connector *connector,
 				      const u8 *hf_scds)
@@ -6313,6 +6332,13 @@ static void drm_parse_hdmi_forum_scds(struct drm_connector *connector,
 		drm_parse_dsc_info(hdmi_dsc, hf_scds);
 		dsc_support = true;
 	}
+
+	drm_parse_vrr_info(info, hf_scds);
+
+	if (info->monitor_range.min_vfreq > 0)
+		hdmi->vrr_capable = true;
+	else
+		hdmi->vrr_capable = false;
 
 	drm_dbg_kms(connector->dev,
 		    "[CONNECTOR:%d:%s] HF-VSDB: max TMDS clock: %d KHz, HDMI 2.1 support: %s, DSC 1.2 support: %s\n",

@@ -333,6 +333,9 @@ struct drm_hdmi_info {
 
 	/** @dsc_cap: DSC capabilities of the sink */
 	struct drm_hdmi_dsc_cap dsc_cap;
+
+	/** @vrr_capable: The sink supports variable refresh rate */
+	bool vrr_capable;
 };
 
 /**
