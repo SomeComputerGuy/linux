@@ -694,6 +694,12 @@ drm_atomic_helper_check_modeset(struct drm_device *dev,
 			new_crtc_state->active_changed = true;
 		}
 
+		if (old_crtc_state->vrr_enabled != new_crtc_state->vrr_enabled) {
+			drm_dbg_atomic(dev, "[CRTC:%d:%s] VRR changed\n",
+				       crtc->base.id, crtc->name);
+			new_crtc_state->mode_changed = true;
+		}
+
 		if (new_crtc_state->enable != has_connectors) {
 			drm_dbg_atomic(dev, "[CRTC:%d:%s] enabled/connectors mismatch (%d/%d)\n",
 				       crtc->base.id, crtc->name,
