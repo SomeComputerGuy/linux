@@ -65,5 +65,8 @@ int drm_helper_force_disable_all(struct drm_device *dev);
 
 bool drm_crtc_helper_vrr_flush(struct drm_crtc_state *crtc_state);
 bool drm_crtc_helper_vrr_vsync(struct drm_crtc_state *crtc_state);
+int drm_crtc_helper_vrr_set_range(struct drm_crtc_state *crtc_state,
+				  unsigned int min_vfreq,
+				  unsigned int max_vfreq);
 
 #endif

@@ -901,6 +901,62 @@ bool drm_crtc_helper_vrr_vsync(struct drm_crtc_state *crtc_state)
 }
 EXPORT_SYMBOL(drm_crtc_helper_vrr_vsync);
 
+static u32 drm_crtc_helper_vrr_vtotal(const struct drm_display_mode *mode,
+				      unsigned int vfreq)
+{
+	return div_u64(mul_u32_u32(mode->crtc_clock, 1000),
+		       mode->crtc_htotal * vfreq);
+}
+
+/**
+ * drm_crtc_helper_vrr_set_range - Set up the VRR state for a refresh rate range
+ * @crtc_state: CRTC state with the mode to drive at a variable refresh rate
+ * @min_vfreq: lowest refresh rate of the sink, in Hz
+ * @max_vfreq: highest refresh rate of the sink, in Hz
+ *
+ * A sink with a variable refresh rate (DisplayPort Adaptive-Sync, HDMI VRR)
+ * shows a frame when it arrives: the source varies the refresh rate with the
+ * length of the vertical front porch of the mode. Compute the vtotal of the
+ * adjusted mode of @crtc_state at its own refresh rate, the highest one, and
+ * at the lowest refresh rate of the sink, as &drm_crtc_vrr_state.base_vtotal and
+ * &drm_crtc_vrr_state.max_vtotal. Encoder or bridge drivers call this from
+ * their atomic_check when &drm_crtc_state.vrr_enabled is set, so that the
+ * CRTC driver can stretch the frames between those two.
+ *
+ * The VRR state is cleared on failure.
+ *
+ * Returns:
+ * 0 on success, -EINVAL if the refresh rate of the mode is outside of the
+ * range of the sink or the range is empty for this mode.
+ */
+int drm_crtc_helper_vrr_set_range(struct drm_crtc_state *crtc_state,
+				  unsigned int min_vfreq,
+				  unsigned int max_vfreq)
+{
+	const struct drm_display_mode *mode = &crtc_state->adjusted_mode;
+	struct drm_crtc_vrr_state *vrr = &crtc_state->vrr_state;
+	int refresh = drm_mode_vrefresh(mode);
+	u32 base_vtotal, max_vtotal;
+
+	memset(vrr, 0, sizeof(*vrr));
+
+	if (!min_vfreq || min_vfreq >= max_vfreq || !mode->crtc_htotal ||
+	    refresh < min_vfreq || refresh > max_vfreq)
+		return -EINVAL;
+
+	base_vtotal = max_t(u32, drm_crtc_helper_vrr_vtotal(mode, refresh),
+			    mode->crtc_vtotal);
+	max_vtotal = drm_crtc_helper_vrr_vtotal(mode, min_vfreq);
+	if (max_vtotal <= base_vtotal || max_vtotal > U16_MAX)
+		return -EINVAL;
+
+	vrr->base_vtotal = base_vtotal;
+	vrr->max_vtotal = max_vtotal;
+
+	return 0;
+}
+EXPORT_SYMBOL(drm_crtc_helper_vrr_set_range);
+
 static int drm_helper_choose_encoder_dpms(struct drm_encoder *encoder)
 {
 	int dpms = DRM_MODE_DPMS_OFF;
