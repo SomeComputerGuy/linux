@@ -38,6 +38,8 @@ struct rockchip_dw_dp_plat_data {
 	u32 max_link_rate;
 	u8 pixel_mode;
 	u32 hpd_reg[ROCKCHIP_MAX_CTRLS];
+	/* The VOP2 can vary the refresh rate of its video ports */
+	bool supports_vrr;
 };
 
 struct rockchip_dw_dp {
@@ -250,6 +252,14 @@ static int dw_dp_rockchip_bind(struct device *dev, struct device *master, void *
 
 	drm_connector_attach_colorspace_property(connector);
 
+	if (dp->pdata->supports_vrr) {
+		ret = drm_connector_attach_vrr_capable_property(connector);
+		if (ret) {
+			dw_dp_unbind(dp->base);
+			return ret;
+		}
+	}
+
 	return 0;
 }
 
@@ -358,6 +368,7 @@ static const struct rockchip_dw_dp_plat_data rk3588_dp_plat_data = {
 	.max_link_rate = 810000,
 	.pixel_mode = DW_DP_MP_QUAD_PIXEL,
 	.hpd_reg = {0x0000, 0x0008},
+	.supports_vrr = true,
 };
 
 static const struct rockchip_dw_dp_plat_data rk3576_dp_plat_data = {
