@@ -346,6 +346,12 @@ struct drm_hdmi_info {
 
 	/** @vrr_capable: The sink supports variable refresh rate */
 	bool vrr_capable;
+
+	/**
+	 * @allm: The sink supports Auto Low Latency Mode (ALLM), signalled in
+	 * the HDMI Forum vendor specific InfoFrame
+	 */
+	bool allm;
 };
 
 /**
