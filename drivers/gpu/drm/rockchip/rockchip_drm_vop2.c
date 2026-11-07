@@ -3063,9 +3063,17 @@ static u32 vop2_vp_read_vcnt(struct vop2_video_port *vp)
 }
 
 /*
- * Set the vtotal of the frame being scanned out, with immediate effect: a
- * vtotal at or below the current line ends the frame now, a larger one
- * stretches its vertical front porch. Called with the event_lock held.
+ * Lines between the scan position and a vtotal written to end a stretched
+ * VRR frame early, so that the write lands well before the video port gets
+ * there, also with the latency of the register write.
+ */
+#define VOP2_VRR_END_MARGIN	4
+
+/*
+ * Set the vtotal of the frame being scanned out, with immediate effect: it
+ * stretches or shortens the vertical front porch of the current frame. The
+ * caller makes sure that it is past the current line.
+ * Called with the event_lock held.
  */
 static void vop2_vp_set_vrr_vtotal(struct vop2_video_port *vp, u16 vtotal)
 {
@@ -3084,6 +3092,30 @@ static void vop2_vp_set_vrr_vtotal(struct vop2_video_port *vp, u16 vtotal)
 	vop2_vp_update_bits(vp, RK3568_VP_DSP_VTOTAL_VS_END, mask,
 			    vtotal << 16 | RK3568_VP_DSP_VTOTAL_VS_END__IMD);
 	vp->vrr_cur_vtotal = vtotal;
+}
+
+/*
+ * End the stretched front porch of the VRR frame being scanned out as early
+ * as allowed: at the vtotal of the highest refresh rate, or a few lines past
+ * the current line when the frame has already been stretched beyond that.
+ *
+ * A vtotal at or below the current line also ends the frame at once, but
+ * that relies on the video port noticing that it is already past the end of
+ * the frame. Some of those frames start with a part of their vertical
+ * blanking missing, too short for the fetch of the first active line, and
+ * the video port underflows (POST_BUF_EMPTY at the first active line). Only
+ * ever program a vtotal the video port still has to reach. Called with the
+ * event_lock held.
+ */
+static void vop2_vp_end_vrr_frame(struct vop2_video_port *vp)
+{
+	u32 end = vop2_vp_read_vcnt(vp) + VOP2_VRR_END_MARGIN;
+
+	/* Close to the maximum vtotal, the frame ends there on its own */
+	end = max_t(u32, end, vp->vrr_base_vtotal);
+	end = min_t(u32, end, vp->vrr_max_vtotal);
+
+	vop2_vp_set_vrr_vtotal(vp, end);
 }
 
 static void vop2_crtc_atomic_flush(struct drm_crtc *crtc,
@@ -3113,14 +3145,14 @@ static void vop2_crtc_atomic_flush(struct drm_crtc *crtc,
 	/*
 	 * VRR: the new frame is ready (the configuration is marked done
 	 * above), so end the stretched front porch of the current frame at the
-	 * earliest point, the vtotal of the highest refresh rate. The next
+	 * earliest point (vop2_vp_end_vrr_frame()). The next
 	 * frame start stretches it again (vop2_vp_handle_vblank()).
 	 */
 	vp->vrr_active = vp->enabled && crtc_state->vrr_enabled;
 	if (vp->vrr_active) {
 		vp->vrr_base_vtotal = crtc_state->vrr_state.base_vtotal;
 		vp->vrr_max_vtotal = crtc_state->vrr_state.max_vtotal;
-		vop2_vp_set_vrr_vtotal(vp, vp->vrr_base_vtotal);
+		vop2_vp_end_vrr_frame(vp);
 	}
 
 	if (crtc->state->event) {
