@@ -1426,6 +1426,7 @@ DEFINE_INFOFRAME_FILE(avi);
 DEFINE_INFOFRAME_FILE(hdmi);
 DEFINE_INFOFRAME_FILE(hdr_drm);
 DEFINE_INFOFRAME_FILE(spd);
+DEFINE_INFOFRAME_FILE(vtem);
 
 static int create_hdmi_infoframe_files(struct drm_connector *connector,
 				       struct dentry *parent)
@@ -1449,6 +1450,10 @@ static int create_hdmi_infoframe_files(struct drm_connector *connector,
 		return ret;
 
 	ret = create_hdmi_spd_infoframe_file(connector, parent);
+	if (ret)
+		return ret;
+
+	ret = create_hdmi_vtem_infoframe_file(connector, parent);
 	if (ret)
 		return ret;
 
