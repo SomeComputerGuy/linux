@@ -344,6 +344,28 @@ static int drm_bridge_connector_force_ctx(struct drm_connector *connector,
 	return 0;
 }
 
+/*
+ * The vrr_capable property describes the sink, so it follows the EDID: update
+ * it whenever display_info changes, for the connectors that attached it.
+ */
+static void drm_bridge_connector_update_vrr_capable(struct drm_connector *connector,
+						    struct drm_bridge *bridge)
+{
+	bool capable;
+
+	if (!connector->vrr_capable_property)
+		return;
+
+	if (connector->status != connector_status_connected)
+		capable = false;
+	else if (bridge->funcs->vrr_capable)
+		capable = bridge->funcs->vrr_capable(bridge, connector);
+	else
+		capable = drm_display_info_is_vrr_capable(&connector->display_info);
+
+	drm_connector_set_vrr_capable_property(connector, capable);
+}
+
 static int drm_bridge_connector_get_modes_edid(struct drm_connector *connector,
 					       struct drm_bridge *bridge)
 {
@@ -360,6 +382,7 @@ static int drm_bridge_connector_get_modes_edid(struct drm_connector *connector,
 	}
 
 	drm_edid_connector_update(connector, drm_edid);
+	drm_bridge_connector_update_vrr_capable(connector, bridge);
 	n = drm_edid_connector_add_modes(connector);
 
 	drm_edid_free(drm_edid);
@@ -367,6 +390,7 @@ static int drm_bridge_connector_get_modes_edid(struct drm_connector *connector,
 
 no_edid:
 	drm_edid_connector_update(connector, NULL);
+	drm_bridge_connector_update_vrr_capable(connector, bridge);
 	return 0;
 }
 

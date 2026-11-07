@@ -498,6 +498,26 @@ struct drm_bridge_funcs {
 					    struct drm_connector *connector);
 
 	/**
+	 * @vrr_capable:
+	 *
+	 * Tell whether the sink can be driven with a variable refresh rate
+	 * through this bridge. The bridge connector calls it on the bridge
+	 * that reads the EDID (&DRM_BRIDGE_OP_EDID), right after updating
+	 * &drm_connector.display_info from the EDID, and sets the
+	 * "vrr_capable" connector property from it, if the connector has
+	 * that property.
+	 *
+	 * This callback is optional. Without it, the property follows
+	 * drm_display_info_is_vrr_capable().
+	 *
+	 * RETURNS:
+	 *
+	 * True if the sink supports a variable refresh rate on this link.
+	 */
+	bool (*vrr_capable)(struct drm_bridge *bridge,
+			    struct drm_connector *connector);
+
+	/**
 	 * @hpd_notify:
 	 *
 	 * Notify the bridge of hot plug detection.
