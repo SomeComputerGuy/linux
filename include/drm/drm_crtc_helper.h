@@ -44,6 +44,7 @@ struct drm_encoder;
 struct drm_framebuffer;
 struct drm_mode_set;
 struct drm_modeset_acquire_ctx;
+struct drm_crtc_state;
 
 void drm_helper_disable_unused_functions(struct drm_device *dev);
 int drm_crtc_helper_set_config(struct drm_mode_set *set,
@@ -61,5 +62,8 @@ int drm_helper_connector_dpms(struct drm_connector *connector, int mode);
 
 void drm_helper_resume_force_mode(struct drm_device *dev);
 int drm_helper_force_disable_all(struct drm_device *dev);
+
+bool drm_crtc_helper_vrr_flush(struct drm_crtc_state *crtc_state);
+bool drm_crtc_helper_vrr_vsync(struct drm_crtc_state *crtc_state);
 
 #endif
