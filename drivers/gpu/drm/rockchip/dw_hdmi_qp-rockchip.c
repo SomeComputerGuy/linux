@@ -955,6 +955,9 @@ static int dw_hdmi_qp_rockchip_bind(struct device *dev, struct device *master,
 
 	drm_connector_attach_colorspace_property(connector);
 
+	/* Sent in the AVI InfoFrame; "Game" also enables ALLM */
+	drm_connector_attach_content_type_property(connector);
+
 	if (hdmi->limited_range_rgb) {
 		ret = drm_connector_attach_broadcast_rgb_property(connector);
 		if (ret)
