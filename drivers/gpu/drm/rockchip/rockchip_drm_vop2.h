@@ -862,6 +862,9 @@ enum dst_factor_mode {
 
 #define RK3588_VP_DSP_CTRL__GAMMA_UPDATE_EN		BIT(22)
 
+#define RK3568_VP_DSP_VTOTAL_VS_END__DSP_VTOTAL	GENMASK(28, 16)
+#define RK3568_VP_DSP_VTOTAL_VS_END__IMD		BIT(15)
+
 #define RK3588_VP_CLK_CTRL__DCLK_OUT_DIV		GENMASK(3, 2)
 #define RK3588_VP_CLK_CTRL__DCLK_CORE_DIV		GENMASK(1, 0)
 
@@ -1017,6 +1020,12 @@ static inline void vop2_writel(struct vop2 *vop2, u32 offset, u32 v)
 static inline void vop2_vp_write(struct vop2_video_port *vp, u32 offset, u32 v)
 {
 	regmap_write(vp->vop2->map, vp->data->offset + offset, v);
+}
+
+static inline void vop2_vp_update_bits(struct vop2_video_port *vp, u32 offset,
+				       u32 mask, u32 v)
+{
+	regmap_update_bits(vp->vop2->map, vp->data->offset + offset, mask, v);
 }
 
 static inline u32 vop2_readl(struct vop2 *vop2, u32 offset)
