@@ -838,6 +838,69 @@ fail:
 }
 EXPORT_SYMBOL(drm_crtc_helper_set_config);
 
+/**
+ * drm_crtc_helper_vrr_flush - Update VRR state on frame ready
+ * @crtc_state: pointer to &struct drm_crtc_state of CRTC that has a new frame ready
+ *
+ * Update the VRR state by communicating that a frame is ready on
+ * @crtc_state.crtc.
+ *
+ * Should be called from the @crtc_state.crtc &drm_crtc_helper_funcs.atomic_flush
+ * hook.
+ *
+ * Returns:
+ * - %true if @crtc_state.vrr_state.cur_vtotal changed
+ * - %false otherwise
+ */
+bool drm_crtc_helper_vrr_flush(struct drm_crtc_state *crtc_state)
+{
+	struct drm_crtc_vrr_state *vrr = &crtc_state->vrr_state;
+
+	if (!crtc_state->vrr_enabled) {
+		if (vrr->cur_vtotal) {
+			vrr->cur_vtotal = 0;
+			return true;
+		}
+		return false;
+	}
+
+	if (vrr->cur_vtotal == vrr->base_vtotal)
+		return false;
+
+	vrr->cur_vtotal = vrr->base_vtotal;
+
+	return true;
+}
+EXPORT_SYMBOL(drm_crtc_helper_vrr_flush);
+
+/**
+ * drm_crtc_helper_vrr_vsync - Update VRR state on vblank end
+ * @crtc_state: pointer to &struct drm_crtc_state of CRTC the vblank occurred on
+ *
+ * Update the VRR state by communicating that a vertical blank has ended and a
+ * new frame is about to start.
+ *
+ * Returns:
+ *  - %true if @crtc_state.vrr_state.cur_vtotal changed
+ *  - %false otherwise
+ */
+bool drm_crtc_helper_vrr_vsync(struct drm_crtc_state *crtc_state)
+{
+	struct drm_crtc_vrr_state *vrr = &crtc_state->vrr_state;
+	u16 old_vtotal = vrr->cur_vtotal;
+
+	if (!crtc_state->vrr_enabled)
+		vrr->cur_vtotal = 0;
+	else
+		vrr->cur_vtotal = vrr->max_vtotal;
+
+	if (abs_diff(vrr->cur_vtotal, old_vtotal) > 1)
+		vrr->dynamic = true;
+
+	return old_vtotal != vrr->cur_vtotal;
+}
+EXPORT_SYMBOL(drm_crtc_helper_vrr_vsync);
+
 static int drm_helper_choose_encoder_dpms(struct drm_encoder *encoder)
 {
 	int dpms = DRM_MODE_DPMS_OFF;
