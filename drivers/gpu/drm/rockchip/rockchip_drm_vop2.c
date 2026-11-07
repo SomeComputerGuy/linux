@@ -3143,12 +3143,15 @@ static void vop2_crtc_atomic_flush(struct drm_crtc *crtc,
 	spin_lock_irq(&crtc->dev->event_lock);
 
 	/*
-	 * VRR: the new frame is ready (the configuration is marked done
+	 * VRR, if the encoder set up a VRR range for the mode (it leaves the
+	 * VRR state cleared when the sink cannot vary the refresh rate of the
+	 * mode): the new frame is ready (the configuration is marked done
 	 * above), so end the stretched front porch of the current frame at the
 	 * earliest point (vop2_vp_end_vrr_frame()). The next
 	 * frame start stretches it again (vop2_vp_handle_vblank()).
 	 */
-	vp->vrr_active = vp->enabled && crtc_state->vrr_enabled;
+	vp->vrr_active = vp->enabled && crtc_state->vrr_enabled &&
+			 crtc_state->vrr_state.max_vtotal;
 	if (vp->vrr_active) {
 		vp->vrr_base_vtotal = crtc_state->vrr_state.base_vtotal;
 		vp->vrr_max_vtotal = crtc_state->vrr_state.max_vtotal;
