@@ -2037,6 +2037,8 @@ int __drm_atomic_helper_set_config(struct drm_mode_set *set,
 
 	crtc_state->active = true;
 
+	crtc_state->vrr_enabled = false;
+
 	ret = drm_atomic_set_crtc_for_plane(primary_state, crtc);
 	if (ret != 0)
 		return ret;
