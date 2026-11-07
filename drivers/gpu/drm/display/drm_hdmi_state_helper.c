@@ -905,6 +905,56 @@ static int hdmi_generate_hdmi_vendor_infoframe(const struct drm_connector *conne
 	return 0;
 }
 
+static int hdmi_generate_emp_infoframe_vtem(const struct drm_connector *connector,
+					    struct drm_connector_state *conn_state)
+{
+	const struct drm_display_info *info = &connector->display_info;
+	const struct drm_crtc_state *crtc_state =
+		drm_atomic_get_crtc_state(conn_state->state, conn_state->crtc);
+	struct drm_connector_hdmi_infoframe *infoframe =
+		&conn_state->hdmi.infoframes.vtem;
+	struct hdmi_emp_infoframe_vtem *vtem =
+		&infoframe->data.vtem;
+	const struct drm_crtc_vrr_state *vrr = &crtc_state->vrr_state;
+	int vfront;
+
+	infoframe->set = false;
+
+	if (!connector->hdmi.funcs->vtem.write_infoframe)
+		return 0;
+
+	if (!info->hdmi.vrr_capable)
+		return 0;
+
+	hdmi_emp_infoframe_vtem_init(vtem);
+	if (!crtc_state->vrr_enabled || vrr->vic) {
+		vtem->base_refresh_rate = 0;
+		vtem->base_vfront = 0;
+	} else {
+		vtem->base_refresh_rate = drm_mode_vrefresh(&crtc_state->mode);
+		vfront = crtc_state->adjusted_mode.crtc_vsync_start -
+			 crtc_state->adjusted_mode.crtc_vdisplay;
+		if (vfront > U8_MAX || vfront < 0)
+			return -EINVAL;
+
+		vtem->base_vfront = vfront;
+	}
+	vtem->fva_factor_m1 = 0;
+	infoframe->set = true;
+
+	if (!crtc_state->vrr_enabled) {
+		vtem->m_const = false;
+		vtem->game_vrr_en = false;
+		return 0;
+	}
+
+	vtem->game_vrr_en = true;
+
+	vtem->m_const = !vrr->dynamic;
+
+	return 0;
+}
+
 static int
 hdmi_generate_infoframes(const struct drm_connector *connector,
 			 struct drm_connector_state *conn_state)
@@ -933,6 +983,10 @@ hdmi_generate_infoframes(const struct drm_connector *connector,
 		return ret;
 
 	ret = hdmi_generate_hdmi_vendor_infoframe(connector, conn_state);
+	if (ret)
+		return ret;
+
+	ret = hdmi_generate_emp_infoframe_vtem(connector, conn_state);
 	if (ret)
 		return ret;
 
@@ -1549,6 +1603,12 @@ int drm_atomic_helper_connector_hdmi_update_infoframes(struct drm_connector *con
 		if (ret)
 			goto out;
 	}
+
+	if (info->hdmi.vrr_capable)
+		ret = write_or_clear_infoframe(connector,
+					&funcs->vtem, "VTEM",
+					&old_conn_state->hdmi.infoframes.vtem,
+					&new_conn_state->hdmi.infoframes.vtem);
 
 out:
 	mutex_unlock(&connector->hdmi.infoframes.lock);
