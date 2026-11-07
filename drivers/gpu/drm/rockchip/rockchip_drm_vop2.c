@@ -3494,6 +3494,16 @@ static void vop2_crtc_atomic_begin(struct drm_crtc *crtc,
 }
 
 /*
+ * The line the video port scans out now, counted from the start of the
+ * vertical sync pulse (RK3568/RK3588 only).
+ */
+static u32 vop2_vp_read_vcnt(struct vop2_video_port *vp)
+{
+	return FIELD_GET(RK3568_SYS_STATUS__DSP_VCNT,
+			 vop2_readl(vp->vop2, RK3568_SYS_STATUS(vp->id)));
+}
+
+/*
  * Set the vtotal of the frame being scanned out, with immediate effect: a
  * vtotal at or below the current line ends the frame now, a larger one
  * stretches its vertical front porch. Called with the event_lock held.
@@ -4342,8 +4352,8 @@ static irqreturn_t vop2_isr(int irq, void *data)
 			if (irqs & VP_INT_POST_BUF_EMPTY) {
 				vop2_crtc_handle_post_buf_empty(vp);
 				drm_err_ratelimited(vop2->drm,
-						    "POST_BUF_EMPTY irq err at vp%d\n",
-						    vp->id);
+						    "POST_BUF_EMPTY irq err at vp%d line %u\n",
+						    vp->id, vop2_vp_read_vcnt(vp));
 				ret = IRQ_HANDLED;
 			}
 		}

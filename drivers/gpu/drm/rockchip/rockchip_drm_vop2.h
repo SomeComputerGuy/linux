@@ -622,6 +622,7 @@ enum dst_factor_mode {
 #define RK3568_OTP_WIN_EN			0x050
 #define RK3568_LUT_PORT_SEL			0x058
 #define RK3568_SYS_STATUS0			0x060
+#define RK3568_SYS_STATUS(vp)			(0x060 + (vp) * 0x4)
 #define RK3568_VP_LINE_FLAG(vp)			(0x70 + (vp) * 0x4)
 #define RK3568_SYS0_INT_EN			0x80
 #define RK3568_SYS0_INT_CLR			0x84
@@ -872,6 +873,8 @@ enum dst_factor_mode {
 #define RK3568_VP_DSP_CTRL__OUT_MODE			GENMASK(3, 0)
 
 #define RK3588_VP_DSP_CTRL__GAMMA_UPDATE_EN		BIT(22)
+
+#define RK3568_SYS_STATUS__DSP_VCNT		GENMASK(28, 16)
 
 #define RK3568_VP_DSP_VTOTAL_VS_END__DSP_VTOTAL	GENMASK(28, 16)
 #define RK3568_VP_DSP_VTOTAL_VS_END__IMD		BIT(15)
