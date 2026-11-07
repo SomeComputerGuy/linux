@@ -137,6 +137,7 @@ int hdmi_frl_bandwidth_range_from_clock(unsigned long long clock,
 #define HDMI_AUDIO_INFOFRAME_SIZE  10
 #define HDMI_DRM_INFOFRAME_SIZE    26
 #define HDMI_VENDOR_INFOFRAME_SIZE  4
+#define HDMI_FORUM_VENDOR_INFOFRAME_SIZE  5
 #define HDMI_VTEM_INFOFRAME_SIZE   10
 
 /*
@@ -508,6 +509,32 @@ ssize_t hdmi_vendor_infoframe_pack_only(const struct hdmi_vendor_infoframe *fram
 					void *buffer, size_t size);
 int hdmi_vendor_infoframe_check(struct hdmi_vendor_infoframe *frame);
 
+/**
+ * struct hdmi_forum_vendor_infoframe - HDMI Forum vendor specific InfoFrame
+ * @type: HDMI_INFOFRAME_TYPE_VENDOR
+ * @version: InfoFrame version, 1
+ * @length: payload length, HDMI_FORUM_VENDOR_INFOFRAME_SIZE
+ * @oui: HDMI_FORUM_IEEE_OUI
+ * @allm: ALLM_Mode, ask the sink for its Auto Low Latency Mode
+ *
+ * The HF-VSIF of HDMI 2.1. Only the fields that are used are described:
+ * the 3D and CCBPC fields are always sent as zero.
+ */
+struct hdmi_forum_vendor_infoframe {
+	enum hdmi_infoframe_type type;
+	unsigned char version;
+	unsigned char length;
+	unsigned int oui;
+	bool allm;
+};
+
+int hdmi_forum_vendor_infoframe_init(struct hdmi_forum_vendor_infoframe *frame);
+int hdmi_forum_vendor_infoframe_check(struct hdmi_forum_vendor_infoframe *frame);
+ssize_t hdmi_forum_vendor_infoframe_pack_only(const struct hdmi_forum_vendor_infoframe *frame,
+					      void *buffer, size_t size);
+ssize_t hdmi_forum_vendor_infoframe_pack(struct hdmi_forum_vendor_infoframe *frame,
+					 void *buffer, size_t size);
+
 union hdmi_vendor_any_infoframe {
 	struct {
 		enum hdmi_infoframe_type type;
@@ -516,6 +543,7 @@ union hdmi_vendor_any_infoframe {
 		unsigned int oui;
 	} any;
 	struct hdmi_vendor_infoframe hdmi;
+	struct hdmi_forum_vendor_infoframe hdmi_forum;
 };
 
 /**
