@@ -1709,6 +1709,20 @@ drm_atomic_helper_connector_hdmi_clear_audio_infoframe(struct drm_connector *con
 }
 EXPORT_SYMBOL(drm_atomic_helper_connector_hdmi_clear_audio_infoframe);
 
+/*
+ * The vrr_capable property describes the sink, so it follows the EDID. Keep
+ * it up to date here, where the EDID is read, rather than in atomic_check:
+ * userspace looks at it when the connector is probed, before any commit.
+ */
+static void hdmi_update_vrr_capable(struct drm_connector *connector)
+{
+	if (!connector->vrr_capable_property)
+		return;
+
+	drm_connector_set_vrr_capable_property(connector,
+		drm_display_info_is_vrr_capable(&connector->display_info));
+}
+
 static int
 drm_atomic_helper_connector_hdmi_update(struct drm_connector *connector,
 					struct drm_modeset_acquire_ctx *ctx,
@@ -1736,6 +1750,8 @@ drm_atomic_helper_connector_hdmi_update(struct drm_connector *connector,
 		if (ret)
 			drm_warn(connector->dev, "Ignored EDID update error: %d\n", ret);
 
+		hdmi_update_vrr_capable(connector);
+
 		drm_connector_cec_phys_addr_invalidate(connector);
 
 		return 0;
@@ -1749,6 +1765,8 @@ drm_atomic_helper_connector_hdmi_update(struct drm_connector *connector,
 	drm_edid_connector_update(connector, drm_edid);
 
 	drm_edid_free(drm_edid);
+
+	hdmi_update_vrr_capable(connector);
 
 	if (status == connector_status_connected) {
 		/*
