@@ -901,6 +901,25 @@ static int hdmi_generate_hdmi_vendor_infoframe(const struct drm_connector *conne
 	if (ret)
 		return ret;
 
+	/*
+	 * Auto Low Latency Mode: for game content, ask a sink that supports
+	 * it for its lowest latency mode with the HDMI Forum VSIF. It takes
+	 * the place of the HDMI 1.4 VSIF, which is only needed for an HDMI
+	 * VIC or 3D: keep that one for such modes.
+	 */
+	if (info->hdmi.allm &&
+	    conn_state->content_type == DRM_MODE_CONTENT_TYPE_GAME &&
+	    !frame->vic && frame->s3d_struct == HDMI_3D_STRUCTURE_INVALID) {
+		struct hdmi_forum_vendor_infoframe *hf =
+			&infoframe->data.vendor.hdmi_forum;
+
+		ret = hdmi_forum_vendor_infoframe_init(hf);
+		if (ret)
+			return ret;
+
+		hf->allm = true;
+	}
+
 	infoframe->set = true;
 
 	return 0;
