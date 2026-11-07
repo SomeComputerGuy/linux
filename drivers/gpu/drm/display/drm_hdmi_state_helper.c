@@ -1115,9 +1115,9 @@ static int hdmi_validate_vrr(struct drm_connector *connector,
 	const struct drm_display_mode *mode = &new_crtc_state->mode;
 	struct drm_device *dev = connector->dev;
 	int mode_refresh, vfront, ret;
-	u32 min_vfreq_n = info->monitor_range.min_vfreq;
+	u32 min_vfreq_n = info->hdmi.vrr_min_vfreq;
 	u32 min_vfreq_d = 1;
-	u32 max_vfreq_n = info->monitor_range.max_vfreq;
+	u32 max_vfreq_n = info->hdmi.vrr_max_vfreq;
 	u32 max_vfreq_d = 1;
 
 	/* Save on the expensive vic lookup, if nothing else. */
