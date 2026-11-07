@@ -28,6 +28,7 @@
 #include <linux/export.h>
 #include <linux/hdmi.h>
 #include <linux/string.h>
+#include <linux/string_choices.h>
 #include <linux/device.h>
 
 #define hdmi_log(fmt, ...) dev_printk(level, dev, fmt, ##__VA_ARGS__)
@@ -829,6 +830,131 @@ ssize_t hdmi_vendor_infoframe_pack(struct hdmi_vendor_infoframe *frame,
 }
 EXPORT_SYMBOL(hdmi_vendor_infoframe_pack);
 
+/**
+ * hdmi_forum_vendor_infoframe_init() - initialize an HDMI Forum vendor
+ * specific infoframe
+ * @frame: HDMI Forum vendor specific infoframe
+ *
+ * Returns 0 on success or a negative error code on failure.
+ */
+int hdmi_forum_vendor_infoframe_init(struct hdmi_forum_vendor_infoframe *frame)
+{
+	memset(frame, 0, sizeof(*frame));
+
+	frame->type = HDMI_INFOFRAME_TYPE_VENDOR;
+	frame->version = 1;
+	frame->oui = HDMI_FORUM_IEEE_OUI;
+	frame->length = HDMI_FORUM_VENDOR_INFOFRAME_SIZE;
+
+	return 0;
+}
+EXPORT_SYMBOL(hdmi_forum_vendor_infoframe_init);
+
+static int
+hdmi_forum_vendor_infoframe_check_only(const struct hdmi_forum_vendor_infoframe *frame)
+{
+	if (frame->type != HDMI_INFOFRAME_TYPE_VENDOR ||
+	    frame->version != 1 ||
+	    frame->oui != HDMI_FORUM_IEEE_OUI ||
+	    frame->length != HDMI_FORUM_VENDOR_INFOFRAME_SIZE)
+		return -EINVAL;
+
+	return 0;
+}
+
+/**
+ * hdmi_forum_vendor_infoframe_check() - check an HDMI Forum vendor specific
+ * infoframe
+ * @frame: HDMI Forum vendor specific infoframe
+ *
+ * Validates that the infoframe is consistent and updates derived fields
+ * (eg. length) based on other fields.
+ *
+ * Returns 0 on success or a negative error code on failure.
+ */
+int hdmi_forum_vendor_infoframe_check(struct hdmi_forum_vendor_infoframe *frame)
+{
+	frame->length = HDMI_FORUM_VENDOR_INFOFRAME_SIZE;
+
+	return hdmi_forum_vendor_infoframe_check_only(frame);
+}
+EXPORT_SYMBOL(hdmi_forum_vendor_infoframe_check);
+
+/**
+ * hdmi_forum_vendor_infoframe_pack_only() - write an HDMI Forum vendor
+ * specific infoframe to binary buffer
+ * @frame: HDMI Forum vendor specific infoframe
+ * @buffer: destination buffer
+ * @size: size of buffer
+ *
+ * Packs the information contained in the @frame structure into a binary
+ * representation that can be written into the corresponding controller
+ * registers. Also computes the checksum.
+ *
+ * Returns the number of bytes packed into the binary buffer or a negative
+ * error code on failure.
+ */
+ssize_t hdmi_forum_vendor_infoframe_pack_only(const struct hdmi_forum_vendor_infoframe *frame,
+					      void *buffer, size_t size)
+{
+	u8 *ptr = buffer;
+	size_t length;
+	int ret;
+
+	ret = hdmi_forum_vendor_infoframe_check_only(frame);
+	if (ret)
+		return ret;
+
+	length = HDMI_INFOFRAME_HEADER_SIZE + frame->length;
+
+	if (size < length)
+		return -ENOSPC;
+
+	memset(buffer, 0, size);
+
+	ptr[0] = frame->type;
+	ptr[1] = frame->version;
+	ptr[2] = frame->length;
+	ptr[3] = 0; /* checksum */
+
+	/* HDMI Forum OUI */
+	ptr[4] = 0xd8;
+	ptr[5] = 0x5d;
+	ptr[6] = 0xc4;
+
+	ptr[7] = 1;	/* HF-VSIF version */
+	if (frame->allm)
+		ptr[8] |= BIT(1);
+
+	hdmi_infoframe_set_checksum(buffer, length);
+
+	return length;
+}
+EXPORT_SYMBOL(hdmi_forum_vendor_infoframe_pack_only);
+
+/**
+ * hdmi_forum_vendor_infoframe_pack() - check an HDMI Forum vendor specific
+ * infoframe, and write it to binary buffer
+ * @frame: HDMI Forum vendor specific infoframe
+ * @buffer: destination buffer
+ * @size: size of buffer
+ *
+ * Returns the number of bytes packed into the binary buffer or a negative
+ * error code on failure.
+ */
+ssize_t hdmi_forum_vendor_infoframe_pack(struct hdmi_forum_vendor_infoframe *frame,
+					 void *buffer, size_t size)
+{
+	int ret;
+
+	ret = hdmi_forum_vendor_infoframe_check(frame);
+	if (ret)
+		return ret;
+
+	return hdmi_forum_vendor_infoframe_pack_only(frame, buffer, size);
+}
+EXPORT_SYMBOL(hdmi_forum_vendor_infoframe_pack);
+
 static int
 hdmi_vendor_any_infoframe_check_only(const union hdmi_vendor_any_infoframe *frame)
 {
@@ -995,11 +1121,14 @@ hdmi_vendor_any_infoframe_check(union hdmi_vendor_any_infoframe *frame)
 	if (ret)
 		return ret;
 
-	/* we only know about HDMI vendor infoframes */
-	if (frame->any.oui != HDMI_IEEE_OUI)
+	switch (frame->any.oui) {
+	case HDMI_IEEE_OUI:
+		return hdmi_vendor_infoframe_check(&frame->hdmi);
+	case HDMI_FORUM_IEEE_OUI:
+		return hdmi_forum_vendor_infoframe_check(&frame->hdmi_forum);
+	default:
 		return -EINVAL;
-
-	return hdmi_vendor_infoframe_check(&frame->hdmi);
+	}
 }
 
 /*
@@ -1015,11 +1144,15 @@ hdmi_vendor_any_infoframe_pack_only(const union hdmi_vendor_any_infoframe *frame
 	if (ret)
 		return ret;
 
-	/* we only know about HDMI vendor infoframes */
-	if (frame->any.oui != HDMI_IEEE_OUI)
+	switch (frame->any.oui) {
+	case HDMI_IEEE_OUI:
+		return hdmi_vendor_infoframe_pack_only(&frame->hdmi, buffer, size);
+	case HDMI_FORUM_IEEE_OUI:
+		return hdmi_forum_vendor_infoframe_pack_only(&frame->hdmi_forum,
+							     buffer, size);
+	default:
 		return -EINVAL;
-
-	return hdmi_vendor_infoframe_pack_only(&frame->hdmi, buffer, size);
+	}
 }
 
 /*
@@ -1647,6 +1780,11 @@ hdmi_vendor_any_infoframe_log(const char *level,
 	hdmi_infoframe_log_header(level, dev,
 				  (const struct hdmi_any_infoframe *)frame);
 
+	if (frame->any.oui == HDMI_FORUM_IEEE_OUI) {
+		hdmi_log("    HDMI Forum vendor specific infoframe\n");
+		hdmi_log("    ALLM mode: %s\n", str_on_off(frame->hdmi_forum.allm));
+		return;
+	}
 	if (frame->any.oui != HDMI_IEEE_OUI) {
 		hdmi_log("    not a HDMI vendor infoframe\n");
 		return;
