@@ -63,6 +63,14 @@ struct drm_atomic_commit;
 struct drm_crtc_helper_funcs;
 struct drm_plane_helper_funcs;
 
+struct drm_crtc_vrr_state {
+	u8 vic;
+	u16 cur_vtotal;
+	u16 max_vtotal;
+	u16 base_vtotal;
+	bool dynamic;
+};
+
 /**
  * struct drm_crtc_state - mutable CRTC state
  *
@@ -396,6 +404,9 @@ struct drm_crtc_state {
 	 * update, but it should avoid tearing.
 	 */
 	struct drm_pending_vblank_event *event;
+
+	/** @vrr_state: State related to variable refresh rate. */
+	struct drm_crtc_vrr_state vrr_state;
 
 	/**
 	 * @commit:

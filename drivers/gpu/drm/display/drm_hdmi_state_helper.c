@@ -940,6 +940,225 @@ hdmi_generate_infoframes(const struct drm_connector *connector,
 }
 
 /**
+ * cmp_fraction - compares two fractional numbers
+ * @a: numerator of the first fraction
+ * @b: denominator of the first fraction
+ * @c: numerator of the second fraction
+ * @d: denominator of the second fraction
+ *
+ * Compare fractional expression given by @a divided by @b with fractional
+ * expression given by @c divided by @d, without running into rounding issues.
+ *
+ * Neither @b nor @d should be 0.
+ *
+ * Returns:
+ *  - %1 if @a / @b > @c / @d
+ *  - %-1 if @a / @b < @c / @d
+ *  - %0 if @a / @b == @c / @d
+ *  - %-EDOM if @b is zero or @d is zero.
+ */
+static int cmp_fraction(u32 a, u32 b, u32 c, u32 d)
+{
+	u64 a_d = mul_u32_u32(a, d);
+	u64 b_c = mul_u32_u32(b, c);
+
+	if (WARN_ON(!b || !d))
+		return -EDOM;
+
+	/* a/b > c/d */
+	if (a_d > b_c)
+		return 1;
+
+	/* a/b < c/d */
+	if (a_d < b_c)
+		return -1;
+
+	/* a/b == c/d */
+	return 0;
+}
+
+static int hdmi_calculate_vtotal(const struct drm_display_mode *mode,
+				 u32 rate_n, u32 rate_d, u16 *out_vtotal,
+				 u32 *out_denom, u32 *out_frame_err)
+{
+	u32 denom, result, err;
+	u64 numerator;
+
+	/*
+	 * We perform VRR based rate limiting by adjusting the vertical front
+	 * porch. We do that by picking a new Vtotal to pass to the hardware,
+	 * which extends the display period. Since we can change no other
+	 * timings, this rarely results in a perfect integer match to the
+	 * target framerate. However, we would like to correct for this error
+	 * using only integer math.
+	 *
+	 * For a given refresh rate:
+	 *
+	 * Vtotal =              clock
+	 *          ----------------------------------
+	 *               Htotal * target_refresh
+	 *
+	 * We specify target_refresh as a ratio, because the possible target
+	 * framerates include rates like 23.97... that are actually 24 / 1.001,
+	 * or 24000 / 1001.
+	 *
+	 *                        clock
+	 * Vtotal = ----------------------------------
+	 *            Htotal * target_n / target_d
+	 *
+	 * Some algebra brings us to:
+	 *
+	 *                clock * target_n
+	 * Vtotal = ----------------------------------
+	 *                Htotal * rate_n
+	 *
+	 * The amount of timing error we accumulate every frame will be
+	 * the remainder of that division.
+	 *
+	 * We store the remainder for later. Every frame we add the remainder
+	 * to an accumulator, and when the accumulator exceeds the denominator,
+	 * one Htotal worth of error has accumulated.
+	 *
+	 * In practice, as soon as the accumulated error exceeds half the
+	 * denominator, it is dithered across frames by temporarily extending
+	 * Vtotal by a single row on that frame.
+	 */
+
+	if (check_mul_overflow(mode->crtc_htotal, rate_n, &denom))
+		return -ERANGE;
+
+	if (check_mul_overflow(mode->crtc_clock * 1000ULL, rate_d, &numerator))
+		return -ERANGE;
+
+	result = div_u64_rem(numerator, denom, &err);
+	if (result > U16_MAX)
+		return -ERANGE;
+
+	if (out_vtotal)
+		*out_vtotal = result;
+	if (out_denom)
+		*out_denom = denom;
+	if (out_frame_err)
+		*out_frame_err = err;
+
+	return 0;
+}
+
+static int hdmi_validate_vrr(struct drm_connector *connector,
+			     struct drm_atomic_commit *state)
+{
+	struct drm_connector_state *new_conn_state =
+		drm_atomic_get_new_connector_state(state, connector);
+	struct drm_crtc_state *new_crtc_state =
+		drm_atomic_get_new_crtc_state(state, new_conn_state->crtc);
+	struct drm_crtc_state *old_crtc_state =
+		drm_atomic_get_old_crtc_state(state, new_conn_state->crtc);
+	struct drm_crtc_vrr_state *vrr_state =
+		&new_crtc_state->vrr_state;
+	struct drm_crtc_vrr_state *old_vrr_state =
+		&old_crtc_state->vrr_state;
+	struct drm_display_info *info = &connector->display_info;
+	const struct drm_display_mode *mode = &new_crtc_state->mode;
+	struct drm_device *dev = connector->dev;
+	int mode_refresh, vfront, ret;
+	u32 min_vfreq_n = info->monitor_range.min_vfreq;
+	u32 min_vfreq_d = 1;
+	u32 max_vfreq_n = info->monitor_range.max_vfreq;
+	u32 max_vfreq_d = 1;
+
+	/* Save on the expensive vic lookup, if nothing else. */
+	if (!new_crtc_state->mode_changed &&
+	    old_crtc_state->vrr_enabled &&
+	    info->hdmi.vrr_capable) {
+		memcpy(vrr_state, old_vrr_state, sizeof(*vrr_state));
+		vrr_state->dynamic = false;
+		return 0;
+	}
+
+	if (!new_crtc_state->vrr_enabled)
+		return 0;
+
+	if (!info->hdmi.vrr_capable)
+		return -EOPNOTSUPP;
+
+	mode_refresh = drm_mode_vrefresh(mode);
+
+	/* HDMI uses 10 bits to signal the base refresh. */
+	if (mode_refresh < 0 || mode_refresh > 1023) {
+		drm_dbg_kms(dev, "Mode's refresh of %dHz > HDMI VRR maximum (1023)\n",
+			    mode_refresh);
+		return -EINVAL;
+	}
+
+	if (!max_vfreq_n || max_vfreq_n > mode_refresh)
+		max_vfreq_n = mode_refresh;
+
+	if (!min_vfreq_n) {
+		drm_dbg_kms(dev, "Could not get minimum VRR rate from sink\n");
+		return -EINVAL;
+	}
+
+	vfront = mode->crtc_vsync_start - mode->crtc_vdisplay;
+	if (vfront < 0 || vfront > U8_MAX) {
+		drm_dbg_kms(dev, "Vfront of %d would not fit in VTEM packet\n", vfront);
+		return -EINVAL;
+	}
+
+	vrr_state->vic = drm_match_cea_mode(mode);
+
+	if (cmp_fraction(min_vfreq_n, min_vfreq_d, max_vfreq_n, max_vfreq_d) > 0) {
+		drm_dbg_kms(dev, "Target max (%u/%u) > target min (%u/%u)\n",
+			    max_vfreq_n, max_vfreq_d, min_vfreq_n, min_vfreq_d);
+		return -EINVAL;
+	}
+
+	ret = hdmi_calculate_vtotal(mode, max_vfreq_n, max_vfreq_d,
+				    &vrr_state->base_vtotal, NULL, NULL);
+	if (ret) {
+		drm_dbg_kms(dev, "Couldn't calculate base_vtotal: %pe\n", ERR_PTR(ret));
+		return ret;
+	}
+
+	/*
+	 * Even at its fastest, it can't go faster than the mode, so
+	 * clamp to avoid imprecisely rounded mode_refresh values we
+	 * can't do anything about from ruining our day.
+	 */
+	vrr_state->base_vtotal = max(vrr_state->base_vtotal, mode->crtc_vtotal);
+
+	if (cmp_fraction(min_vfreq_n, min_vfreq_d, mode_refresh, 1) >= 0) {
+		/* refresh <= VRR min, don't do VRR vtotal adjustment */
+		vrr_state->max_vtotal = mode->crtc_vtotal;
+	} else {
+		/*
+		 * Allow additional front porch until effective rate == VRR min
+		 * In essence, this is mode->vtotal * mode_refresh / min_vfreq
+		 * but the relevant factors factored out from drm_mode_vrefresh()
+		 * to avoid working with rounded values, as well as using the
+		 * hardware adjusted crtc_* values instead.
+		 */
+		ret = hdmi_calculate_vtotal(mode, min_vfreq_n, min_vfreq_d,
+					    &vrr_state->max_vtotal, NULL, NULL);
+		if (ret) {
+			drm_dbg_kms(dev, "Couldn't calculate max_vtotal: %pe\n", ERR_PTR(ret));
+			return ret;
+		}
+
+		if (vrr_state->max_vtotal < mode->crtc_vtotal) {
+			drm_dbg_kms(dev, "max_vtotal=%u < crtc_vtotal=%u\n",
+				    vrr_state->max_vtotal, mode->crtc_vtotal);
+			return -EINVAL;
+		}
+	}
+
+	drm_dbg_kms(dev, "VRR has base_vtotal=%u max_vtotal=%u from %u/%uHz <= rate <= %u/%uHz\n",
+		    vrr_state->base_vtotal, vrr_state->max_vtotal, min_vfreq_n,
+		    min_vfreq_d, max_vfreq_n, max_vfreq_d);
+
+	return 0;
+}
+
+/**
  * drm_atomic_helper_connector_hdmi_check() - Helper to check HDMI connector atomic state
  * @connector: DRM Connector
  * @state: the DRM State object
@@ -974,6 +1193,10 @@ int drm_atomic_helper_connector_hdmi_check(struct drm_connector *connector,
 		return ret;
 
 	new_conn_state->hdmi.is_limited_range = hdmi_is_limited_range(connector, new_conn_state);
+
+	ret = hdmi_validate_vrr(connector, state);
+	if (ret)
+		return ret;
 
 	ret = hdmi_generate_infoframes(connector, new_conn_state);
 	if (ret)
