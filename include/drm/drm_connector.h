@@ -334,6 +334,16 @@ struct drm_hdmi_info {
 	/** @dsc_cap: DSC capabilities of the sink */
 	struct drm_hdmi_dsc_cap dsc_cap;
 
+	/** @vrr_min_vfreq: VRRmin of the HF-VSDB, in Hz */
+	u16 vrr_min_vfreq;
+
+	/**
+	 * @vrr_max_vfreq: VRRmax of the HF-VSDB, in Hz. 0 means that the sink
+	 * gave no maximum: the base refresh rate of the mode is the maximum
+	 * then.
+	 */
+	u16 vrr_max_vfreq;
+
 	/** @vrr_capable: The sink supports variable refresh rate */
 	bool vrr_capable;
 };
