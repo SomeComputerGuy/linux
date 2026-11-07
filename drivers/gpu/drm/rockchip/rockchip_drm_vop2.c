@@ -3569,6 +3569,16 @@ static void vop2_crtc_atomic_flush(struct drm_crtc *crtc,
 		}
 
 		crtc->state->event = NULL;
+	} else if (vp->vrr_active) {
+		/*
+		 * A commit without an event (e.g. a legacy cursor update) holds
+		 * no vblank reference, so the frame start interrupt may be off
+		 * and the next frame would not be stretched again. Take and drop
+		 * a reference: it keeps the interrupt on for the vblank off
+		 * delay, and the last frame start in that time leaves max_vtotal.
+		 */
+		if (!drm_crtc_vblank_get(crtc))
+			drm_crtc_vblank_put(crtc);
 	}
 
 	spin_unlock_irq(&crtc->dev->event_lock);
