@@ -950,7 +950,11 @@ static int hdmi_generate_emp_infoframe_vtem(const struct drm_connector *connecto
 
 	vtem->game_vrr_en = true;
 
-	vtem->m_const = !vrr->dynamic;
+	/*
+	 * Game mode VRR: the frame rate follows the source's page flips, so
+	 * it is not constant. M_CONST would tell the sink that it is.
+	 */
+	vtem->m_const = false;
 
 	return 0;
 }
@@ -1604,11 +1608,14 @@ int drm_atomic_helper_connector_hdmi_update_infoframes(struct drm_connector *con
 			goto out;
 	}
 
-	if (info->hdmi.vrr_capable)
-		ret = write_or_clear_infoframe(connector,
-					&funcs->vtem, "VTEM",
-					&old_conn_state->hdmi.infoframes.vtem,
-					&new_conn_state->hdmi.infoframes.vtem);
+	/*
+	 * Not only for VRR capable sinks: the VTEM of a previous VRR capable
+	 * sink has to be stopped when a sink without VRR is plugged in.
+	 */
+	ret = write_or_clear_infoframe(connector,
+				       &funcs->vtem, "VTEM",
+				       &old_conn_state->hdmi.infoframes.vtem,
+				       &new_conn_state->hdmi.infoframes.vtem);
 
 out:
 	mutex_unlock(&connector->hdmi.infoframes.lock);
