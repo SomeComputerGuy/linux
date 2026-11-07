@@ -55,6 +55,7 @@ enum hdmi_packet_type {
 };
 
 enum hdmi_infoframe_type {
+	HDMI_INFOFRAME_TYPE_EMP = 0x7F,
 	HDMI_INFOFRAME_TYPE_VENDOR = 0x81,
 	HDMI_INFOFRAME_TYPE_AVI = 0x82,
 	HDMI_INFOFRAME_TYPE_SPD = 0x83,
@@ -136,6 +137,7 @@ int hdmi_frl_bandwidth_range_from_clock(unsigned long long clock,
 #define HDMI_AUDIO_INFOFRAME_SIZE  10
 #define HDMI_DRM_INFOFRAME_SIZE    26
 #define HDMI_VENDOR_INFOFRAME_SIZE  4
+#define HDMI_VTEM_INFOFRAME_SIZE   10
 
 /*
  * HDMI 1.3a table 5-14 states that the largest InfoFrame_length is 27,
@@ -295,6 +297,18 @@ struct hdmi_drm_infoframe {
 	u16 max_fall;
 };
 
+struct hdmi_emp_infoframe_vtem {
+	enum hdmi_infoframe_type type;
+	unsigned char version;
+	unsigned char length;
+
+	bool game_vrr_en;
+	bool m_const;
+	unsigned char fva_factor_m1;
+	unsigned char base_vfront;
+	u16 base_refresh_rate;
+};
+
 void hdmi_avi_infoframe_init(struct hdmi_avi_infoframe *frame);
 ssize_t hdmi_avi_infoframe_pack(struct hdmi_avi_infoframe *frame, void *buffer,
 				size_t size);
@@ -309,6 +323,10 @@ ssize_t hdmi_drm_infoframe_pack_only(const struct hdmi_drm_infoframe *frame,
 int hdmi_drm_infoframe_check(struct hdmi_drm_infoframe *frame);
 int hdmi_drm_infoframe_unpack_only(struct hdmi_drm_infoframe *frame,
 				   const void *buffer, size_t size);
+void hdmi_emp_infoframe_vtem_init(struct hdmi_emp_infoframe_vtem *frame);
+ssize_t hdmi_emp_infoframe_vtem_pack(struct hdmi_emp_infoframe_vtem *frame,
+				     void *buffer,
+				     size_t size);
 
 enum hdmi_spd_sdi {
 	HDMI_SPD_SDI_UNKNOWN,
@@ -520,6 +538,7 @@ union hdmi_infoframe {
 	union hdmi_vendor_any_infoframe vendor;
 	struct hdmi_audio_infoframe audio;
 	struct hdmi_drm_infoframe drm;
+	struct hdmi_emp_infoframe_vtem vtem;
 };
 
 ssize_t hdmi_infoframe_pack(union hdmi_infoframe *frame, void *buffer,
