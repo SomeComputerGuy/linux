@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Device tree overlay for a Sony IMX219 camera module (e.g. Raspberry Pi
+ * Camera Module v2) attached through an adapter to the CAM1 connector of
+ * the Orange Pi 5 / 5B.
+ *
+ * CAM1 is wired to MIPI CSI D-PHY 0 (csi_dphy0, full mode) which feeds the
+ * MIPI CSI-2 receiver csi2 and VICAP port mipi2. The sensor control bus is
+ * I2C7 (M0 pins), the master clock is CLK_MIPI_CAMARAOUT_M3 on GPIO1_D6,
+ * the sensor reset line is GPIO3_C4 and the module power-down/enable line is
+ * GPIO3_C6. This mapping is taken from the Xunlong vendor kernel
+ * (rk3588s-orangepi-5-camera1.dtsi); CAM2 and CAM3 are wired to the
+ * MIPI DC-PHYs, which have no camera (RX) support in mainline yet.
+ *
+ * The official Xunlong OV13850 / OV13855 modules have no mainline sensor
+ * driver, hence the IMX219 for testing. The IMX219 module has its own
+ * regulators, which are modelled here as fixed regulators switched by the
+ * CAM1 power-down/enable GPIO.
+ *
+ * The RK3588 ISP0 is enabled as well so that the rkisp2 memory-to-memory
+ * path (libcamera rkisp2 pipeline) can be used on frames captured by VICAP.
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/clock/rockchip,rk3588-cru.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/media/video-interfaces.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+
+&{/} {
+	vcc_cam1: regulator-vcc-cam1 {
+		compatible = "regulator-fixed";
+		enable-active-high;
+		gpio = <&gpio3 RK_PC6 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam1_pwr_en>;
+		regulator-name = "vcc_cam1";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		startup-delay-us = <2000>;
+		vin-supply = <&vcc_3v3_s3>;
+	};
+
+	vana_cam1: regulator-vana-cam1 {
+		compatible = "regulator-fixed";
+		regulator-name = "vana_cam1";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		vin-supply = <&vcc_cam1>;
+	};
+
+	vdig_cam1: regulator-vdig-cam1 {
+		compatible = "regulator-fixed";
+		regulator-name = "vdig_cam1";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		vin-supply = <&vcc_cam1>;
+	};
+
+	vddl_cam1: regulator-vddl-cam1 {
+		compatible = "regulator-fixed";
+		regulator-name = "vddl_cam1";
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+		vin-supply = <&vcc_cam1>;
+	};
+};
+
+&i2c7 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c7m0_xfer>;
+	status = "okay";
+
+	imx219: camera-sensor@10 {
+		compatible = "sony,imx219";
+		reg = <0x10>;
+		assigned-clocks = <&cru CLK_MIPI_CAMARAOUT_M3>;
+		assigned-clock-rates = <24000000>;
+		clocks = <&cru CLK_MIPI_CAMARAOUT_M3>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&mipim0_camera3_clk &cam1_rstn>;
+		reset-gpios = <&gpio3 RK_PC4 GPIO_ACTIVE_HIGH>;
+		VANA-supply = <&vana_cam1>;
+		VDIG-supply = <&vdig_cam1>;
+		VDDL-supply = <&vddl_cam1>;
+
+		port {
+			imx219_output: endpoint {
+				data-lanes = <1 2>;
+				link-frequencies = /bits/ 64 <456000000>;
+				remote-endpoint = <&csi2_input>;
+			};
+		};
+	};
+};
+
+&pinctrl {
+	cam1 {
+		cam1_pwr_en: cam1-pwr-en-pinctrl {
+			rockchip,pins = <3 RK_PC6 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		cam1_rstn: cam1-rstn-pinctrl {
+			rockchip,pins = <3 RK_PC4 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+};
+
+&csi_dphy0 {
+	status = "okay";
+};
+
+&csi2 {
+	status = "okay";
+};
+
+&csi2_in {
+	csi2_input: endpoint {
+		bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
+		data-lanes = <1 2>;
+		link-frequencies = /bits/ 64 <456000000>;
+		remote-endpoint = <&imx219_output>;
+	};
+};
+
+&vicap {
+	status = "okay";
+};
+
+&vicap_mmu {
+	status = "okay";
+};
+
+&isp0 {
+	status = "okay";
+};
+
+&isp0_mmu {
+	status = "okay";
+};
