@@ -688,19 +688,33 @@ static int rkvenc_hevc_run(struct rkvenc_ctx *ctx, struct rkvenc_core *core,
 
 /*
  * The next tile column continues the bitstream right after the previous
- * one, as a slice of its own (the hardware writes its slice header).
+ * one, as a slice of its own (the hardware writes its slice header). Once
+ * the picture is complete, the rate control may have it encoded again with
+ * a higher QP, from the first tile column, over the slice data of the first
+ * encode.
  */
 static int rkvenc_hevc_next_pass(struct rkvenc_ctx *ctx,
 				 struct rkvenc_core *core,
 				 struct rkvenc_run *run)
 {
 	struct rkvenc_hevc_ctx *hevc = ctx->priv;
-	const struct v4l2_ctrl_hevc_pps *pps = &hevc->enc.state_active.pps;
+	struct v4l2_hevc_enc *enc = &hevc->enc;
+	const struct v4l2_ctrl_hevc_pps *pps = &enc->state_active.pps;
 	u64 offset = run->hdr_bytes + run->fb.bs_len;
 
 	if (!(pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED) ||
-	    hevc->tile >= pps->num_tile_columns_minus1)
-		return 0;
+	    hevc->tile >= pps->num_tile_columns_minus1) {
+		if (!run->fb.bs_len || offset > rkvenc_dst_size(run) ||
+		    !v4l2_hevc_enc_reencode(enc, offset))
+			return 0;
+
+		rkvenc_set(core, VEPU580_ADR_BSBS,
+			   rkvenc_dst_addr(run) + run->hdr_bytes);
+		rkvenc_hevc_setup_qp(hevc, core);
+		rkvenc_hevc_setup_tile(hevc, core, 0);
+
+		return RKVENC_PASS_AGAIN;
+	}
 
 	if (!run->fb.bs_len || offset + SZ_4K > rkvenc_dst_size(run))
 		return -ENOSPC;
@@ -708,7 +722,7 @@ static int rkvenc_hevc_next_pass(struct rkvenc_ctx *ctx,
 	rkvenc_set(core, VEPU580_ADR_BSBS, rkvenc_dst_addr(run) + offset);
 	rkvenc_hevc_setup_tile(hevc, core, hevc->tile + 1);
 
-	return 1;
+	return RKVENC_PASS_NEXT;
 }
 
 static void rkvenc_hevc_done(struct rkvenc_ctx *ctx, struct rkvenc_run *run,

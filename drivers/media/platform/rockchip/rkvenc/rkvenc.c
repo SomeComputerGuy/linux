@@ -965,7 +965,11 @@ static irqreturn_t rkvenc_irq_thread(int irq, void *priv)
 		if (ops->next_pass)
 			ret = ops->next_pass(core->curr_ctx, core, &core->run);
 		if (ret > 0) {
-			core->run.pass++;
+			/* A picture encoded again starts a new status sum. */
+			if (ret == RKVENC_PASS_AGAIN)
+				core->run.pass = 0;
+			else
+				core->run.pass++;
 			rkvenc_hw_start(core);
 			pm_runtime_put_noidle(core->dev);
 			return IRQ_HANDLED;
