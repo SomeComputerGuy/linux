@@ -1273,7 +1273,8 @@ static int rc_step(struct v4l2_h264_enc *enc)
 	if (rc->mode) {
 		pr_debug("  rc mode: %s", rc->mode->name);
 
-		if (rc->mode->type == V4L2_H264_ENC_RC_TYPE_CBR) {
+		if (rc->mode->type == V4L2_H264_ENC_RC_TYPE_CBR ||
+		    rc->mode->type == V4L2_H264_ENC_RC_TYPE_VBR) {
 			pr_debug("  rc bitrate: %u bits/s", state->bitrate);
 			pr_debug("  rc target: %lu bytes", rc->size);
 		}

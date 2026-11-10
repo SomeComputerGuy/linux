@@ -218,10 +218,34 @@ static const struct v4l2_h264_enc_rc_mode cbr_mode = {
 	.complete	= cbr_complete,
 };
 
+/*
+ * Variable bitrate mode: the same rate control with the peak bitrate, which
+ * meets the bitrate on average and keeps every second within the peak.
+ */
+static int vbr_measure(struct v4l2_h264_enc_rc *rc, unsigned long *size)
+{
+	struct v4l2_h264_enc_state *state = rc->state;
+
+	v4l2_enc_cbr_set_peak(&rc->cbr, max(state->bitrate_peak,
+					    state->bitrate));
+
+	return cbr_measure(rc, size);
+}
+
+static const struct v4l2_h264_enc_rc_mode vbr_mode = {
+	.name		= "variable bitrate",
+	.type		= V4L2_H264_ENC_RC_TYPE_VBR,
+	.init		= cbr_init,
+	.measure	= vbr_measure,
+	.estimate	= cbr_estimate,
+	.complete	= cbr_complete,
+};
+
 static const struct v4l2_h264_enc_rc_mode *modes[] = {
 	&direct_mode,
 	&cq_mode,
 	&cbr_mode,
+	&vbr_mode,
 };
 
 static int mode_prepare(struct v4l2_h264_enc_rc *rc)
