@@ -4,6 +4,7 @@
 #include <linux/platform_device.h>
 #include <linux/phy/rockchip-usbdp.h>
 #include <linux/pm_runtime.h>
+#include <linux/property.h>
 #include "glue.h"
 #include "io.h"
 
@@ -152,6 +153,15 @@ static int dwc3_rockchip_probe(struct platform_device *pdev)
 	probe_data.dwc = &dwc_rk->dwc;
 	probe_data.res = res;
 	probe_data.properties = DWC3_DEFAULT_PROPERTIES;
+
+	/*
+	 * On RK3588 nothing powers the controllers down in suspend-to-idle:
+	 * this glue does not touch them, and they are either in PD_USB, which
+	 * stays on for a device on the awake path, or in no power domain.
+	 * (On RK3576 the second controller is in PD_PHP, which does not.)
+	 */
+	if (device_is_compatible(&pdev->dev, "rockchip,rk3588-dwc3"))
+		probe_data.properties.keep_host_bus_in_s2idle = true;
 
 	return dwc3_core_probe(&probe_data);
 }
