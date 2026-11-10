@@ -567,6 +567,43 @@ static void rkvenc_hevc_setup_tile(struct rkvenc_hevc_ctx *hevc,
 		   buf + (tile ? tile - 1 : 1) * hevc->tile_buf_size);
 }
 
+/*
+ * QP of the picture. In CBR mode the size target of the frame rate control
+ * is handed to the hardware CTU row rate control, which adapts the QP of
+ * each CTU row by up to the row_rc_qp_range parameter, within the QP limits
+ * of the picture type.
+ */
+static void rkvenc_hevc_setup_qp(struct rkvenc_hevc_ctx *hevc,
+				 struct rkvenc_core *core)
+{
+	struct v4l2_hevc_enc *enc = &hevc->enc;
+	const struct v4l2_hevc_enc_state *state = &enc->state_active;
+	bool intra = state->encode.slice_type == V4L2_HEVC_SLICE_TYPE_I;
+	unsigned int qp_range;
+	int qp_min, qp_max;
+
+	rkvenc_update(core, VEPU580_ENC_PIC, VEPU580_ENC_PIC_PIC_QP, 0);
+	rkvenc_update(core, VEPU580_HEVC_SYNT_SLI1, VEPU580_HEVC_SLI1_SLI_QP,
+		      FIELD_PREP(VEPU580_HEVC_SLI1_SLI_QP, enc->qp));
+
+	qp_range = min(READ_ONCE(rkvenc_row_rc_qp_range), 15U);
+	hevc->hw_rc = state->frame_rc_enable &&
+		      state->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_CBR &&
+		      qp_range;
+	if (!hevc->hw_rc) {
+		vepu580_setup_fixed_qp(core, enc->qp);
+		return;
+	}
+
+	qp_min = intra ? state->qp_min_i : state->qp_min;
+	qp_max = intra ? state->qp_max_i : state->qp_max;
+	vepu580_setup_row_rc(core, &rkvenc_hevc_row_rc, enc->qp,
+			     clamp(qp_min, 0, 51), clamp(qp_max, 0, 51),
+			     qp_range, enc->cbr.target_bits,
+			     state->width_ctbs * state->height_ctbs,
+			     state->width_ctbs);
+}
+
 static int rkvenc_hevc_run(struct rkvenc_ctx *ctx, struct rkvenc_core *core,
 			   struct rkvenc_run *run)
 {
@@ -574,7 +611,6 @@ static int rkvenc_hevc_run(struct rkvenc_ctx *ctx, struct rkvenc_core *core,
 	struct v4l2_hevc_enc *enc = &hevc->enc;
 	const struct v4l2_hevc_enc_state *state = &enc->state_active;
 	struct rkvenc_rec_buf *rec, *refr = NULL, *col = NULL;
-	unsigned int ctus, qp_range;
 	bool intra, tmvp, colmv_stor;
 	int ret;
 
@@ -591,7 +627,6 @@ static int rkvenc_hevc_run(struct rkvenc_ctx *ctx, struct rkvenc_core *core,
 		return -ENOSPC;
 
 	intra = state->encode.slice_type == V4L2_HEVC_SLICE_TYPE_I;
-	ctus = state->width_ctbs * state->height_ctbs;
 
 	rec = enc->ref.buffer_current.private_data;
 	if (!rec)
@@ -645,24 +680,7 @@ static int rkvenc_hevc_run(struct rkvenc_ctx *ctx, struct rkvenc_core *core,
 			      colmv_stor, col && col->colmv_valid);
 	vepu580_setup_hevc_tuning(core, intra);
 
-	/*
-	 * In CBR mode the size target of the frame rate control is handed to
-	 * the hardware CTU row rate control, which adapts the QP of each CTU
-	 * row by up to the row_rc_qp_range parameter.
-	 */
-	qp_range = min(READ_ONCE(rkvenc_row_rc_qp_range), 15U);
-	hevc->hw_rc = state->frame_rc_enable &&
-		      state->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_CBR &&
-		      qp_range;
-	if (hevc->hw_rc)
-		vepu580_setup_row_rc(core, &rkvenc_hevc_row_rc, enc->qp,
-				     clamp(state->qp_min, 0, 51),
-				     clamp(state->qp_max, 0, 51), qp_range,
-				     enc->cbr.target_bits, ctus,
-				     state->width_ctbs);
-	else
-		vepu580_setup_fixed_qp(core, enc->qp);
-
+	rkvenc_hevc_setup_qp(hevc, core);
 	rkvenc_hevc_setup_tile(hevc, core, 0);
 
 	return 0;
@@ -807,6 +825,9 @@ static const struct v4l2_ctrl_config rkvenc_hevc_ctrl_cfgs[] = {
 	},
 	{ .id = V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP, .max = 51, .step = 1, .def = 10, },
 	{ .id = V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP, .max = 51, .step = 1, .def = 51, },
+	/* I pictures of the frame rate control: 15..51 as in MPP */
+	{ .id = V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_MIN_QP, .max = 51, .step = 1, .def = 15, },
+	{ .id = V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_MAX_QP, .max = 51, .step = 1, .def = 51, },
 	{ .id = V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP, .max = 51, .step = 1, .def = 30, },
 	{ .id = V4L2_CID_MPEG_VIDEO_HEVC_P_FRAME_QP, .max = 51, .step = 1, .def = 32, },
 	{ .id = V4L2_CID_MPEG_VIDEO_AVERAGE_QP, .max = 51, .step = 1, },
