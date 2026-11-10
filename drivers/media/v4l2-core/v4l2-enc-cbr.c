@@ -30,6 +30,13 @@
  * The QP to size relation (6 QP steps per halving) is the same for H.264
  * and HEVC, so the model does not depend on the codec. Only the QP delta of
  * the I pictures is a parameter.
+ *
+ * With a peak bitrate (v4l2_enc_cbr_set_peak()), the same model gives a
+ * variable bitrate: the bitrate is the average over the stream and the
+ * peak bitrate a bound over any second of it. The deviation from the plan
+ * is spread over two seconds instead of a few pictures, so that the size of
+ * the pictures can follow the content, and a picture that would take the
+ * last second over the peak gets a lower size target and a higher QP.
  */
 
 #include <linux/export.h>
@@ -44,6 +51,8 @@
 
 /* The accumulated size error is spread over this many pictures. */
 #define CBR_WINDOW		8
+/* With a peak bitrate, over this many seconds of pictures */
+#define VBR_WINDOW_SECONDS	2
 /* Limit of the accumulated size error, in seconds of the bitrate */
 #define CBR_BUFFER_SECONDS	3
 /* I/P size ratio, 1/16 units: initial value (10x) and limits (1.5x .. 30x) */
@@ -181,6 +190,76 @@ static int cbr_qp_initial(u64 bits, unsigned int samples)
 	return clamp(DIV_ROUND_CLOSEST(qp_q8, 256), 15, 45);
 }
 
+/* Sum of the sizes of the last @count pictures */
+static u64 vbr_window_sum(const struct v4l2_enc_cbr *cbr, unsigned int count)
+{
+	unsigned int i, index = cbr->peak_index;
+	u64 sum = 0;
+
+	count = min(count, cbr->peak_count);
+	for (i = 0; i < count; i++) {
+		index = (index + V4L2_ENC_CBR_PEAK_PICS - 1) %
+			V4L2_ENC_CBR_PEAK_PICS;
+		sum += cbr->peak_bits[index];
+	}
+
+	return sum;
+}
+
+/*
+ * QP steps (1/256 units) that bring a picture of @bits at @qp, coded at
+ * @qp_pic instead, down to @room: 6 QP steps per halving.
+ */
+static int vbr_qp_add(u64 bits, int qp, int qp_pic, u64 room)
+{
+	if (!bits)
+		return 0;
+
+	return 6 * (cbr_log2_q8(bits) - cbr_log2_q8(room)) -
+	       (qp_pic - qp) * 256;
+}
+
+/*
+ * Keep the last second (at most V4L2_ENC_CBR_PEAK_PICS pictures) within the
+ * peak bitrate: limit the size target of the picture to what is left of the
+ * peak, and raise its QP by the QP steps between its expected size and
+ * that. A P picture is expected at the size of the last one, an I picture
+ * at the larger of the last I picture and the last P picture times the I/P
+ * size ratio (which follows a change of the content sooner), each at the
+ * QP difference.
+ */
+static void vbr_bound(struct v4l2_enc_cbr *cbr,
+		      const struct v4l2_fract *timeperframe, unsigned int fps,
+		      int qp_max)
+{
+	unsigned int pics = clamp(fps, 1U, V4L2_ENC_CBR_PEAK_PICS);
+	u64 peak = cbr_nominal(max(cbr->bitrate_peak, cbr->bitrate),
+			       timeperframe) * pics;
+	u64 used = vbr_window_sum(cbr, pics - 1);
+	u64 room = max_t(u64, peak > used ? peak - used : 0, 8);
+	int add;
+
+	cbr->target_bits = min(cbr->target_bits, room);
+
+	if (cbr->intra)
+		add = max(vbr_qp_add(cbr->i_bits, cbr->i_qp, cbr->qp_pic, room),
+			  vbr_qp_add(div_u64(cbr->p_last_bits * cbr->ratio, 16),
+				     cbr->p_qp - cbr->qp_delta_intra,
+				     cbr->qp_pic, room));
+	else
+		add = vbr_qp_add(cbr->p_last_bits, cbr->p_qp, cbr->qp_pic,
+				 room);
+
+	add = min(DIV_ROUND_UP(add, 256), qp_max - cbr->qp_pic);
+	if (add <= 0)
+		return;
+
+	cbr->qp_pic += add;
+	cbr->qp_peak_add = add;
+
+	pr_debug("  peak: %llu bits left of %llu, QP +%d", room, peak, add);
+}
+
 /**
  * v4l2_enc_cbr_reset() - reset the rate control state
  * @cbr: the rate control state
@@ -194,6 +273,22 @@ void v4l2_enc_cbr_reset(struct v4l2_enc_cbr *cbr, int qp_delta_intra)
 	cbr->qp_delta_intra = qp_delta_intra;
 }
 EXPORT_SYMBOL_GPL(v4l2_enc_cbr_reset);
+
+/**
+ * v4l2_enc_cbr_set_peak() - set the peak bitrate
+ * @cbr: the rate control state
+ * @bitrate_peak: peak bitrate in bits per second, 0 for a constant bitrate
+ *
+ * A non-zero peak bitrate makes the rate control a variable bitrate one:
+ * the bitrate of v4l2_enc_cbr_begin() is met on average, and no second of
+ * the stream goes over the peak bitrate (a peak below the bitrate counts as
+ * the bitrate). Takes effect from the next v4l2_enc_cbr_begin().
+ */
+void v4l2_enc_cbr_set_peak(struct v4l2_enc_cbr *cbr, u32 bitrate_peak)
+{
+	cbr->bitrate_peak = bitrate_peak;
+}
+EXPORT_SYMBOL_GPL(v4l2_enc_cbr_set_peak);
 
 /**
  * v4l2_enc_cbr_begin() - set up the size target of the next picture
@@ -284,12 +379,17 @@ int v4l2_enc_cbr_begin(struct v4l2_enc_cbr *cbr, u32 bitrate,
 
 	target = (s64)cbr->plan_bits -
 		 div_s64(cbr->buffer_bits - max_t(s64, expected, 0),
-			 CBR_WINDOW);
+			 cbr->bitrate_peak ? VBR_WINDOW_SECONDS * fps :
+					     CBR_WINDOW);
 	cbr->target_bits = clamp_t(s64, target,
 				   max_t(u64, cbr->plan_bits / 4, 8),
 				   cbr->plan_bits * 2);
 	cbr->intra = intra;
 	cbr->qp_reenc = 0;
+	cbr->qp_peak_add = 0;
+
+	if (cbr->bitrate_peak)
+		vbr_bound(cbr, timeperframe, fps, qp_max);
 
 	pr_debug("+ v4l2-enc-cbr: begin");
 	pr_debug("  nominal: %llu bits, plan: %llu bits, target: %llu bits",
@@ -408,12 +508,17 @@ void v4l2_enc_cbr_end(struct v4l2_enc_cbr *cbr, u64 bits,
 			   div64_u64(cbr->window_bits,
 				     CBR_BUFFER_SECONDS * fps);
 
+	cbr->peak_bits[cbr->peak_index] = min_t(u64, bits, U32_MAX);
+	cbr->peak_index = (cbr->peak_index + 1) % V4L2_ENC_CBR_PEAK_PICS;
+	cbr->peak_count = min(cbr->peak_count + 1, V4L2_ENC_CBR_PEAK_PICS);
+
 	/*
-	 * QP error of the picture, 1/256 units. A re-encoded picture was coded
-	 * above the QP of the state: its error at the state counts that too.
+	 * QP error of the picture, 1/256 units. A picture coded above the QP
+	 * of the state (re-encoded, or raised for the peak bitrate) counts
+	 * that too: the state would have given a picture that much larger.
 	 */
 	err = 6 * (cbr_log2_q8(bits) - cbr_log2_q8(cbr->target_bits)) +
-	      cbr->qp_reenc * 256;
+	      (cbr->qp_reenc + cbr->qp_peak_add) * 256;
 
 	step = err / 8;
 	if (err > CBR_ERR_SLOW)
@@ -425,6 +530,8 @@ void v4l2_enc_cbr_end(struct v4l2_enc_cbr *cbr, u64 bits,
 	if (!cbr->intra) {
 		cbr->qp_q8 += step;
 		cbr->p_bits = cbr->p_bits ? (7 * cbr->p_bits + bits) / 8 : bits;
+		cbr->p_last_bits = bits;
+		cbr->p_qp = clamp(cbr->qp_pic, qp_min, qp_max);
 		cbr->since_i++;
 
 		/* I/P size ratio, once a few P pictures were coded */
@@ -439,6 +546,7 @@ void v4l2_enc_cbr_end(struct v4l2_enc_cbr *cbr, u64 bits,
 		 * estimate: only all-intra streams steer the QP fully with it.
 		 */
 		cbr->i_bits = bits;
+		cbr->i_qp = clamp(cbr->qp_pic, qp_min, qp_max);
 
 		/*
 		 * Above its share of the GOP at the largest I/P ratio, an I

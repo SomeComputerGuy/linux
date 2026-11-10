@@ -12,6 +12,9 @@
 #include <linux/types.h>
 #include <linux/videodev2.h>
 
+/* Pictures of the peak bitrate window: one second, up to 128 pictures. */
+#define V4L2_ENC_CBR_PEAK_PICS	128U
+
 /**
  * struct v4l2_enc_cbr - constant bitrate rate control state
  * @qp_delta_intra: QP of the I pictures below the QP of the P pictures
@@ -37,8 +40,17 @@
  *		 decays by 1/(3 * fps) per picture)
  * @plan_bits: planned size of the current picture
  * @target_bits: size target of the current picture
+ * @bitrate_peak: peak bitrate in bits per second, 0 for a constant bitrate
+ * @qp_peak_add: QP increase of the current picture for the peak bitrate
+ * @i_qp: QP of the last I picture
+ * @p_last_bits: size of the last P picture
+ * @p_qp: QP of the last P picture
+ * @peak_bits: sizes of the last pictures, for the peak bitrate
+ * @peak_index: next entry of @peak_bits
+ * @peak_count: valid entries of @peak_bits
  *
- * Only @qp_delta_intra is set by the user, after v4l2_enc_cbr_reset().
+ * Only @qp_delta_intra is set by the user, after v4l2_enc_cbr_reset(), and
+ * @bitrate_peak by v4l2_enc_cbr_set_peak().
  * @target_bits is valid from v4l2_enc_cbr_begin() of a picture until its
  * v4l2_enc_cbr_end().
  */
@@ -63,9 +75,19 @@ struct v4l2_enc_cbr {
 	u64 window_bits;
 	u64 plan_bits;
 	u64 target_bits;
+
+	u32 bitrate_peak;
+	int qp_peak_add;
+	int i_qp;
+	u64 p_last_bits;
+	int p_qp;
+	u32 peak_bits[V4L2_ENC_CBR_PEAK_PICS];
+	unsigned int peak_index;
+	unsigned int peak_count;
 };
 
 void v4l2_enc_cbr_reset(struct v4l2_enc_cbr *cbr, int qp_delta_intra);
+void v4l2_enc_cbr_set_peak(struct v4l2_enc_cbr *cbr, u32 bitrate_peak);
 int v4l2_enc_cbr_begin(struct v4l2_enc_cbr *cbr, u32 bitrate,
 		       const struct v4l2_fract *timeperframe,
 		       unsigned int samples, bool intra, int qp_min,
