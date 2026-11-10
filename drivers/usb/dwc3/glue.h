@@ -14,10 +14,17 @@
  * @gsbuscfg0_reqinfo: Value to be programmed in the GSBUSCFG0.REQINFO field
  * @needs_full_reinit: indicate the controller may not remain power during system
  *			pm and need full initialization
+ * @keep_host_bus_in_s2idle: indicate the controller, its PHYs and its power
+ *			domain stay powered across suspend-to-idle when the core
+ *			keeps them on, so a suspended host bus can be kept
+ *			instead of being torn down. Set it only if the USB power
+ *			domain, if there is one, stays on in suspend-to-idle for
+ *			a device on the awake path (GENPD_FLAG_ACTIVE_WAKEUP)
  */
 struct dwc3_properties {
 	u32 gsbuscfg0_reqinfo;
 	unsigned needs_full_reinit:1;
+	unsigned keep_host_bus_in_s2idle:1;
 };
 
 #define DWC3_DEFAULT_PROPERTIES ((struct dwc3_properties){		\
