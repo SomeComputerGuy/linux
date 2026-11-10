@@ -239,8 +239,22 @@ int v4l2_enc_cbr_begin(struct v4l2_enc_cbr *cbr, u32 bitrate,
 
 	if (intra) {
 		/* An I picture closes the GOP: its length is the IDR period. */
-		if (cbr->seen_i)
+		if (cbr->seen_i) {
+			/*
+			 * The second picture of an all-intra stream: the size
+			 * of the first one at its QP tells the QP of the
+			 * nominal size better than the start estimate, which
+			 * assumed a GOP with P pictures.
+			 */
+			if (!cbr->gop && !cbr->since_i)
+				cbr->qp_q8 = clamp_t(int, (cbr->qp_pic +
+						 cbr->qp_delta_intra) * 256 +
+						 6 * (cbr_log2_q8(cbr->i_bits) -
+						      cbr_log2_q8(nominal)),
+						 (qp_min + cbr->qp_delta_intra) * 256,
+						 (qp_max + cbr->qp_delta_intra) * 256);
 			cbr->gop = cbr->since_i + 1;
+		}
 		cbr->since_i = 0;
 		cbr->seen_i = true;
 	}
@@ -381,7 +395,7 @@ void v4l2_enc_cbr_end(struct v4l2_enc_cbr *cbr, u64 bits,
 	unsigned int fps = cbr_fps(timeperframe);
 	s64 limit = cbr->nominal * CBR_BUFFER_SECONDS * fps;
 	unsigned int ratio;
-	int err, step;
+	int err, step, shift;
 	s64 cap, add;
 
 	if (!cbr->bitrate || !cbr->target_bits)
@@ -452,7 +466,14 @@ void v4l2_enc_cbr_end(struct v4l2_enc_cbr *cbr, u64 bits,
 		cbr->qp_q8 += cbr->gop == 1 ? step : step / 4;
 	}
 
-	cbr->qp_q8 = clamp_t(int, cbr->qp_q8, qp_min * 256, qp_max * 256);
+	/*
+	 * The state is the QP of the P pictures. All-intra streams code their
+	 * pictures at the state less the I QP delta, so they need the QP range
+	 * shifted up by it to reach the highest QP.
+	 */
+	shift = cbr->gop == 1 ? cbr->qp_delta_intra : 0;
+	cbr->qp_q8 = clamp_t(int, cbr->qp_q8, (qp_min + shift) * 256,
+			     (qp_max + shift) * 256);
 
 	pr_debug("+ v4l2-enc-cbr: end");
 	pr_debug("  size: %llu bits, target: %llu bits, qp error: %d/256, qp: %d/256",
