@@ -4986,6 +4986,12 @@ AV1 Tx mode as described in section 6.8.21 "TX mode semantics" of :ref:`av1`.
     * - ``V4L2_MPEG4_VOL_FLAG_REVERSIBLE_VLC``
       - 0x00000020
       - ``reversible_vlc`` syntax element.
+    * - ``V4L2_MPEG4_VOL_FLAG_LOW_DELAY``
+      - 0x00000040
+      - ``low_delay`` syntax element, or the value inferred for it when
+	``vol_control_parameters`` is 0: the VOL contains no B-VOPs. Drivers
+	which cannot decode some B-VOPs can refuse a VOL without this flag, so
+	that userspace finds out before decoding starts.
 
 ``V4L2_CID_STATELESS_MPEG4_VOP (struct)``
     Specifies the video object plane parameters (as extracted from the
