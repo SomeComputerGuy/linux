@@ -1370,6 +1370,45 @@ static int ref_complete(struct v4l2_hevc_enc *enc, u64 timestamp)
 }
 
 /**
+ * v4l2_hevc_enc_reencode() - decide on encoding the picture a second time
+ * @enc: the core context
+ * @bytesused: size of the encoded picture in bytes, with the headers the core
+ *	       wrote
+ *
+ * In the constant bitrate mode of the core, a picture far above its size
+ * target can be encoded again with a higher QP (see v4l2_enc_cbr_reencode()).
+ * Drivers that can run the hardware again for the same picture call it after
+ * the hardware finished it and before v4l2_hevc_enc_complete(). If it returns
+ * true, @enc->qp holds the new QP and the driver encodes the picture again,
+ * with the same size target and the same headers, writing the slice data
+ * from the same offset. Only for hardware that writes the slice header
+ * (V4L2_HEVC_ENC_FLAG_HW_SLICE_HEADER): the slice header of the core holds the
+ * QP of the first pass.
+ *
+ * Return: true if the picture is to be encoded again.
+ */
+bool v4l2_hevc_enc_reencode(struct v4l2_hevc_enc *enc, unsigned int bytesused)
+{
+	struct v4l2_hevc_enc_state *state = &enc->state_active;
+	bool intra = state->encode.slice_type == V4L2_HEVC_SLICE_TYPE_I;
+	int qp_max = intra ? state->qp_max_i : state->qp_max;
+
+	if (!(enc->flags & V4L2_HEVC_ENC_FLAG_HW_SLICE_HEADER) ||
+	    !rc_core_cbr(enc, state))
+		return false;
+
+	if (!v4l2_enc_cbr_reencode(&enc->cbr, (u64)bytesused * 8,
+				   &state->timeperframe, enc->qp,
+				   min(qp_max, 51)))
+		return false;
+
+	enc->qp = rc_clamp_qp(state, v4l2_enc_cbr_qp(&enc->cbr));
+
+	return true;
+}
+EXPORT_SYMBOL_GPL(v4l2_hevc_enc_reencode);
+
+/**
  * v4l2_hevc_enc_complete() - complete the encode run of a picture
  * @enc: the core context
  * @buffer: the CAPTURE buffer, with its payload set
