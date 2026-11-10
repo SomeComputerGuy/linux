@@ -645,6 +645,12 @@ static void prepare_rc(struct v4l2_hevc_enc *enc,
 	state->qp_min = enc_ctrl_val(enc, V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP,
 				     -qp_bd_offset);
 	state->qp_max = enc_ctrl_val(enc, V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP, 51);
+	state->qp_min_i = enc_ctrl_val(enc,
+				       V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_MIN_QP,
+				       state->qp_min);
+	state->qp_max_i = enc_ctrl_val(enc,
+				       V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_MAX_QP,
+				       state->qp_max);
 	state->qp_i = enc_ctrl_val(enc, V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP, 30);
 	state->qp_p = enc_ctrl_val(enc, V4L2_CID_MPEG_VIDEO_HEVC_P_FRAME_QP,
 				   state->qp_i);
@@ -1072,10 +1078,23 @@ static bool rc_core_cbr(const struct v4l2_hevc_enc *enc,
 	       !(enc->rc_ops && enc->rc_ops->estimate);
 }
 
+/* QP limits of the picture: the I picture ones with a frame rate control */
+static int rc_clamp_qp(const struct v4l2_hevc_enc_state *state, int qp)
+{
+	int qp_bd_offset = 6 * state->sps.bit_depth_luma_minus8;
+
+	if (state->frame_rc_enable &&
+	    state->encode.slice_type == V4L2_HEVC_SLICE_TYPE_I)
+		qp = clamp(qp, state->qp_min_i, state->qp_max_i);
+	else
+		qp = clamp(qp, state->qp_min, state->qp_max);
+
+	return clamp(qp, -qp_bd_offset, 51);
+}
+
 static int rc_step(struct v4l2_hevc_enc *enc)
 {
 	struct v4l2_hevc_enc_state *state = &enc->state_active;
-	int qp_bd_offset = 6 * state->sps.bit_depth_luma_minus8;
 	u8 slice_type = state->encode.slice_type;
 	unsigned int range;
 	int qp, ret;
@@ -1114,8 +1133,7 @@ static int rc_step(struct v4l2_hevc_enc *enc)
 			return ret;
 	}
 
-	qp = clamp(qp, state->qp_min, state->qp_max);
-	enc->qp = clamp(qp, -qp_bd_offset, 51);
+	enc->qp = rc_clamp_qp(state, qp);
 
 	return 0;
 }

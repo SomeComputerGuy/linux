@@ -128,6 +128,11 @@ struct v4l2_hevc_enc_ref {
  * @frame_rc_enable: V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE
  * @qp_min: V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP
  * @qp_max: V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP
+ * @qp_min_i: V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_MIN_QP, @qp_min if the driver
+ *	      has no such control. Limits the I pictures with a frame rate
+ *	      control instead of @qp_min.
+ * @qp_max_i: V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_MAX_QP, @qp_max if the driver
+ *	      has no such control
  * @qp_i: V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP
  * @qp_p: V4L2_CID_MPEG_VIDEO_HEVC_P_FRAME_QP
  * @qp_b: V4L2_CID_MPEG_VIDEO_HEVC_B_FRAME_QP
@@ -153,6 +158,8 @@ struct v4l2_hevc_enc_state {
 	bool frame_rc_enable;
 	int qp_min;
 	int qp_max;
+	int qp_min_i;
+	int qp_max_i;
 	int qp_i;
 	int qp_p;
 	int qp_b;
