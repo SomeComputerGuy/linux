@@ -400,6 +400,9 @@ static int hantro_try_fmt(const struct hantro_ctx *ctx,
 	vpu_debug(4, "trying format %p4cc\n", &pix_mp->pixelformat);
 
 	fmt = hantro_find_format(ctx, pix_mp->pixelformat);
+	/* The format list mixes coded and raw formats, only take the right kind */
+	if (fmt && coded != (fmt->codec_mode != HANTRO_MODE_NONE))
+		fmt = NULL;
 	/* A 4:0:0 stream is decoded to a 4:0:0 format only, and vice versa */
 	if (fmt && !coded && !ctx->is_encoder &&
 	    fmt->monochrome != ctx->monochrome)
