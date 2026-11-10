@@ -47,8 +47,10 @@
 /*
  * The I QP increase after oversized I pictures: at most 4 QP (1/256 units)
  * per I picture for an I picture twice its largest share, and in all at most
- * a quarter QP per QP step below 45, up to 6 QP (more where the QP is low,
- * where a QP step changes the size by fewer bits).
+ * a quarter QP per step of the QP state below 45, up to 6 QP (more where the
+ * QP is low, where a QP step changes the size by fewer bits). It raises the
+ * current state in the mean of cbr_qp_intra(), so half of it reaches the I
+ * pictures.
  */
 #define CBR_INTRA_ADD_STEP	(4 * 256)
 #define CBR_INTRA_ADD_QP_END	45
@@ -126,25 +128,25 @@ static u64 cbr_plan(const struct v4l2_enc_cbr *cbr, unsigned int fps,
 }
 
 /*
- * QP of an I picture: the mean of the QP state now and at the previous I
- * picture (the current state weighs 70% when it rose from 33 or below to 35
- * or above: content that got much harder), plus the increase after
- * oversized I pictures, less the I QP delta. All-intra streams use the
- * state alone, which then follows the I pictures fully.
+ * QP of an I picture: the mean of the QP state now, raised by the increase
+ * after oversized I pictures, and the state at the previous I picture (the
+ * current state weighs 70% when it rose from 33 or below to 35 or above:
+ * content that got much harder), less the I QP delta. All-intra streams use
+ * the state alone, which then follows the I pictures fully.
  */
 static int cbr_qp_intra(const struct v4l2_enc_cbr *cbr)
 {
 	int cur = cbr->qp_q8, ref = cbr->qp_intra_ref_q8, q8;
 
-	if (cbr->gop == 1 || ref < 0)
+	if (cbr->gop == 1 || ref < 0) {
 		q8 = cur;
-	else if (cur >= 35 * 256 && ref <= 33 * 256)
-		q8 = (3 * ref + 7 * cur) / 10;
-	else
-		q8 = (ref + cur) / 2;
-
-	if (cbr->gop != 1)
-		q8 += cbr->qp_intra_add_q8;
+	} else {
+		cur += cbr->qp_intra_add_q8;
+		if (cur >= 35 * 256 && ref <= 33 * 256)
+			q8 = (3 * ref + 7 * cur) / 10;
+		else
+			q8 = (ref + cur) / 2;
+	}
 
 	return DIV_ROUND_CLOSEST(q8, 256) - cbr->qp_delta_intra;
 }
@@ -350,8 +352,8 @@ void v4l2_enc_cbr_end(struct v4l2_enc_cbr *cbr, u64 bits,
 			      cbr->qp_intra_add_q8;
 			cbr->qp_intra_add_q8 =
 				clamp_t(s64, add, 0,
-					clamp((CBR_INTRA_ADD_QP_END -
-					       cbr->qp_pic) * 64, 0,
+					clamp(CBR_INTRA_ADD_QP_END * 64 -
+					      cbr->qp_q8 / 4, 0,
 					      CBR_INTRA_ADD_MAX));
 		}
 
