@@ -196,9 +196,11 @@ void hantro_iommu_restore(struct hantro_dev *vpu)
 
 	if (vpu->attached_domain) {
 		ret = iommu_attach_device(vpu->attached_domain, vpu->dev);
-		if (ret)
-			dev_err(vpu->dev, "Failed to attach back to the IOMMU domain of the main core: %d\n",
+		if (ret) {
+			dev_err(vpu->dev, "Failed to attach back to the IOMMU domain of the main core (%d), refusing further jobs\n",
 				ret);
+			vpu->iommu_lost = true;
+		}
 	}
 }
 
