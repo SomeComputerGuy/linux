@@ -42,10 +42,6 @@
 /* Unclaimed shared interrupts during a job before it is aborted */
 #define IEP_MAX_FOREIGN_IRQS	4
 
-/* DEBUG-ONLY (not for commit): OUTPUT tail padding experiment */
-static unsigned int src_tail = 4096;
-module_param(src_tail, uint, 0644);
-
 static const struct iep_fmt iep_formats[] = {
 	{
 		.fourcc = V4L2_PIX_FMT_NV12,
@@ -910,7 +906,7 @@ static int iep_try_fmt_vid_out(struct file *file, void *priv,
 		pix->quantization = V4L2_QUANTIZATION_DEFAULT;
 	}
 
-	iep_fill_pix(pix, fmt, src_tail);
+	iep_fill_pix(pix, fmt, IEP_SRC_TAIL);
 
 	return 0;
 }
@@ -1114,7 +1110,7 @@ static int iep_open(struct file *file)
 	ctx->src_fmt.height = 576;
 	ctx->src_fmt.field = V4L2_FIELD_INTERLACED_TB;
 	ctx->src_fmt.colorspace = V4L2_COLORSPACE_SMPTE170M;
-	iep_fill_pix(&ctx->src_fmt, ctx->fmt, src_tail);
+	iep_fill_pix(&ctx->src_fmt, ctx->fmt, IEP_SRC_TAIL);
 
 	ctx->dst_fmt = ctx->src_fmt;
 	ctx->dst_fmt.field = V4L2_FIELD_NONE;
@@ -1330,9 +1326,8 @@ static void iep_remove(struct platform_device *pdev)
 }
 
 static const struct dev_pm_ops iep_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
-				pm_runtime_force_resume)
-	SET_RUNTIME_PM_OPS(iep_runtime_suspend, iep_runtime_resume, NULL)
+	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	RUNTIME_PM_OPS(iep_runtime_suspend, iep_runtime_resume, NULL)
 };
 
 static const struct of_device_id iep_of_match[] = {
