@@ -113,12 +113,17 @@ struct rkvenc_run {
  *	 registers (codec syntax, rate control and references)
  * @next_pass: optional, called after each hardware pass that finished without
  *	       error, with the status of the passes so far summed in @run->fb.
- *	       Returns 1 after updating @core's shadow registers for another
- *	       pass of the same picture, 0 when the picture is complete, or a
- *	       negative error code.
+ *	       Returns RKVENC_PASS_NEXT after updating @core's shadow registers
+ *	       for another pass of the same picture, RKVENC_PASS_AGAIN after
+ *	       setting them up to encode the whole picture again (the status
+ *	       of the passes so far is dropped), 0 when the picture is
+ *	       complete, or a negative error code.
  * @done: called after the hardware finished; @fb holds the status read-back.
  *	  The backend sets the CAPTURE payload and may change @state.
  */
+#define RKVENC_PASS_NEXT	1
+#define RKVENC_PASS_AGAIN	2
+
 struct rkvenc_codec_ops {
 	int (*adjust_fmt)(struct rkvenc_ctx *ctx, struct v4l2_format *f);
 	int (*start)(struct rkvenc_ctx *ctx);
