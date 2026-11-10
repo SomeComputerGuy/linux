@@ -1598,21 +1598,78 @@ static bool vop2_win_axi_ids_clash(const struct vop2_win *a, const struct vop2_w
  * same layers fetched through different ports are fine. Raising ACLK or
  * the NoC priority of the VOP doesn't help, the limit is per port.
  *
- * So pick the port of a window when it starts fetching: use the port that
- * leaves the busier of the two ports least loaded, preferring the default
- * one, and never a port on which another active window already uses one of
- * its read IDs. A window keeps its port while it stays enabled.
+ * So the atomic check assigns a port to every window that starts fetching,
+ * from the whole new state: a window that keeps fetching keeps its port,
+ * and the new ones, the busiest first, get the port that leaves the busier
+ * of the two ports least loaded, preferring the default one. A window
+ * never gets a port on which another window may still fetch with one of
+ * its read IDs.
  */
-struct vop2_axi_fetch {
-	/* average fetch rate, bytes/s */
-	u64 load;
-	/* fetch rate while the lines of the window are scanned out, bytes/s */
-	u64 peak;
-	/* display lines [y1, y2) of the window on video port vp */
-	u16 y1;
-	u16 y2;
-	u8 vp;
+#define to_vop2_axi_state(s) container_of(s, struct vop2_axi_state, base)
+
+static struct drm_private_state *vop2_axi_duplicate_state(struct drm_private_obj *obj)
+{
+	struct vop2 *vop2 = container_of(obj, struct vop2, axi_obj);
+	struct vop2_axi_state *state;
+
+	state = kmemdup(to_vop2_axi_state(obj->state),
+			struct_size(state, win, vop2->registered_num_wins),
+			GFP_KERNEL);
+	if (!state)
+		return NULL;
+
+	__drm_atomic_helper_private_obj_duplicate_state(obj, &state->base);
+
+	return &state->base;
+}
+
+static void vop2_axi_destroy_state(struct drm_private_obj *obj,
+				   struct drm_private_state *state)
+{
+	kfree(to_vop2_axi_state(state));
+}
+
+static struct drm_private_state *vop2_axi_create_state(struct drm_private_obj *obj)
+{
+	struct vop2 *vop2 = container_of(obj, struct vop2, axi_obj);
+	struct vop2_axi_state *state;
+	int i;
+
+	state = kzalloc(struct_size(state, win, vop2->registered_num_wins),
+			GFP_KERNEL);
+	if (!state)
+		return ERR_PTR(-ENOMEM);
+
+	for (i = 0; i < vop2->registered_num_wins; i++)
+		state->win[i].bus = vop2->win[i].data->axi_bus_id;
+
+	__drm_atomic_helper_private_obj_create_state(obj, &state->base);
+
+	return &state->base;
+}
+
+static const struct drm_private_state_funcs vop2_axi_state_funcs = {
+	.atomic_create_state = vop2_axi_create_state,
+	.atomic_duplicate_state = vop2_axi_duplicate_state,
+	.atomic_destroy_state = vop2_axi_destroy_state,
 };
+
+/* Bits per source pixel fetched, from all planes of the framebuffer */
+static u32 vop2_fetch_bpp(const struct drm_format_info *info)
+{
+	u32 bits = 0;
+	int i;
+
+	/* Single plane formats like YUV420_8BIT have no cpp */
+	if (info->num_planes == 1)
+		return vop2_get_bpp(info);
+
+	for (i = 0; i < info->num_planes; i++)
+		bits += drm_format_info_bpp(info, i) /
+			(i ? info->hsub * info->vsub : 1);
+
+	return bits;
+}
 
 static void vop2_win_axi_fetch(const struct drm_plane_state *pstate,
 			       const struct drm_rect *src,
@@ -1620,13 +1677,13 @@ static void vop2_win_axi_fetch(const struct drm_plane_state *pstate,
 			       const struct drm_display_mode *mode,
 			       struct vop2_axi_fetch *f)
 {
-	u32 bpp = vop2_get_bpp(pstate->fb->format);
+	u32 bpp = vop2_fetch_bpp(pstate->fb->format);
 	u32 src_w = drm_rect_width(src) >> 16;
 	u32 src_h = drm_rect_height(src) >> 16;
 	u32 dsp_h = drm_rect_height(dst);
 	u64 line;
 
-	f->load = (u64)src_w * src_h * bpp / 8 * drm_mode_vrefresh(mode);
+	f->load = div_u64((u64)src_w * src_h * bpp * drm_mode_vrefresh(mode), 8);
 	f->vp = vp_id;
 	f->y1 = dst->y1;
 	f->y2 = dst->y2;
@@ -1643,6 +1700,36 @@ static void vop2_win_axi_fetch(const struct drm_plane_state *pstate,
 	f->peak = div_u64(line * mode->crtc_clock * 1000, mode->crtc_htotal);
 }
 
+/*
+ * Whether a window that doesn't fetch in the new state may still fetch while
+ * a window starts on @crtc. The window registers are latched at the frame
+ * start of their video port: a window switched off in this commit stops
+ * together with the new one only on the same video port, and one switched
+ * off in an earlier commit once that commit is done.
+ */
+static int vop2_win_may_fetch(struct drm_atomic_commit *state,
+			      struct vop2_win *win, const struct drm_crtc *crtc,
+			      bool *fetching)
+{
+	const struct drm_plane_state *old = drm_atomic_get_old_plane_state(state, &win->base);
+	struct drm_crtc_commit *commit;
+	int ret;
+
+	if (old) {
+		*fetching = old->crtc && old->crtc != crtc;
+		return 0;
+	}
+
+	ret = drm_modeset_lock(&win->base.mutex, state->acquire_ctx);
+	if (ret)
+		return ret;
+
+	commit = win->base.state->commit;
+	*fetching = commit && !try_wait_for_completion(&commit->flip_done);
+
+	return 0;
+}
+
 static u8 vop2_axi_pick_bus(u8 def, const u64 *bus_load, const bool *clash, u64 load)
 {
 	if (!clash[def ^ 1] &&
@@ -1653,64 +1740,20 @@ static u8 vop2_axi_pick_bus(u8 def, const u64 *bus_load, const bool *clash, u64 
 	return def;
 }
 
-static u8 vop2_win_get_axi_bus(struct vop2_win *win, const struct vop2_axi_fetch *f)
+/* The AXI read port of the window in the new state */
+static u8 vop2_win_axi_bus(struct vop2_win *win, struct drm_atomic_commit *state)
 {
 	struct vop2 *vop2 = win->vop2;
-	u64 bus_load[VOP2_SYS_AXI_BUS_NUM] = { };
-	bool clash[VOP2_SYS_AXI_BUS_NUM] = { };
-	u8 def = win->data->axi_bus_id;
-	unsigned long flags;
-	u8 bus = def;
-	int i;
+	struct drm_private_state *priv;
 
 	if (!(vop2->data->feature & VOP2_FEATURE_AXI_BALANCE))
-		return def;
+		return win->data->axi_bus_id;
 
-	spin_lock_irqsave(&vop2->axi_lock, flags);
+	priv = drm_atomic_get_new_private_obj_state(state, &vop2->axi_obj);
+	if (drm_WARN_ON_ONCE(vop2->drm, !priv))
+		return win->data->axi_bus_id;
 
-	if (win->axi_active) {
-		bus = win->axi_bus;
-		goto out;
-	}
-
-	for (i = 0; i < vop2->registered_num_wins; i++) {
-		struct vop2_win *w = &vop2->win[i];
-
-		if (w == win || !w->axi_active)
-			continue;
-
-		bus_load[w->axi_bus] += w->axi_load;
-		if (vop2_win_axi_ids_clash(win, w))
-			clash[w->axi_bus] = true;
-	}
-
-	bus = vop2_axi_pick_bus(def, bus_load, clash, f->load);
-
-	WARN_ON_ONCE(clash[bus]);
-
-	win->axi_bus = bus;
-	win->axi_active = true;
-out:
-	win->axi_load = f->load;
-	win->axi_peak = f->peak;
-	win->axi_y1 = f->y1;
-	win->axi_y2 = f->y2;
-	win->axi_vp = f->vp;
-	spin_unlock_irqrestore(&vop2->axi_lock, flags);
-
-	return bus;
-}
-
-static void vop2_win_put_axi_bus(struct vop2_win *win)
-{
-	struct vop2 *vop2 = win->vop2;
-	unsigned long flags;
-
-	spin_lock_irqsave(&vop2->axi_lock, flags);
-	win->axi_active = false;
-	win->axi_load = 0;
-	win->axi_peak = 0;
-	spin_unlock_irqrestore(&vop2->axi_lock, flags);
+	return to_vop2_axi_state(priv)->win[win - vop2->win].bus;
 }
 
 /*
@@ -1722,19 +1765,12 @@ static void vop2_win_put_axi_bus(struct vop2_win *win)
  */
 #define VOP2_AXI_PORT_MAX_FETCH		4600000000ULL
 
-struct vop2_axi_slot {
-	struct vop2_axi_fetch f;
-	bool active;
-	bool assigned;
-	u8 bus;
-};
-
 /*
  * Worst case fetch rate of an AXI port: the windows of one video port only
  * add up where their display lines overlap, windows of different video
  * ports aren't synchronised and always may.
  */
-static u64 vop2_axi_port_peak(const struct vop2_axi_slot *s, int n, u8 bus)
+static u64 vop2_axi_port_peak(const struct vop2_axi_win *s, int n, u8 bus)
 {
 	u64 peak = 0;
 	int i, j;
@@ -1761,32 +1797,37 @@ static u64 vop2_axi_port_peak(const struct vop2_axi_slot *s, int n, u8 bus)
 }
 
 /*
- * Refuse a state that needs more than one AXI read port can fetch. The
- * ports are assigned at plane update time (see vop2_win_get_axi_bus()), so
- * predict that assignment: windows that are fetching keep their port,
- * windows that start fetching get one by the same rule. A state that
+ * Assign the AXI read ports of the windows from the whole new state, and
+ * refuse a state that needs more than one port can fetch. A state that
  * doesn't make any port busier than it is now is always accepted.
  */
 static int vop2_axi_check(struct vop2 *vop2, struct drm_atomic_commit *state)
 {
 	const struct vop2_splice_state *splice = NULL;
-	struct rockchip_crtc_state *vcstate;
-	int n = vop2->registered_num_wins;
-	struct vop2_axi_slot *s;
-	u32 borrowed = 0;
-	u8 vp_id;
+	unsigned int n = vop2->registered_num_wins;
 	u64 old_peak[VOP2_SYS_AXI_BUS_NUM];
-	unsigned long flags;
+	struct rockchip_crtc_state *vcstate;
+	const struct vop2_axi_state *old;
+	struct drm_private_state *priv;
+	struct vop2_axi_win *s;
+	unsigned long start = 0;
 	bool changed = false;
-	int i, j, ret = 0;
-	u8 bus;
+	u32 borrowed = 0;
+	unsigned int i, j;
+	u8 bus, vp_id;
+	int ret;
 
 	if (!(vop2->data->feature & VOP2_FEATURE_AXI_BALANCE))
 		return 0;
 
-	if (vop2->splice_master) {
-		struct drm_private_state *priv;
+	for (i = 0; i < n; i++)
+		if (drm_atomic_get_new_plane_state(state, &vop2->win[i].base))
+			changed = true;
 
+	if (!changed)
+		return 0;
+
+	if (vop2->splice_master) {
 		priv = drm_atomic_get_new_private_obj_state(state, &vop2->splice_obj);
 		if (priv) {
 			splice = container_of(priv, struct vop2_splice_state, base);
@@ -1794,27 +1835,19 @@ static int vop2_axi_check(struct vop2 *vop2, struct drm_atomic_commit *state)
 		}
 	}
 
-	s = kcalloc(n, sizeof(*s), GFP_KERNEL);
-	if (!s)
-		return -ENOMEM;
+	priv = drm_atomic_get_private_obj_state(state, &vop2->axi_obj);
+	if (IS_ERR(priv))
+		return PTR_ERR(priv);
 
-	spin_lock_irqsave(&vop2->axi_lock, flags);
-	for (i = 0; i < n; i++) {
-		struct vop2_win *w = &vop2->win[i];
+	s = to_vop2_axi_state(priv)->win;
+	old = to_vop2_axi_state(drm_atomic_get_old_private_obj_state(state,
+								     &vop2->axi_obj));
 
-		s[i].active = w->axi_active;
-		s[i].assigned = w->axi_active;
-		s[i].bus = w->axi_bus;
-		s[i].f.load = w->axi_load;
-		s[i].f.peak = w->axi_peak;
-		s[i].f.y1 = w->axi_y1;
-		s[i].f.y2 = w->axi_y2;
-		s[i].f.vp = w->axi_vp;
-	}
-	spin_unlock_irqrestore(&vop2->axi_lock, flags);
+	for (i = 0; i < n; i++)
+		s[i] = old->win[i];
 
 	for (bus = 0; bus < VOP2_SYS_AXI_BUS_NUM; bus++)
-		old_peak[bus] = vop2_axi_port_peak(s, n, bus);
+		old_peak[bus] = vop2_axi_port_peak(old->win, n, bus);
 
 	for (i = 0; i < n; i++) {
 		struct drm_plane_state *pstate;
@@ -1824,20 +1857,25 @@ static int vop2_axi_check(struct vop2 *vop2, struct drm_atomic_commit *state)
 		if (!pstate)
 			continue;
 
-		changed = true;
+		/* The right half of the plane is set up again below */
+		for (j = 0; j < n; j++) {
+			if (s[j].owner == i + 1) {
+				s[j].active = false;
+				s[j].owner = 0;
+			}
+		}
 
 		if (pstate->crtc && pstate->visible && pstate->fb)
 			cstate = drm_atomic_get_new_crtc_state(state, pstate->crtc);
 
 		if (!cstate || !cstate->active) {
 			/* Unless it shows the right half of another plane */
-			if (!(borrowed & BIT(i))) {
+			if (!(borrowed & BIT(i)))
 				s[i].active = false;
-				s[i].assigned = false;
-			}
 			continue;
 		}
 
+		s[i].owner = 0;
 		vcstate = to_rockchip_crtc_state(cstate);
 		vp_id = to_vop2_video_port(pstate->crtc)->id;
 		if (vcstate->splice) {
@@ -1849,8 +1887,6 @@ static int vop2_axi_check(struct vop2 *vop2, struct drm_atomic_commit *state)
 			if (s[i].active)
 				vop2_win_axi_fetch(pstate, &src[0], &dst[0], vp_id,
 						   &cstate->adjusted_mode, &s[i].f);
-			else
-				s[i].assigned = false;
 
 			/* Known once vop2_splice_check() ran */
 			if (!splice || !p)
@@ -1862,11 +1898,11 @@ static int vop2_axi_check(struct vop2 *vop2, struct drm_atomic_commit *state)
 			 */
 			p--;
 			s[p].active = drm_rect_width(&dst[1]);
-			if (s[p].active)
+			if (s[p].active) {
 				vop2_win_axi_fetch(pstate, &src[1], &dst[1], vp_id,
 						   &cstate->adjusted_mode, &s[p].f);
-			else
-				s[p].assigned = false;
+				s[p].owner = i + 1;
+			}
 			continue;
 		}
 
@@ -1875,30 +1911,66 @@ static int vop2_axi_check(struct vop2 *vop2, struct drm_atomic_commit *state)
 		s[i].active = true;
 	}
 
-	if (!changed)
-		goto out;
-
 	for (i = 0; i < n; i++) {
+		if (s[i].active && !old->win[i].active) {
+			start |= BIT(i);
+			s[i].active = false;
+		}
+	}
+
+	while (start) {
 		u64 bus_load[VOP2_SYS_AXI_BUS_NUM] = { };
 		bool clash[VOP2_SYS_AXI_BUS_NUM] = { };
-		struct vop2_win *win = &vop2->win[i];
+		const struct drm_crtc *crtc;
+		struct vop2_win *win;
+		unsigned int k = n;
 
-		if (!s[i].active || s[i].assigned)
-			continue;
+		for_each_set_bit(j, &start, n)
+			if (k == n || s[j].f.load > s[k].f.load)
+				k = j;
+
+		win = &vop2->win[k];
+		crtc = &vop2->vps[s[k].f.vp].crtc;
 
 		for (j = 0; j < n; j++) {
-			if (j == i || !s[j].active || !s[j].assigned)
+			struct vop2_win *w = &vop2->win[j];
+			bool fetching = s[j].active;
+
+			if (j == k || (start & BIT(j)))
 				continue;
 
-			bus_load[s[j].bus] += s[j].f.load;
-			if (vop2_win_axi_ids_clash(win, &vop2->win[j]))
+			if (fetching)
+				bus_load[s[j].bus] += s[j].f.load;
+
+			if (!vop2_win_axi_ids_clash(win, w))
+				continue;
+
+			if (!fetching) {
+				ret = vop2_win_may_fetch(state, w, crtc, &fetching);
+				if (ret)
+					return ret;
+			}
+
+			if (fetching)
 				clash[s[j].bus] = true;
 		}
 
-		s[i].bus = vop2_axi_pick_bus(win->data->axi_bus_id, bus_load,
-					     clash, s[i].f.load);
-		s[i].assigned = true;
+		bus = vop2_axi_pick_bus(win->data->axi_bus_id, bus_load, clash,
+					s[k].f.load);
+		if (clash[bus]) {
+			drm_dbg_kms(vop2->drm, "%s: no AXI port with free read IDs\n",
+				    win->data->name);
+			return -EINVAL;
+		}
+
+		s[k].bus = bus;
+		s[k].active = true;
+		start &= ~BIT(k);
 	}
+
+	for (i = 0; i < n; i++)
+		if (!s[i].active)
+			s[i].f = (struct vop2_axi_fetch){ };
 
 	for (bus = 0; bus < VOP2_SYS_AXI_BUS_NUM; bus++) {
 		u64 peak = vop2_axi_port_peak(s, n, bus);
@@ -1908,20 +1980,15 @@ static int vop2_axi_check(struct vop2 *vop2, struct drm_atomic_commit *state)
 				    "AXI port %u would fetch %llu MB/s, more than %llu MB/s\n",
 				    bus, div_u64(peak, 1000000),
 				    div_u64(VOP2_AXI_PORT_MAX_FETCH, 1000000));
-			ret = -EINVAL;
-			break;
+			return -EINVAL;
 		}
 	}
 
-out:
-	kfree(s);
-
-	return ret;
+	return 0;
 }
 
 static void vop2_win_stop(struct vop2_win *win)
 {
-	vop2_win_put_axi_bus(win);
 	vop2_win_disable(win);
 	vop2_win_write(win, VOP2_WIN_YUV_CLIP, 0);
 }
@@ -1945,8 +2012,6 @@ static void vop2_win_put_splice_partner(struct vop2_win *win, bool write_hw)
 	partner->splice_owner = NULL;
 	if (write_hw)
 		vop2_win_stop(partner);
-	else
-		vop2_win_put_axi_bus(partner);
 }
 
 static void vop2_plane_atomic_disable(struct drm_plane *plane,
@@ -1962,8 +2027,6 @@ static void vop2_plane_atomic_disable(struct drm_plane *plane,
 		return;
 
 	drm_dbg(vop2->drm, "%s disable\n", win->data->name);
-
-	vop2_win_put_axi_bus(win);
 
 	if (state)
 		old_pstate = drm_atomic_get_old_plane_state(state, plane);
@@ -2042,6 +2105,7 @@ static void vop2_win_setup_color_key(struct vop2_win *win,
  * vp.
  */
 static void vop2_win_update(struct vop2_win *win, struct vop2_video_port *vp,
+			    struct drm_atomic_commit *state,
 			    struct drm_plane_state *pstate,
 			    const struct drm_rect *src, const struct drm_rect *dest,
 			    u16 width)
@@ -2134,10 +2198,7 @@ static void vop2_win_update(struct vop2_win *win, struct vop2_video_port *vp,
 		afbc_en ? "AFBC" : "", &yrgb_mst);
 
 	if (vop2->version > VOP_VERSION_RK3568) {
-		struct vop2_axi_fetch f;
-
-		vop2_win_axi_fetch(pstate, src, dest, vp->id, adjusted_mode, &f);
-		vop2_win_write(win, VOP2_WIN_AXI_BUS_ID, vop2_win_get_axi_bus(win, &f));
+		vop2_win_write(win, VOP2_WIN_AXI_BUS_ID, vop2_win_axi_bus(win, state));
 		vop2_win_write(win, VOP2_WIN_AXI_YRGB_R_ID, win->data->axi_yrgb_r_id);
 		vop2_win_write(win, VOP2_WIN_AXI_UV_R_ID, win->data->axi_uv_r_id);
 	}
@@ -2313,7 +2374,7 @@ static void vop2_plane_atomic_update(struct drm_plane *plane,
 	hdisplay = crtc->state->adjusted_mode.hdisplay;
 	if (!vcstate->splice) {
 		vop2_win_put_splice_partner(win, true);
-		vop2_win_update(win, vp, pstate, &pstate->src, &pstate->dst, hdisplay);
+		vop2_win_update(win, vp, state, pstate, &pstate->src, &pstate->dst, hdisplay);
 		return;
 	}
 
@@ -2325,7 +2386,7 @@ static void vop2_plane_atomic_update(struct drm_plane *plane,
 	vop2_splice_rects(pstate, hdisplay, src, dst);
 
 	if (drm_rect_width(&dst[0]))
-		vop2_win_update(win, vp, pstate, &src[0], &dst[0], hdisplay / 2);
+		vop2_win_update(win, vp, state, pstate, &src[0], &dst[0], hdisplay / 2);
 	else
 		vop2_win_stop(win);
 
@@ -2336,7 +2397,7 @@ static void vop2_plane_atomic_update(struct drm_plane *plane,
 	partner->splice_owner = win;
 
 	if (drm_rect_width(&dst[1]))
-		vop2_win_update(partner, vp, pstate, &src[1], &dst[1], hdisplay / 2);
+		vop2_win_update(partner, vp, state, pstate, &src[1], &dst[1], hdisplay / 2);
 	else
 		vop2_win_stop(partner);
 }
@@ -3480,7 +3541,7 @@ static int vop2_crtc_atomic_check(struct drm_crtc *crtc,
 		return -EINVAL;
 	}
 
-	return vop2_axi_check(vp->vop2, state);
+	return 0;
 }
 
 static void vop2_crtc_atomic_begin(struct drm_crtc *crtc,
@@ -4214,7 +4275,7 @@ int vop2_atomic_check(struct drm_device *drm, struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *crtc_state;
 	struct drm_crtc *crtc;
-	int i, ret, recheck;
+	int i, ret, ret2, recheck;
 
 	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
 		struct vop2 *vop2;
@@ -4231,6 +4292,11 @@ int vop2_atomic_check(struct drm_device *drm, struct drm_atomic_commit *state)
 		ret = vop2->pll_plan ? vop2_pll_plan(vop2, state) : 0;
 		if (ret < 0)
 			return ret;
+
+		/* With the windows of a splicing CRTC known */
+		ret2 = vop2_axi_check(vop2, state);
+		if (ret2)
+			return ret2;
 
 		return recheck || ret;
 	}
@@ -4979,7 +5045,6 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 
 	mutex_init(&vop2->vop2_lock);
 	mutex_init(&vop2->ovl_lock);
-	spin_lock_init(&vop2->axi_lock);
 	for (i = 0; i < ARRAY_SIZE(vop2->vps); i++)
 		spin_lock_init(&vop2->vps[i].irq_lock);
 
@@ -4990,6 +5055,13 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 	ret = vop2_create_crtcs(vop2);
 	if (ret)
 		return ret;
+
+	if (vop2_data->feature & VOP2_FEATURE_AXI_BALANCE) {
+		ret = drm_atomic_private_obj_init(drm, &vop2->axi_obj,
+						  &vop2_axi_state_funcs);
+		if (ret)
+			goto err_crtcs;
+	}
 
 	ret = vop2_pll_init(vop2);
 	if (ret)
@@ -5053,6 +5125,8 @@ err_pll:
 		vop2->pll_plan = false;
 	}
 err_crtcs:
+	if (vop2->axi_obj.state)
+		drm_atomic_private_obj_fini(&vop2->axi_obj);
 	vop2_destroy_crtcs(vop2);
 
 	return ret;
@@ -5074,6 +5148,9 @@ static void vop2_unbind(struct device *dev, struct device *master, void *data)
 
 	if (vop2->pll_plan)
 		drm_atomic_private_obj_fini(&vop2->pll_obj);
+
+	if (vop2->axi_obj.state)
+		drm_atomic_private_obj_fini(&vop2->axi_obj);
 }
 
 const struct component_ops vop2_component_ops = {

@@ -225,27 +225,6 @@ struct vop2_win {
 	enum drm_plane_type type;
 
 	/**
-	 * @axi_bus: AXI read port the window currently fetches through,
-	 * protected by &vop2.axi_lock.
-	 */
-	u8 axi_bus;
-	/** @axi_active: the window is fetching, protected by &vop2.axi_lock */
-	bool axi_active;
-	/** @axi_load: estimated fetch rate in bytes/s, protected by &vop2.axi_lock */
-	u64 axi_load;
-	/**
-	 * @axi_peak: estimated fetch rate in bytes/s while the lines of the
-	 * window are scanned out, protected by &vop2.axi_lock.
-	 */
-	u64 axi_peak;
-	/** @axi_y1: first display line of the window, protected by &vop2.axi_lock */
-	u16 axi_y1;
-	/** @axi_y2: last display line + 1 of the window, protected by &vop2.axi_lock */
-	u16 axi_y2;
-	/** @axi_vp: video port the window is fetching for, protected by &vop2.axi_lock */
-	u8 axi_vp;
-
-	/**
 	 * @splice_partner: window that shows the right half of the plane of
 	 * this window on a splicing video port, as programmed
 	 */
@@ -255,6 +234,47 @@ struct vop2_win {
 	 * of, as programmed
 	 */
 	struct vop2_win *splice_owner;
+};
+
+/**
+ * struct vop2_axi_fetch - estimated fetch of a window
+ * @load: average fetch rate, bytes/s
+ * @peak: fetch rate while the lines of the window are scanned out, bytes/s
+ * @y1: first display line of the window on video port @vp
+ * @y2: last display line + 1
+ * @vp: video port the window fetches for
+ */
+struct vop2_axi_fetch {
+	u64 load;
+	u64 peak;
+	u16 y1;
+	u16 y2;
+	u8 vp;
+};
+
+/**
+ * struct vop2_axi_win - AXI read port use of a window
+ * @f: estimated fetch, zero if the window doesn't fetch
+ * @bus: AXI read port the window fetches through, or last fetched through
+ * @active: the window fetches
+ * @owner: 1 + index of the window whose plane this window shows the right
+ *	half of on a splicing video port, 0 if it shows its own plane
+ */
+struct vop2_axi_win {
+	struct vop2_axi_fetch f;
+	u8 bus;
+	bool active;
+	u8 owner;
+};
+
+/**
+ * struct vop2_axi_state - AXI read port assignment of all windows
+ * @base: private object state
+ * @win: one entry per window, indexed like &vop2.win
+ */
+struct vop2_axi_state {
+	struct drm_private_state base;
+	struct vop2_axi_win win[];
 };
 
 /**
@@ -539,8 +559,11 @@ struct vop2 {
 	 */
 	struct mutex ovl_lock;
 
-	/* protects the AXI port assignment of all windows (&vop2_win.axi_bus) */
-	spinlock_t axi_lock;
+	/**
+	 * @axi_obj: AXI read port assignment of the windows (&struct
+	 * vop2_axi_state), with VOP2_FEATURE_AXI_BALANCE only
+	 */
+	struct drm_private_obj axi_obj;
 
 	/* must be put at the end of the struct */
 	struct vop2_win win[];
