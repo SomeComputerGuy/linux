@@ -1092,6 +1092,56 @@ static int rkvdec_enum_capture_fmt(struct file *file, void *priv,
 	return 0;
 }
 
+static bool rkvdec_ctx_idle(struct rkvdec_ctx *ctx)
+{
+	guard(spinlock_irqsave)(&ctx->dev->cores_lock);
+
+	return !ctx->num_jobs && !ctx->num_completers;
+}
+
+/*
+ * Have the jobs of @ctx that may read a CAPTURE buffer as a reference all
+ * finished? The references of a job are looked up when it starts, so a job
+ * that is ready to run counts as well.
+ */
+static bool rkvdec_ctx_refs_released(struct rkvdec_ctx *ctx)
+{
+	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
+
+	if (!rkvdec_ctx_idle(ctx))
+		return false;
+
+	return !vb2_is_streaming(v4l2_m2m_get_src_vq(m2m_ctx)) ||
+	       !vb2_is_streaming(v4l2_m2m_get_dst_vq(m2m_ctx)) ||
+	       !v4l2_m2m_num_src_bufs_ready(m2m_ctx) ||
+	       !v4l2_m2m_num_dst_bufs_ready(m2m_ctx);
+}
+
+/*
+ * A dequeued CAPTURE buffer may still hold the reference frame of a frame
+ * being decoded: the stateless decoder interface lets userspace drop the
+ * buffers of reference frames once the requests that use them are queued,
+ * which FFmpeg and GStreamer do with VIDIOC_REMOVE_BUFS for the buffers of
+ * an earlier frame size. Freeing such a buffer while the hardware reads it
+ * makes it fetch unmapped (or reused) memory: IOMMU page faults and a wrong
+ * frame. Wait for the jobs that may read it first.
+ */
+static int rkvdec_remove_bufs(struct file *file, void *priv,
+			      struct v4l2_remove_buffers *remove)
+{
+	struct rkvdec_ctx *ctx = file_to_rkvdec_ctx(file);
+	int ret;
+
+	if (V4L2_TYPE_IS_CAPTURE(remove->type) && remove->count) {
+		ret = wait_event_interruptible(ctx->jobs_wq,
+					       rkvdec_ctx_refs_released(ctx));
+		if (ret)
+			return ret;
+	}
+
+	return v4l2_m2m_ioctl_remove_bufs(file, priv, remove);
+}
+
 static const struct v4l2_ioctl_ops rkvdec_ioctl_ops = {
 	.vidioc_querycap = rkvdec_querycap,
 	.vidioc_enum_framesizes = rkvdec_enum_framesizes,
@@ -1111,7 +1161,7 @@ static const struct v4l2_ioctl_ops rkvdec_ioctl_ops = {
 	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
 	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
 	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
-	.vidioc_remove_bufs = v4l2_m2m_ioctl_remove_bufs,
+	.vidioc_remove_bufs = rkvdec_remove_bufs,
 	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
 
 	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
@@ -1205,13 +1255,6 @@ static void rkvdec_buf_request_complete(struct vb2_buffer *vb)
 	struct rkvdec_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
 
 	v4l2_ctrl_request_complete(vb->req_obj.req, &ctx->ctrl_hdl);
-}
-
-static bool rkvdec_ctx_idle(struct rkvdec_ctx *ctx)
-{
-	guard(spinlock_irqsave)(&ctx->dev->cores_lock);
-
-	return !ctx->num_jobs && !ctx->num_completers;
 }
 
 /*
