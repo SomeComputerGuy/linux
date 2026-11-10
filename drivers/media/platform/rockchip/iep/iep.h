@@ -9,6 +9,7 @@
 #include <linux/clk.h>
 #include <linux/mutex.h>
 #include <linux/reset.h>
+#include <linux/sizes.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 
@@ -32,6 +33,12 @@
 /* Stride registers are 16 bits wide, in units of 32-bit words */
 #define IEP_MAX_STRIDE		(0xffff * 4)
 #define IEP_STRIDE_ALIGN	16
+
+/*
+ * The IEP2 reads past the end of the OUTPUT buffer. The BSP maps a spare
+ * page behind it; here the OUTPUT sizeimage is padded by that much instead.
+ */
+#define IEP_SRC_TAIL		SZ_4K
 
 /*
  * V4L2_CID_DEINTERLACING_MODE menu items. The algorithm and the output rate
