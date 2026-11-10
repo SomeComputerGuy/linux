@@ -381,11 +381,13 @@ static int rkvenc_h264_run(struct rkvenc_ctx *ctx, struct rkvenc_core *core,
 	vepu580_setup_h264_tuning(ctx->dev, core, intra);
 
 	/*
-	 * In CBR mode the frame size target of the rate control is handed to
-	 * the hardware row rate control, which adapts the QP of each
+	 * In CBR and VBR mode the frame size target of the rate control is
+	 * handed to the hardware row rate control, which adapts the QP of each
 	 * macroblock row by up to the row_rc_qp_range parameter.
 	 */
-	h264->hw_rc = rc->mode && rc->mode->type == V4L2_H264_ENC_RC_TYPE_CBR &&
+	h264->hw_rc = rc->mode &&
+		      (rc->mode->type == V4L2_H264_ENC_RC_TYPE_CBR ||
+		       rc->mode->type == V4L2_H264_ENC_RC_TYPE_VBR) &&
 		      READ_ONCE(rkvenc_row_rc_qp_range);
 	if (h264->hw_rc)
 		vepu580_setup_row_rc(core, &vepu580_h264_row_rc, rc->qp,
@@ -466,11 +468,14 @@ static const struct v4l2_ctrl_config rkvenc_h264_ctrl_cfgs[] = {
 		.min = V4L2_MPEG_VIDEO_BITRATE_MODE_VBR,
 		.max = V4L2_MPEG_VIDEO_BITRATE_MODE_CQ,
 		.def = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
-		.menu_skip_mask = BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_VBR),
 	},
 	{
 		.id = V4L2_CID_MPEG_VIDEO_BITRATE,
 		.min = 10000, .max = 200000000, .step = 1, .def = 10000000,
+	},
+	{
+		.id = V4L2_CID_MPEG_VIDEO_BITRATE_PEAK,
+		.min = 10000, .max = 200000000, .step = 1, .def = 20000000,
 	},
 	{
 		.id = V4L2_CID_MPEG_VIDEO_CONSTANT_QUALITY,
