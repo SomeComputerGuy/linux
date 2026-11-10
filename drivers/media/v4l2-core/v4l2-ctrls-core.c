@@ -1183,7 +1183,8 @@ static int validate_mpeg4_vol(struct v4l2_ctrl_mpeg4_vol *vol)
 			   V4L2_MPEG4_VOL_FLAG_QUARTER_SAMPLE |
 			   V4L2_MPEG4_VOL_FLAG_RESYNC_MARKER_DISABLE |
 			   V4L2_MPEG4_VOL_FLAG_DATA_PARTITIONED |
-			   V4L2_MPEG4_VOL_FLAG_REVERSIBLE_VLC))
+			   V4L2_MPEG4_VOL_FLAG_REVERSIBLE_VLC |
+			   V4L2_MPEG4_VOL_FLAG_LOW_DELAY))
 		return -EINVAL;
 
 	/* Reversible VLCs are only used with data partitioning. */
