@@ -16,6 +16,11 @@
  * the size the plan expects at this point of the GOP is spread over the next
  * pictures, so that the bitrate converges to the target.
  *
+ * A picture far above its size target that also moves the bitrate of the
+ * last three seconds well away from the target can be coded a second time
+ * with a higher QP (the re-encode of the Rockchip MPP library): I pictures
+ * above 1.5 times their target, P pictures above 3 times (a scene change).
+ *
  * After each picture the QP state moves by a fraction of the QP error
  * 6 * log2(size / target) (a QP step of 6 halves the size): slowly for small
  * errors, so that the QP does not follow the size noise from picture to
@@ -29,6 +34,7 @@
 
 #include <linux/export.h>
 #include <linux/int_log.h>
+#include <linux/math.h>
 #include <linux/math64.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
@@ -66,6 +72,16 @@
  */
 #define CBR_STEP_UP_MAX		(4 * 256)
 #define CBR_STEP_DOWN_MAX	(2 * 256)
+/*
+ * Re-encode: size thresholds in halves of the target (I 1.5x, P 3x), the
+ * least excess over the target (1/20 of the bits of the three second
+ * window, i.e. 0.15 s of the bitrate) and the least deviation of the window
+ * from the target (1/10).
+ */
+#define CBR_REENC_THR_INTRA	3
+#define CBR_REENC_THR_INTER	6
+#define CBR_REENC_JUMP_DIV	20
+#define CBR_REENC_DEV_DIV	10
 
 /* log2(x) in 8.8 fixed point */
 static int cbr_log2_q8(u64 x)
@@ -218,6 +234,7 @@ int v4l2_enc_cbr_begin(struct v4l2_enc_cbr *cbr, u32 bitrate,
 		cbr->bitrate = bitrate;
 		cbr->nominal = nominal;
 		cbr->buffer_bits = 0;
+		cbr->window_bits = nominal * CBR_BUFFER_SECONDS * fps;
 	}
 
 	if (intra) {
@@ -258,6 +275,7 @@ int v4l2_enc_cbr_begin(struct v4l2_enc_cbr *cbr, u32 bitrate,
 				   max_t(u64, cbr->plan_bits / 4, 8),
 				   cbr->plan_bits * 2);
 	cbr->intra = intra;
+	cbr->qp_reenc = 0;
 
 	pr_debug("+ v4l2-enc-cbr: begin");
 	pr_debug("  nominal: %llu bits, plan: %llu bits, target: %llu bits",
@@ -285,6 +303,70 @@ int v4l2_enc_cbr_qp(const struct v4l2_enc_cbr *cbr)
 EXPORT_SYMBOL_GPL(v4l2_enc_cbr_qp);
 
 /**
+ * v4l2_enc_cbr_reencode() - decide on coding the picture a second time
+ * @cbr: the rate control state
+ * @bits: size of the coded picture in bits
+ * @timeperframe: frame interval
+ * @qp: QP the picture was coded with, within the QP limits of the codec
+ * @qp_max: highest QP of the picture
+ *
+ * Called after a picture was coded and before v4l2_enc_cbr_end(), by
+ * drivers that can code the same picture again. A picture is coded at most
+ * twice. When it returns true, v4l2_enc_cbr_qp() gives the higher QP of the
+ * second pass, which keeps the size target; v4l2_enc_cbr_end() is then
+ * called with the size of the second pass only.
+ *
+ * Return: true if the picture should be coded again.
+ */
+bool v4l2_enc_cbr_reencode(struct v4l2_enc_cbr *cbr, u64 bits,
+			   const struct v4l2_fract *timeperframe, int qp,
+			   int qp_max)
+{
+	unsigned int fps = cbr_fps(timeperframe);
+	u64 n = CBR_BUFFER_SECONDS * fps;
+	u64 window = cbr->nominal * n;
+	u64 thr, ins;
+	int add;
+
+	if (!cbr->bitrate || !cbr->target_bits || cbr->qp_reenc)
+		return false;
+
+	thr = div_u64(cbr->target_bits * (cbr->intra ? CBR_REENC_THR_INTRA :
+					  CBR_REENC_THR_INTER), 2);
+	if (bits <= thr)
+		return false;
+
+	/* The picture alone moves the window by more than 5% ... */
+	if (bits - cbr->target_bits <= div_u64(window, CBR_REENC_JUMP_DIV))
+		return false;
+
+	/* ... and the window is more than 10% off the target. */
+	ins = cbr->window_bits - div64_u64(cbr->window_bits, n) + bits;
+	if (abs_diff(ins, window) <= div_u64(window, CBR_REENC_DEV_DIV))
+		return false;
+
+	if (bits > 2 * thr)
+		add = 3;
+	else if (2 * bits > 3 * thr)
+		add = 2;
+	else
+		add = 1;
+
+	if (qp + add > qp_max)
+		return false;
+
+	cbr->qp_pic = qp + add;
+	cbr->qp_reenc = add;
+
+	pr_debug("+ v4l2-enc-cbr: re-encode");
+	pr_debug("  size: %llu bits, target: %llu bits, window: %llu bits, picture QP %d",
+		 bits, cbr->target_bits, ins, cbr->qp_pic);
+
+	return true;
+}
+EXPORT_SYMBOL_GPL(v4l2_enc_cbr_reencode);
+
+/**
  * v4l2_enc_cbr_end() - account for a coded picture
  * @cbr: the rate control state
  * @bits: size of the coded picture in bits
@@ -307,9 +389,17 @@ void v4l2_enc_cbr_end(struct v4l2_enc_cbr *cbr, u64 bits,
 
 	cbr->buffer_bits = clamp_t(s64, cbr->buffer_bits + (s64)bits -
 				   (s64)cbr->nominal, -limit, limit);
+	/* Sum of the picture sizes over about three seconds */
+	cbr->window_bits = cbr->window_bits + bits -
+			   div64_u64(cbr->window_bits,
+				     CBR_BUFFER_SECONDS * fps);
 
-	/* QP error of the picture, 1/256 units */
-	err = 6 * (cbr_log2_q8(bits) - cbr_log2_q8(cbr->target_bits));
+	/*
+	 * QP error of the picture, 1/256 units. A re-encoded picture was coded
+	 * above the QP of the state: its error at the state counts that too.
+	 */
+	err = 6 * (cbr_log2_q8(bits) - cbr_log2_q8(cbr->target_bits)) +
+	      cbr->qp_reenc * 256;
 
 	step = err / 8;
 	if (err > CBR_ERR_SLOW)

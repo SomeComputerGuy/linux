@@ -23,6 +23,8 @@
  * @qp_intra_add_q8: QP increase of the I pictures after I pictures larger
  *		     than their share of the GOP at the largest I/P ratio
  * @qp_pic: QP of the current picture
+ * @qp_reenc: QP increase of the second pass of the current picture, 0 if
+ *	      it was coded once
  * @ratio: I/P picture size ratio in 1/16 units
  * @gop: measured IDR period in pictures, 0 until two I pictures were seen
  * @since_i: pictures coded since the last I picture
@@ -31,6 +33,8 @@
  * @p_bits: running mean of the P picture sizes
  * @i_bits: size of the last I picture
  * @buffer_bits: accumulated difference between the coded and nominal sizes
+ * @window_bits: sum of the coded sizes over about three seconds (each size
+ *		 decays by 1/(3 * fps) per picture)
  * @plan_bits: planned size of the current picture
  * @target_bits: size target of the current picture
  *
@@ -47,6 +51,7 @@ struct v4l2_enc_cbr {
 	int qp_intra_ref_q8;
 	int qp_intra_add_q8;
 	int qp_pic;
+	int qp_reenc;
 	unsigned int ratio;
 	unsigned int gop;
 	unsigned int since_i;
@@ -55,6 +60,7 @@ struct v4l2_enc_cbr {
 	u64 p_bits;
 	u64 i_bits;
 	s64 buffer_bits;
+	u64 window_bits;
 	u64 plan_bits;
 	u64 target_bits;
 };
@@ -65,6 +71,9 @@ int v4l2_enc_cbr_begin(struct v4l2_enc_cbr *cbr, u32 bitrate,
 		       unsigned int samples, bool intra, int qp_min,
 		       int qp_max);
 int v4l2_enc_cbr_qp(const struct v4l2_enc_cbr *cbr);
+bool v4l2_enc_cbr_reencode(struct v4l2_enc_cbr *cbr, u64 bits,
+			   const struct v4l2_fract *timeperframe, int qp,
+			   int qp_max);
 void v4l2_enc_cbr_end(struct v4l2_enc_cbr *cbr, u64 bits,
 		      const struct v4l2_fract *timeperframe, int qp_min,
 		      int qp_max);
