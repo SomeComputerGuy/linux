@@ -723,7 +723,7 @@ static const struct hantro_ctrl controls[] = {
 		.codec = HANTRO_H264_ENCODER,
 		.cfg = {
 			.id = V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
-			.min = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
+			.min = V4L2_MPEG_VIDEO_BITRATE_MODE_VBR,
 			.max = V4L2_MPEG_VIDEO_BITRATE_MODE_CQ,
 			.def = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
 		},
@@ -743,6 +743,15 @@ static const struct hantro_ctrl controls[] = {
 			.min = 1000,
 			.max = 100000000,
 			.def = 2000000,
+			.step = 1,
+		},
+	}, {
+		.codec = HANTRO_H264_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_BITRATE_PEAK,
+			.min = 1000,
+			.max = 100000000,
+			.def = 4000000,
 			.step = 1,
 		},
 	}, {
