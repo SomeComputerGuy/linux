@@ -285,6 +285,8 @@ int v4l2_hevc_enc_init(struct v4l2_hevc_enc *enc);
 void v4l2_hevc_enc_exit(struct v4l2_hevc_enc *enc);
 int v4l2_hevc_enc_step(struct v4l2_hevc_enc *enc,
 		       struct vb2_v4l2_buffer *buffer);
+bool v4l2_hevc_enc_reencode(struct v4l2_hevc_enc *enc,
+			    unsigned int bytesused);
 int v4l2_hevc_enc_complete(struct v4l2_hevc_enc *enc,
 			   struct vb2_v4l2_buffer *buffer,
 			   const struct v4l2_stateless_encode_stats *stats);
