@@ -278,6 +278,21 @@ struct vop2_axi_state {
 };
 
 /**
+ * struct vop2_plane_state - plane state of a window
+ * @base: DRM plane state
+ * @axi_bus: AXI read port the window fetches through, the default one of
+ *	the window unless the atomic check assigned one
+ *	(VOP2_FEATURE_AXI_BALANCE)
+ * @splice_axi_bus: AXI read port of the window that shows the right half of
+ *	the plane on a splicing video port
+ */
+struct vop2_plane_state {
+	struct drm_plane_state base;
+	u8 axi_bus;
+	u8 splice_axi_bus;
+};
+
+/**
  * enum vop2_dclk_parent - CRU parents of the DCLK sources (RK3588)
  *
  * @VOP2_DCLK_GPLL: general PLL, fixed rate

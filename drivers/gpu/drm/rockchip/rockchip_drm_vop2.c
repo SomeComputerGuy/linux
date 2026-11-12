@@ -1604,8 +1604,15 @@ static bool vop2_win_axi_ids_clash(const struct vop2_win *a, const struct vop2_w
  * of the two ports least loaded, preferring the default one. A window
  * never gets a port on which another window may still fetch with one of
  * its read IDs.
+ *
+ * The assignment of all windows is kept in a private object for the next
+ * atomic check. The plane update takes the port of its window from the
+ * plane state instead: commits on different video ports aren't ordered
+ * against each other, so a later one may have replaced and freed the
+ * private state by the time the planes of this one are updated.
  */
 #define to_vop2_axi_state(s) container_of(s, struct vop2_axi_state, base)
+#define to_vop2_plane_state(s) container_of(s, struct vop2_plane_state, base)
 
 static struct drm_private_state *vop2_axi_duplicate_state(struct drm_private_obj *obj)
 {
@@ -1738,22 +1745,6 @@ static u8 vop2_axi_pick_bus(u8 def, const u64 *bus_load, const bool *clash, u64 
 		return def ^ 1;
 
 	return def;
-}
-
-/* The AXI read port of the window in the new state */
-static u8 vop2_win_axi_bus(struct vop2_win *win, struct drm_atomic_commit *state)
-{
-	struct vop2 *vop2 = win->vop2;
-	struct drm_private_state *priv;
-
-	if (!(vop2->data->feature & VOP2_FEATURE_AXI_BALANCE))
-		return win->data->axi_bus_id;
-
-	priv = drm_atomic_get_new_private_obj_state(state, &vop2->axi_obj);
-	if (drm_WARN_ON_ONCE(vop2->drm, !priv))
-		return win->data->axi_bus_id;
-
-	return to_vop2_axi_state(priv)->win[win - vop2->win].bus;
 }
 
 /*
@@ -1984,7 +1975,58 @@ static int vop2_axi_check(struct vop2 *vop2, struct drm_atomic_commit *state)
 		}
 	}
 
+	/* The plane update programs the ports from the plane state */
+	for (i = 0; i < n; i++) {
+		struct vop2_plane_state *vpstate;
+		struct drm_plane_state *pstate;
+
+		pstate = drm_atomic_get_new_plane_state(state, &vop2->win[i].base);
+		if (!pstate)
+			continue;
+
+		vpstate = to_vop2_plane_state(pstate);
+		vpstate->axi_bus = s[i].bus;
+		for (j = 0; j < n; j++)
+			if (s[j].owner == i + 1)
+				vpstate->splice_axi_bus = s[j].bus;
+	}
+
 	return 0;
+}
+
+static void vop2_plane_reset(struct drm_plane *plane)
+{
+	struct vop2_plane_state *vpstate;
+
+	if (plane->state) {
+		__drm_atomic_helper_plane_destroy_state(plane->state);
+		kfree(to_vop2_plane_state(plane->state));
+		plane->state = NULL;
+	}
+
+	vpstate = kzalloc_obj(*vpstate);
+	if (!vpstate)
+		return;
+
+	__drm_atomic_helper_plane_reset(plane, &vpstate->base);
+	vpstate->axi_bus = to_vop2_win(plane)->data->axi_bus_id;
+}
+
+static struct drm_plane_state *vop2_plane_duplicate_state(struct drm_plane *plane)
+{
+	struct vop2_plane_state *vpstate;
+
+	if (WARN_ON(!plane->state))
+		return NULL;
+
+	vpstate = kmemdup(to_vop2_plane_state(plane->state), sizeof(*vpstate),
+			  GFP_KERNEL);
+	if (!vpstate)
+		return NULL;
+
+	__drm_atomic_helper_plane_duplicate_state(plane, &vpstate->base);
+
+	return &vpstate->base;
 }
 
 static void vop2_win_stop(struct vop2_win *win)
@@ -2198,7 +2240,12 @@ static void vop2_win_update(struct vop2_win *win, struct vop2_video_port *vp,
 		afbc_en ? "AFBC" : "", &yrgb_mst);
 
 	if (vop2->version > VOP_VERSION_RK3568) {
-		vop2_win_write(win, VOP2_WIN_AXI_BUS_ID, vop2_win_axi_bus(win, state));
+		struct vop2_plane_state *vpstate = to_vop2_plane_state(pstate);
+
+		/* The window of the plane, or the one showing its right half */
+		vop2_win_write(win, VOP2_WIN_AXI_BUS_ID,
+			       win == to_vop2_win(pstate->plane) ?
+			       vpstate->axi_bus : vpstate->splice_axi_bus);
 		vop2_win_write(win, VOP2_WIN_AXI_YRGB_R_ID, win->data->axi_yrgb_r_id);
 		vop2_win_write(win, VOP2_WIN_AXI_UV_R_ID, win->data->axi_uv_r_id);
 	}
@@ -2412,8 +2459,8 @@ static const struct drm_plane_funcs vop2_plane_funcs = {
 	.update_plane	= drm_atomic_helper_update_plane,
 	.disable_plane	= drm_atomic_helper_disable_plane,
 	.destroy = drm_plane_cleanup,
-	.reset = drm_atomic_helper_plane_reset,
-	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
+	.reset = vop2_plane_reset,
+	.atomic_duplicate_state = vop2_plane_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
 	.format_mod_supported = rockchip_vop2_mod_supported,
 };
