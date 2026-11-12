@@ -408,6 +408,16 @@ int devfreq_update_target(struct devfreq *devfreq, unsigned long freq)
 	if (!devfreq->governor)
 		return -EINVAL;
 
+	/*
+	 * The device may be powered down while it is suspended. Leave it
+	 * alone, devfreq_resume_device() does the update.
+	 */
+	if (devfreq->suspended) {
+		devfreq->update_pending = true;
+		devfreq->pending_freq = freq;
+		return 0;
+	}
+
 	/* Reevaluate the proper frequency */
 	err = devfreq->governor->get_target_freq(devfreq, &freq);
 	if (err)
@@ -1162,8 +1172,11 @@ int devfreq_suspend_device(struct devfreq *devfreq)
 			return ret;
 	}
 
+	mutex_lock(&devfreq->lock);
+	devfreq->suspended = true;
+	devfreq->update_pending = false;
+	ret = 0;
 	if (devfreq->suspend_freq) {
-		mutex_lock(&devfreq->lock);
 		/*
 		 * devfreq_set_target() records the frequency it sets as the
 		 * one to resume at. Keep the frequency from before suspend
@@ -1173,12 +1186,10 @@ int devfreq_suspend_device(struct devfreq *devfreq)
 		resume_freq = devfreq->previous_freq;
 		ret = devfreq_set_target(devfreq, devfreq->suspend_freq, 0);
 		devfreq->resume_freq = resume_freq;
-		mutex_unlock(&devfreq->lock);
-		if (ret)
-			return ret;
 	}
+	mutex_unlock(&devfreq->lock);
 
-	return 0;
+	return ret;
 }
 EXPORT_SYMBOL(devfreq_suspend_device);
 
@@ -1200,13 +1211,22 @@ int devfreq_resume_device(struct devfreq *devfreq)
 	if (atomic_dec_return(&devfreq->suspend_count) >= 1)
 		return 0;
 
-	if (devfreq->resume_freq) {
-		mutex_lock(&devfreq->lock);
+	mutex_lock(&devfreq->lock);
+	devfreq->suspended = false;
+	ret = 0;
+	if (devfreq->update_pending && devfreq->governor) {
+		/*
+		 * Run the update deferred while suspended. It takes the
+		 * limits set meanwhile into account, unlike resume_freq.
+		 */
+		devfreq->update_pending = false;
+		ret = devfreq_update_target(devfreq, devfreq->pending_freq);
+	} else if (devfreq->resume_freq) {
 		ret = devfreq_set_target(devfreq, devfreq->resume_freq, 0);
-		mutex_unlock(&devfreq->lock);
-		if (ret)
-			return ret;
 	}
+	mutex_unlock(&devfreq->lock);
+	if (ret)
+		return ret;
 
 	if (devfreq->governor) {
 		ret = devfreq->governor->event_handler(devfreq,
