@@ -320,8 +320,22 @@ allOf:
         - clocks
 
     else:
-      properties:
-        clocks: false
+      if:
+        properties:
+          compatible:
+            contains:
+              const: rockchip,rk3588-php-grf
+
+      then:
+        properties:
+          clocks:
+            description:
+              Bus clock of the PHP GRF registers. Optional, as older
+              devicetrees have no clock here.
+
+      else:
+        properties:
+          clocks: false
 
 examples:
   - |
