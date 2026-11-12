@@ -268,6 +268,40 @@ static bool hantro_dec_dst_buf_fits(struct hantro_ctx *ctx,
 	return true;
 }
 
+/*
+ * The HEVC and VP9 decoders are programmed with the frame size of the SPS and
+ * of the frame header, and write a frame of that size into buffers that are
+ * made for the size of the formats. The other decoders are programmed with
+ * the size of the formats, or check the frame size themselves.
+ */
+static bool hantro_dec_frame_fits(struct hantro_ctx *ctx)
+{
+	const struct v4l2_ctrl_hevc_sps *sps;
+	const struct v4l2_ctrl_vp9_frame *frame;
+	u32 width, height;
+
+	switch (ctx->vpu_src_fmt->fourcc) {
+	case V4L2_PIX_FMT_HEVC_SLICE:
+		sps = hantro_get_ctrl(ctx, V4L2_CID_STATELESS_HEVC_SPS);
+		if (!sps)
+			return true;
+		width = sps->pic_width_in_luma_samples;
+		height = sps->pic_height_in_luma_samples;
+		break;
+	case V4L2_PIX_FMT_VP9_FRAME:
+		frame = hantro_get_ctrl(ctx, V4L2_CID_STATELESS_VP9_FRAME);
+		if (!frame)
+			return true;
+		width = frame->frame_width_minus_1 + 1;
+		height = frame->frame_height_minus_1 + 1;
+		break;
+	default:
+		return true;
+	}
+
+	return width <= ctx->ref_fmt.width && height <= ctx->ref_fmt.height;
+}
+
 static void device_run(void *priv)
 {
 	struct hantro_ctx *ctx = priv;
@@ -305,7 +339,8 @@ static void device_run(void *priv)
 	 */
 	v4l2_ctrl_request_setup(src->vb2_buf.req_obj.req, &ctx->ctrl_handler);
 
-	if (!ctx->is_encoder && !hantro_dec_dst_buf_fits(ctx, dst))
+	if (!ctx->is_encoder &&
+	    (!hantro_dec_dst_buf_fits(ctx, dst) || !hantro_dec_frame_fits(ctx)))
 		goto err_clk_disable;
 
 	if (ctx->codec_ops->run(ctx))
