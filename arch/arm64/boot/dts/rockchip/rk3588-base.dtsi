@@ -590,7 +590,6 @@
 		interrupt-names = "eventq", "gerror", "priq", "cmdq-sync";
 		clocks = <&cru ACLK_MMU_PHP>;
 		#iommu-cells = <1>;
-		status = "disabled";
 	};
 
 	pmu1grf: syscon@fd58a000 {
