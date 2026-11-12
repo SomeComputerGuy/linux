@@ -549,6 +549,7 @@
 		compatible = "rockchip,rk3588-dwc3", "snps,dwc3";
 		reg = <0x0 0xfcd00000 0x0 0x400000>;
 		interrupts = <GIC_SPI 222 IRQ_TYPE_LEVEL_HIGH 0>;
+		iommus = <&mmu600_php 6>;
 		clocks = <&cru REF_CLK_USB3OTG2>, <&cru SUSPEND_CLK_USB3OTG2>,
 			 <&cru ACLK_USB3OTG2>, <&cru CLK_UTMI_OTG2>,
 			 <&cru CLK_PIPEPHY2_PIPE_U3_G>;
